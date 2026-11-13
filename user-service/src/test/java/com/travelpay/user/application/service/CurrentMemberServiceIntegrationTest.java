@@ -4,6 +4,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.auth.AuthenticatedUser;
 import com.travelpay.common.error.BusinessException;
@@ -38,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class CurrentMemberServiceIntegrationTest {
 
     @Autowired private CurrentMemberService service;
+    @Autowired private DataSource dataSource;
     @Autowired private EntityManagerFactory entityManagerFactory;
     @Autowired private PlatformTransactionManager transactionManager;
 
@@ -57,6 +60,12 @@ class CurrentMemberServiceIntegrationTest {
             entityManager.persist(user);
             return user.getId();
         });
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.users",
+                () -> service.requireActiveSession(userId, 0L));
     }
 
     @Test

@@ -55,8 +55,7 @@ public class SignupService {
         this.consentRepository = consentRepository;
         this.passwordEncoder = passwordEncoder;
         this.clock = clock;
-        this.readTransactions = new TransactionTemplate(transactionManager);
-        this.readTransactions.setReadOnly(true);
+        this.readTransactions = ReadTransactions.create(transactionManager);
         this.writeTransactions = new TransactionTemplate(transactionManager);
     }
 

@@ -28,8 +28,7 @@ public class UserRealNameService {
             RecipientLookupLimiter lookupLimiter) {
         this.userRepository = userRepository;
         this.lookupLimiter = lookupLimiter;
-        this.readTransactions = new TransactionTemplate(transactionManager);
-        this.readTransactions.setReadOnly(true);
+        this.readTransactions = ReadTransactions.create(transactionManager);
     }
 
     /** 송금 수취인 실명 조회: 다른 회원의 상태가 드러나지 않도록 없는 회원과 ACTIVE가 아닌 회원을 같은 404로 처리합니다. */

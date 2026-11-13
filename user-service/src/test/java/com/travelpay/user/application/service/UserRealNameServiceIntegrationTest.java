@@ -4,6 +4,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.user.common.config.JpaAuditingConfiguration;
@@ -50,6 +52,7 @@ class UserRealNameServiceIntegrationTest {
     private static final UUID REQUESTER_ID = UUID.fromString("550e8400-e29b-41d4-a716-446655440000");
 
     @Autowired private UserRealNameService userRealNameService;
+    @Autowired private DataSource dataSource;
     @Autowired private UserRepository userRepository;
     @Autowired private EntityManagerFactory entityManagerFactory;
     @Autowired private PlatformTransactionManager transactionManager;
@@ -69,6 +72,14 @@ class UserRealNameServiceIntegrationTest {
                 entityManager.createQuery("delete from " + entity).executeUpdate();
             }
         });
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        var userId = saveMember(UserStatus.ACTIVE);
+
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.users",
+                () -> userRealNameService.getFundingIdentity(userId, userId));
     }
 
     @Test

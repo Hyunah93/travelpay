@@ -22,8 +22,7 @@ public class MyInfoService {
 
     public MyInfoService(UserRepository userRepository, PlatformTransactionManager transactionManager) {
         this.userRepository = userRepository;
-        this.readTransactions = new TransactionTemplate(transactionManager);
-        this.readTransactions.setReadOnly(true);
+        this.readTransactions = ReadTransactions.create(transactionManager);
     }
 
     /** 트랜잭션 시작·종료 실패까지 503으로 바꾸도록 트랜잭션을 이 메서드 안에서 실행합니다. */

@@ -4,6 +4,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
@@ -45,6 +47,7 @@ class MyInfoServiceIntegrationTest {
             .encode("MyInfo-test-password!");
 
     @Autowired private MyInfoService myInfoService;
+    @Autowired private DataSource dataSource;
     @Autowired private EntityManagerFactory entityManagerFactory;
     @Autowired private PlatformTransactionManager transactionManager;
 
@@ -60,6 +63,14 @@ class MyInfoServiceIntegrationTest {
                 entityManager.createQuery("delete from " + entity).executeUpdate();
             }
         });
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        var userId = saveMember(true);
+
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.users",
+                () -> myInfoService.getMyInfo(userId));
     }
 
     @Test

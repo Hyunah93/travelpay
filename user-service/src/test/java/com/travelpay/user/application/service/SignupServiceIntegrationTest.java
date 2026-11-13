@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
@@ -87,6 +89,8 @@ class SignupServiceIntegrationTest {
     @Autowired
     private SignupService signupService;
     @Autowired
+    private DataSource dataSource;
+    @Autowired
     private EntityManagerFactory entityManagerFactory;
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -114,6 +118,14 @@ class SignupServiceIntegrationTest {
             publish(new TermsDocumentId("SERVICE_TERMS", "v0"), true, AT.minusSeconds(120));
             publish(new TermsDocumentId("SERVICE_TERMS", "v2"), true, AT.plusSeconds(300));
         });
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        var command = command("member@example.com", "010-1500-0001", List.of(SERVICE, PRIVACY));
+
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.user_credentials",
+                () -> signupService.signup(command));
     }
 
     @Test
