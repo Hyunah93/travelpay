@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 
+import com.travelpay.exchange.domain.ledger.LedgerClient;
 import com.travelpay.exchange.domain.order.ExchangeOrder;
 import com.travelpay.exchange.domain.order.ExchangeOrderRepository;
 import com.travelpay.exchange.domain.order.ExchangeOrderStatus;
@@ -29,6 +30,7 @@ public class ExchangeOrderRecoveryService {
 
     private final ExchangeOrderRepository orderRepository;
     private final ExchangeOrderLedgerProcessor ledgerProcessor;
+    private final LedgerClient ledgerClient;
     private final Clock clock;
 
     /**
@@ -38,7 +40,8 @@ public class ExchangeOrderRecoveryService {
      *
      * 이렇게 되면 주기를 끝냅니다.
      * - 가져온 대상이 batchSize보다 적음: 밀린 게 없음
-     * - 원장이 연달아 결과를 주지 못함: 아직 장애라 다음 주기에 다시 봄
+     * - 원장 서킷이 열려 있거나 원장이 연달아 결과를 주지 못함: 아직 장애라 다음 주기에 다시 봄.
+ *   서킷이 열려 있으면 주문을 고르지도 않아 확인 횟수가 오르지 않는다
      * - 한 묶음에서 확정한 주문이 없음: 오류가 이어지는 등 더 돌아도 진전이 없음
      * - timeBudget이 지남: 스케줄러 스레드(환율 수집·예약 만료와 나눠 씀)를 오래 붙잡지 않게 남은 건 다음 주기로 넘김
      * 원장에는 지금처럼 한 건씩 보냅니다. 동시에 보내면 환전 거래가 모두 같은 시스템 계정을 잠가 처리량이 늘지 않습니다
@@ -60,10 +63,10 @@ public class ExchangeOrderRecoveryService {
             settled += batch.result().settled();
             unsettled += batch.result().unsettled();
             errors += batch.result().errors();
-            if (batch.result().found() < batchSize) {
-                endedBy = EndReason.NOTHING_LEFT;
-            } else if (batch.ledgerUnavailable()) {
+            if (batch.ledgerUnavailable()) {
                 endedBy = EndReason.LEDGER_UNAVAILABLE;
+            } else if (batch.result().found() < batchSize) {
+                endedBy = EndReason.NOTHING_LEFT;
             } else if (batch.result().settled() == 0) {
                 endedBy = EndReason.NO_PROGRESS;
             } else if (!clock.instant().isBefore(deadline)) {
@@ -90,6 +93,12 @@ public class ExchangeOrderRecoveryService {
     }
 
     private Batch recoverBatch(int limit) {
+        // 서킷이 열려 원장에 보낼 수 없으면 주문을 고르지도 않는다. 선점하면 보내지도 못하고 확인 횟수(재시도 대기)만 올라,
+        // 원장이 회복된 뒤에도 그 주문이 늦게 처리된다(#317)
+        if (!ledgerClient.isAvailable()) {
+            log.debug("원장 서킷이 열려 있어 이번 복구는 건너뜁니다");
+            return new Batch(new RecoveryResult(0, 0, 0, 0), true);
+        }
         List<ExchangeOrder> targets = orderRepository.findRecoveryTargets(clock.instant(), limit);
         int settled = 0;
         int unsettled = 0;
@@ -99,6 +108,12 @@ public class ExchangeOrderRecoveryService {
         for (ExchangeOrder target : targets) {
             if (consecutiveUnsettled >= MAX_CONSECUTIVE_UNSETTLED) {
                 log.warn("원장 결과를 연달아 확인하지 못해 남은 주문은 다음 주기로 미룹니다: remaining={}",
+                        targets.size() - settled - unsettled - errors);
+                ledgerUnavailable = true;
+                break;
+            }
+            if (!ledgerClient.isAvailable()) {
+                log.warn("처리 중 원장 서킷이 열려 남은 주문은 다음 주기로 미룹니다: remaining={}",
                         targets.size() - settled - unsettled - errors);
                 ledgerUnavailable = true;
                 break;
@@ -143,7 +158,7 @@ public class ExchangeOrderRecoveryService {
     public enum EndReason {
         /** 가져온 대상이 묶음 크기보다 적어 밀린 게 없음 */
         NOTHING_LEFT,
-        /** 원장이 연달아 결과를 주지 못해 아직 장애로 봄 */
+        /** 원장 서킷이 열려 있거나 원장이 연달아 결과를 주지 못해 아직 장애로 봄 */
         LEDGER_UNAVAILABLE,
         /** 한 묶음에서 확정한 주문이 없어 더 돌아도 진전이 없음 */
         NO_PROGRESS,

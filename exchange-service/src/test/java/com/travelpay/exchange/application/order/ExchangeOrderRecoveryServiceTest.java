@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import com.travelpay.exchange.application.order.ExchangeOrderRecoveryService.EndReason;
 import com.travelpay.exchange.application.order.ExchangeOrderRecoveryService.RecoveryCycle;
 import com.travelpay.exchange.application.order.ExchangeOrderRecoveryService.RecoveryResult;
+import com.travelpay.exchange.domain.ledger.LedgerClient;
 import com.travelpay.exchange.domain.order.ExchangeOrder;
 import com.travelpay.exchange.domain.order.ExchangeOrderRepository;
 import com.travelpay.exchange.domain.order.ExchangeOrderStatus;
@@ -19,13 +20,16 @@ import com.travelpay.exchange.domain.order.OrderFixtures;
 import com.travelpay.exchange.domain.quote.ExchangeQuote;
 import com.travelpay.exchange.domain.quote.QuoteFixtures;
 import com.travelpay.exchange.domain.rate.ForeignCurrency;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -36,8 +40,15 @@ class ExchangeOrderRecoveryServiceTest {
 
     private final ExchangeOrderRepository orderRepository = mock(ExchangeOrderRepository.class);
     private final ExchangeOrderLedgerProcessor ledgerProcessor = mock(ExchangeOrderLedgerProcessor.class);
+    private final LedgerClient ledgerClient = mock(LedgerClient.class);
     private final ExchangeOrderRecoveryService service = new ExchangeOrderRecoveryService(orderRepository,
-            ledgerProcessor, Clock.fixed(NOW, ZoneId.of("Asia/Seoul")));
+            ledgerProcessor, ledgerClient, Clock.fixed(NOW, ZoneId.of("Asia/Seoul")));
+
+    /** 기본은 원장에 보낼 수 있는 상태(서킷 닫힘) */
+    @BeforeEach
+    void ledgerAvailable() {
+        when(ledgerClient.isAvailable()).thenReturn(true);
+    }
 
     @Test
     void processesEachTargetAndCountsOutcome() {
@@ -134,7 +145,7 @@ class ExchangeOrderRecoveryServiceTest {
     @Test
     void stopsAtTheTimeBudget() {
         AtomicReference<Instant> now = new AtomicReference<>(NOW);
-        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, clockOf(now));
+        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, ledgerClient, clockOf(now));
         // 묶음 하나에 10초가 걸린다고 치고, 항상 가득 찬 묶음을 돌려준다
         when(orderRepository.findRecoveryTargets(any(), eq(2))).thenAnswer(invocation -> {
             now.set(now.get().plusSeconds(10));
@@ -145,6 +156,35 @@ class ExchangeOrderRecoveryServiceTest {
         RecoveryCycle cycle = timed.recoverPending(2, Duration.ofSeconds(15));
 
         assertEquals(new RecoveryCycle(2, 4, 4, 0, 0, EndReason.TIME_BUDGET), cycle);
+    }
+
+    // ---- 서킷이 열려 있으면 고르지도 않음(#317) ----
+
+    /** 서킷이 열려 원장에 보낼 수 없으면 주문을 고르지 않는다. 선점하지 않으니 확인 횟수(재시도 대기)가 오르지 않는다 */
+    @Test
+    void skipsTheCycleWhileTheCircuitIsOpen() {
+        when(ledgerClient.isAvailable()).thenReturn(false);
+
+        RecoveryCycle cycle = service.recoverPending(50, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(1, 0, 0, 0, 0, EndReason.LEDGER_UNAVAILABLE), cycle);
+        verify(orderRepository, never()).findRecoveryTargets(any(), anyInt());
+        verify(ledgerProcessor, never()).process(any());
+    }
+
+    /** 처리 도중 서킷이 열리면 남은 주문은 건드리지 않고 멈춘다(남은 주문의 확인 횟수가 오르지 않음) */
+    @Test
+    void stopsWhenTheCircuitOpensMidBatch() {
+        List<ExchangeOrder> targets = orders(3);
+        when(orderRepository.findRecoveryTargets(any(), eq(3))).thenReturn(targets);
+        when(ledgerProcessor.process(any())).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+        // 주기 시작 전 확인, 첫 주문 전 확인은 보낼 수 있음. 두 번째 주문 전에 서킷이 열림
+        when(ledgerClient.isAvailable()).thenReturn(true, true, false);
+
+        RecoveryCycle cycle = service.recoverPending(3, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(1, 3, 1, 0, 0, EndReason.LEDGER_UNAVAILABLE), cycle);
+        verify(ledgerProcessor, times(1)).process(any());
     }
 
     private static Clock clockOf(AtomicReference<Instant> now) {
