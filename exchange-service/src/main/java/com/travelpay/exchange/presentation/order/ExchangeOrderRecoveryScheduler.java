@@ -1,5 +1,7 @@
 package com.travelpay.exchange.presentation.order;
 
+import java.time.Duration;
+
 import com.travelpay.exchange.application.order.ExchangeOrderBacklogMonitor;
 import com.travelpay.exchange.application.order.ExchangeOrderRecoveryService;
 import lombok.extern.slf4j.Slf4j;
@@ -12,9 +14,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 /**
  * 결과를 모른 채 남은 환전 주문을 주기적으로 원장에 다시 보냅니다.
  * 주기는 가장 짧은 재시도 대기 시간(30초)과 같고, 주문별 대기 시간은 대상 조회가 거릅니다.
+ * 한 주기 안에서는 batch-size건씩 가져와 처리하고, 밀린 게 남았으면 time-budget까지 이어서 처리합니다(#317).
  * exchange.order.recovery.enabled=false이면 돌지 않습니다. (테스트·수동 확인용)
  * 주기마다 복구보다 먼저 주문 적체(처리 정체·사람 확인 대기) 수를 세어 지표를 갱신합니다.
- * 복구가 오래 걸려도(최대 50건 × 원장 호출) 지표가 늦어지지 않게 먼저 하고, 세기가 실패해도 복구는 계속합니다.
+ * 복구가 오래 걸려도(최대 time-budget) 지표가 늦어지지 않게 먼저 하고, 세기가 실패해도 복구는 계속합니다.
  */
 @Slf4j
 @Configuration(proxyBeanMethods = false)
@@ -26,17 +29,23 @@ public class ExchangeOrderRecoveryScheduler {
     private final ExchangeOrderRecoveryService recoveryService;
     private final ExchangeOrderBacklogMonitor backlogMonitor;
     private final int batchSize;
+    private final Duration timeBudget;
 
-    /** 배치 크기가 1보다 작으면 서버 시작 단계에서 실패합니다. */
+    /** 배치 크기가 1보다 작거나 제한 시간이 0 이하이면 서버 시작 단계에서 실패합니다. */
     public ExchangeOrderRecoveryScheduler(ExchangeOrderRecoveryService recoveryService,
                                           ExchangeOrderBacklogMonitor backlogMonitor,
-                                          @Value("${exchange.order.recovery.batch-size:50}") int batchSize) {
+                                          @Value("${exchange.order.recovery.batch-size:50}") int batchSize,
+                                          @Value("${exchange.order.recovery.time-budget:20s}") Duration timeBudget) {
         if (batchSize < 1) {
             throw new IllegalStateException("exchange.order.recovery.batch-size는 1 이상이어야 합니다: " + batchSize);
+        }
+        if (timeBudget == null || timeBudget.isNegative() || timeBudget.isZero()) {
+            throw new IllegalStateException("exchange.order.recovery.time-budget은 0보다 커야 합니다: " + timeBudget);
         }
         this.recoveryService = recoveryService;
         this.backlogMonitor = backlogMonitor;
         this.batchSize = batchSize;
+        this.timeBudget = timeBudget;
     }
 
     /** 한 주기가 실패해도 다음 주기는 돌도록 예외를 로그로만 남깁니다. */
@@ -45,7 +54,7 @@ public class ExchangeOrderRecoveryScheduler {
     public void recover() {
         backlogMonitor.refresh(); // 예외를 던지지 않음 (실패하면 이전 값 유지)
         try {
-            recoveryService.recover(batchSize);
+            recoveryService.recoverPending(batchSize, timeBudget);
         } catch (RuntimeException e) {
             log.error("환전 주문 복구 주기 실패: exception={}", e.getClass().getName(), e);
         }
