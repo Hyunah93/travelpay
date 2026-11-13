@@ -32,6 +32,7 @@ import com.travelpay.user.domain.model.vo.TermsDocumentId;
 import com.travelpay.user.domain.model.vo.UserStatus;
 import com.travelpay.user.domain.repository.UserConsentRepository;
 import com.travelpay.user.domain.repository.UserCredentialsRepository;
+import com.travelpay.user.domain.repository.UserProfile;
 import com.travelpay.user.domain.repository.UserRepository;
 import com.travelpay.user.domain.repository.UserSearchCondition;
 import com.travelpay.user.domain.repository.UserSearchItem;
@@ -475,6 +476,7 @@ class SignupServiceIntegrationTest {
             return new UserRepository() {
                 @Override public User save(User user) { return delegate.save(user); }
                 @Override public Optional<User> findById(UUID id) { return delegate.findById(id); }
+                @Override public Optional<UserProfile> findProfile(UUID id) { return delegate.findProfile(id); }
                 @Override public boolean existsByPhone(String phone) {
                     var exists = delegate.existsByPhone(phone);
                     state.synchronizeWrite(Race.PHONE);

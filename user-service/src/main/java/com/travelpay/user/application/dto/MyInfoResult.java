@@ -5,10 +5,9 @@ import java.util.List;
 import java.util.UUID;
 
 import com.travelpay.common.auth.AuthRole;
-import com.travelpay.user.domain.model.entity.User;
-import com.travelpay.user.domain.model.entity.UserCredentials;
 import com.travelpay.user.domain.model.vo.LoginMethod;
 import com.travelpay.user.domain.model.vo.UserStatus;
+import com.travelpay.user.domain.repository.UserProfile;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -30,10 +29,11 @@ public record MyInfoResult(
         loginMethods = List.copyOf(loginMethods);
     }
 
-    public static MyInfoResult from(User user, @Nullable UserCredentials credentials) {
-        return new MyInfoResult(user.getId(), user.getRealName(), user.getPhone(),
-                credentials == null ? null : credentials.getLoginEmail(), user.getStatus(), user.getRole(),
-                credentials == null ? List.of() : List.of(LoginMethod.PASSWORD), user.getCreatedAt());
+    // 로그인 이메일은 비밀번호 로그인 정보가 있을 때만 있으므로(열이 NOT NULL), 이메일이 있으면 비밀번호 로그인 수단이 있음
+    public static MyInfoResult from(UserProfile profile) {
+        return new MyInfoResult(profile.userId(), profile.realName(), profile.phone(), profile.loginEmail(),
+                profile.status(), profile.role(),
+                profile.loginEmail() == null ? List.of() : List.of(LoginMethod.PASSWORD), profile.createdAt());
     }
 
     @Override

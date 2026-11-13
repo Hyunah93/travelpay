@@ -23,6 +23,7 @@ import com.travelpay.user.common.config.JpaAuditingConfiguration;
 import com.travelpay.user.common.error.UserErrorCode;
 import com.travelpay.user.domain.model.entity.User;
 import com.travelpay.user.domain.model.vo.UserStatus;
+import com.travelpay.user.domain.repository.UserProfile;
 import com.travelpay.user.domain.repository.UserRepository;
 import com.travelpay.user.domain.repository.UserSearchCondition;
 import com.travelpay.user.domain.repository.UserSearchItem;
@@ -348,6 +349,7 @@ class AdminUserServiceIntegrationTest {
 
         @Override public User save(User user) { return delegate.save(user); }
         @Override public Optional<User> findById(UUID userId) { return delegate.findById(userId); }
+        @Override public Optional<UserProfile> findProfile(UUID userId) { return delegate.findProfile(userId); }
         @Override public boolean existsByPhone(String phone) { return delegate.existsByPhone(phone); }
         @Override public boolean increaseSessionVersion(UUID userId) { return delegate.increaseSessionVersion(userId); }
         @Override public List<UserSearchItem> search(UserSearchCondition condition, int offset, int limit) {

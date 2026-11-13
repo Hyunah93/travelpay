@@ -116,7 +116,7 @@ class MyInfoServiceIntegrationTest {
     }
 
     @Test
-    void readsTheMemberAndTheirSelfLoginWithTwoStatements() {
+    void readsTheMemberAndTheirSelfLoginWithOneStatement() {
         var userId = saveMember(true);
         var statistics = entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
         var statisticsWereEnabled = statistics.isStatisticsEnabled();
@@ -126,7 +126,7 @@ class MyInfoServiceIntegrationTest {
         try {
             myInfoService.getMyInfo(userId);
 
-            assertEquals(2L, statistics.getPrepareStatementCount(), "회원과 로그인 수단을 각각 한 번씩 조회해야 합니다.");
+            assertEquals(1L, statistics.getPrepareStatementCount(), "회원과 로그인 수단을 한 번에 조회해야 합니다.");
         }
         finally {
             statistics.setStatisticsEnabled(statisticsWereEnabled);
