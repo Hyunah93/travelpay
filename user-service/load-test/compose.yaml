@@ -1,0 +1,302 @@
+# User·Gateway 인증 비교 전용입니다. 기존 개발 Compose·DB·포트와 분리합니다.
+name: travelpay-auth-load-test
+
+x-app: &app
+  # 운영 Dockerfile과 같은 JRE입니다. 소스는 먼저 bootJar로 빌드합니다.
+  image: eclipse-temurin:21-jre@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=128m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-client-environment: &client-environment
+  SPRING_CONFIG_NAME: application-prod
+  SPRING_PROFILES_ACTIVE: prod
+  LOGGING_FILE_NAME: ""
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://auth-eureka:8761/eureka/
+  # 현재 운영 Task와 같은 주소 목록 갱신·캐시 정책입니다. User 중복 인증은 유지합니다.
+  EUREKA_INSTANCE_LEASE_RENEWAL_INTERVAL_IN_SECONDS: "5"
+  EUREKA_CLIENT_REGISTRY_FETCH_INTERVAL_SECONDS: "5"
+  SPRING_CLOUD_LOADBALANCER_CACHE_ENABLED: "false"
+  MANAGEMENT_SERVER_ADDRESS: 0.0.0.0
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  SPRING_APPLICATION_JSON: '{"management":{"metrics":{"distribution":{"percentiles-histogram":{"http.server.requests":true}}}}}'
+
+services:
+  auth-postgres:
+    image: postgres:18.6-bookworm
+    cpus: 1
+    mem_limit: 512m
+    shm_size: 128m
+    command: [postgres, -c, shared_preload_libraries=pg_stat_statements, -c, pg_stat_statements.track=all]
+    environment:
+      POSTGRES_DB: travelpay
+      POSTGRES_USER: auth_test_admin
+      POSTGRES_PASSWORD: load-test-only
+      # 공용 초기화 SQL이 여섯 서비스 계정을 모두 읽으므로, 이 시험에서 쓰지 않는 계정도 넣습니다(빠지면 초기화 실패).
+      USER_DB_USERNAME: user_app
+      USER_DB_PASSWORD: load-test-only
+      WALLET_DB_USERNAME: wallet_app
+      WALLET_DB_PASSWORD: load-test-only
+      PAYMENT_DB_USERNAME: payment_app
+      PAYMENT_DB_PASSWORD: load-test-only
+      EXCHANGE_DB_USERNAME: exchange_app
+      EXCHANGE_DB_PASSWORD: load-test-only
+      LEDGER_DB_USERNAME: ledger_app
+      LEDGER_DB_PASSWORD: load-test-only
+      MOCK_BANK_DB_USERNAME: mock_bank_app
+      MOCK_BANK_DB_PASSWORD: load-test-only
+    # 시험 데이터는 컨테이너를 삭제하면 사라집니다. 개발 DB에는 접근하지 않습니다.
+    tmpfs:
+      - /var/lib/postgresql:rw,size=256m
+    # 서비스 계정·스키마는 팀 공용 초기화 SQL을 그대로 씁니다(다른 부하 시험과 같은 방식).
+    volumes:
+      - ../../infra/postgres/init/01-service-schemas.sql:/docker-entrypoint-initdb.d/01-service-schemas.sql:ro
+      - ./init/02-pg-stat-statements.sql:/docker-entrypoint-initdb.d/02-pg-stat-statements.sql:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: postgres
+    healthcheck:
+      test: [CMD, pg_isready, -U, auth_test_admin, -d, travelpay]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  auth-redis:
+    image: redis:8.2.11-bookworm
+    cpus: 0.5
+    mem_limit: 256m
+    command: [redis-server, --requirepass, load-test-only, --maxmemory, 128mb, --maxmemory-policy, noeviction, --save, "", --appendonly, "no"]
+    environment:
+      REDISCLI_AUTH: load-test-only
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: redis-session
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  auth-eureka:
+    <<: *app
+    cpus: 0.5
+    mem_limit: 512m
+    command: [java, -jar, /app.jar]
+    environment:
+      SPRING_CONFIG_NAME: application-prod
+      SPRING_PROFILES_ACTIVE: prod
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx256m -XX:+ExitOnOutOfMemoryError
+      LOGGING_FILE_NAME: ""
+      EUREKA_INSTANCE_HOSTNAME: auth-eureka
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://auth-eureka:8761/eureka/
+      EUREKA_SERVER_EXPECTED_CLIENT_RENEWAL_INTERVAL_SECONDS: "5"
+      EUREKA_SERVER_RESPONSE_CACHE_UPDATE_INTERVAL_MS: "5000"
+      EUREKA_SERVER_ENABLE_SELF_PRESERVATION: "false"
+      MANAGEMENT_SERVER_PORT: "18061"
+      MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+    volumes:
+      - ../../eureka-server/build/libs/eureka-server-0.0.1-SNAPSHOT.jar:/app.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: eureka-server
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:18061/actuator/health/liveness]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  auth-user:
+    <<: *app
+    cpus: 2
+    mem_limit: 1024m
+    command: [java, -jar, /app.jar]
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+      auth-redis:
+        condition: service_healthy
+      auth-eureka:
+        condition: service_healthy
+    environment:
+      <<: *client-environment
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m -XX:+ExitOnOutOfMemoryError
+      EUREKA_INSTANCE_HOSTNAME: auth-user
+      USER_DB_URL: jdbc:postgresql://auth-postgres:5432/travelpay?currentSchema=user_service
+      USER_DB_USERNAME: user_app
+      USER_DB_PASSWORD: load-test-only
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "5"
+      SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE: "1"
+      REDIS_SESSION_HOST: auth-redis
+      REDIS_SESSION_PORT: "6379"
+      REDIS_SESSION_PASSWORD: load-test-only
+      # 시험망은 HTTP입니다. 운영 yml의 Secure 쿠키 설정은 바꾸지 않습니다.
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "false"
+      MANAGEMENT_SERVER_PORT: "18081"
+    volumes:
+      - ../build/libs/user-service-0.0.1-SNAPSHOT.jar:/app.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: user-service
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:18081/actuator/health/liveness]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  auth-gateway:
+    <<: *app
+    cpus: 1
+    mem_limit: 768m
+    command: [java, -jar, /app.jar]
+    depends_on:
+      auth-user:
+        condition: service_healthy
+    environment:
+      <<: *client-environment
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx384m -XX:+ExitOnOutOfMemoryError
+      EUREKA_INSTANCE_HOSTNAME: auth-gateway
+      GATEWAY_MANAGEMENT_PORT: "18080"
+    # 수동 확인·회원 준비에만 씁니다. k6·Prometheus는 Docker 내부 포트로 접근합니다.
+    ports:
+      - "127.0.0.1:28080:8080"
+    volumes:
+      - ../../gateway/build/libs/gateway-0.0.1-SNAPSHOT.jar:/app.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: gateway
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:18080/actuator/health/liveness]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  # ---------- 업무 API 경로(성능 B·장애 C) 전용. --profile business로만 띄웁니다 ----------
+  # 성능 A는 처음 기준선과 같은 조건이 되도록 이 구성을 끈 채 측정합니다. 세 서비스 코드는 바꾸지 않고 운영 설정으로 실행만 합니다.
+  # 운영처럼 Wallet은 Ledger·User를 Eureka로 찾습니다. 측정 대상(GET /api/v1/wallets/me)은 Wallet DB만 읽습니다.
+  auth-kafka:
+    image: apache/kafka:4.2.2
+    profiles: [business]
+    cpus: 1
+    mem_limit: 1024m
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: YpPuKnjuGLYUqVLlmxun8Q
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://auth-kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@auth-kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # 브로커가 1대라 내부 토픽 복제 수를 1로 맞춥니다. 토픽은 Wallet이 직접 만듭니다(자동 생성 끔, 운영과 같음).
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # 기본 힙 1GiB는 메모리 상한과 같아 컨테이너가 종료될 수 있습니다.
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: kafka
+    healthcheck:
+      test: [CMD-SHELL, "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # Wallet 개설(시험 준비)에서만 호출됩니다. 측정 대상 요청은 Ledger를 부르지 않습니다.
+  auth-ledger:
+    <<: *app
+    profiles: [business]
+    cpus: 0.5
+    mem_limit: 1024m
+    command: [java, -jar, /app.jar]
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+      auth-eureka:
+        condition: service_healthy
+    environment:
+      <<: *client-environment
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx512m -XX:+ExitOnOutOfMemoryError
+      EUREKA_INSTANCE_HOSTNAME: auth-ledger
+      LEDGER_DB_URL: jdbc:postgresql://auth-postgres:5432/travelpay?currentSchema=ledger_service
+      LEDGER_DB_USERNAME: ledger_app
+      LEDGER_DB_PASSWORD: load-test-only
+      MANAGEMENT_SERVER_PORT: "18085"
+    volumes:
+      - ../../ledger-service/build/libs/ledger-service-0.0.1-SNAPSHOT.jar:/app.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: ledger-service
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:18085/actuator/health/liveness]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  auth-wallet:
+    <<: *app
+    profiles: [business]
+    cpus: 2
+    mem_limit: 1536m
+    command: [java, -jar, /app.jar]
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+      auth-kafka:
+        condition: service_healthy
+      auth-ledger:
+        condition: service_healthy
+      auth-user:
+        condition: service_healthy
+    environment:
+      <<: *client-environment
+      JAVA_TOOL_OPTIONS: -Xms128m -Xmx768m -XX:+ExitOnOutOfMemoryError
+      EUREKA_INSTANCE_HOSTNAME: auth-wallet
+      WALLET_DB_URL: jdbc:postgresql://auth-postgres:5432/travelpay?currentSchema=wallet_service
+      WALLET_DB_USERNAME: wallet_app
+      WALLET_DB_PASSWORD: load-test-only
+      # 측정 전용 고정 키(Base64 32바이트, wallet 부하 시험과 같은 값). 다른 곳에 쓰지 않습니다.
+      WALLET_ACCOUNT_NUMBER_KEY: bG9hZC10ZXN0LW9ubHktd2FsbGV0LWtleS0zMmJ5dGU=
+      KAFKA_BOOTSTRAP_SERVERS: auth-kafka:9092
+      # 운영 설정에 필수인 값입니다. 충전을 시험하지 않으므로 Mock Bank는 띄우지 않습니다. 호출되면 연결 오류 로그로 드러납니다.
+      MOCK_BANK_URL: http://auth-mock-bank-not-started:8090
+      # 대사는 Mock Bank·Ledger를 주기적으로 부르므로 wallet 부하 시험과 같이 끕니다.
+      TRAVELPAY_WALLET_CHARGE_RECONCILIATION_ENABLED: "false"
+      MANAGEMENT_SERVER_PORT: "18082"
+    volumes:
+      - ../../wallet-service/build/libs/wallet-service-0.0.1-SNAPSHOT.jar:/app.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: wallet-service
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:18082/actuator/health/liveness]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: [k6]
+    cpus: 2
+    # 장애 시험은 응답이 멈춘 요청만큼 VU가 늘어나므로 여유를 둡니다. 부하 측정 결과에는 영향이 없습니다.
+    mem_limit: 2048m
+    # 결과 파일은 실행한 사용자가 소유합니다. UID/GID는 measure.py가 전달합니다.
+    user: "${LOAD_TEST_UID:-1000}:${LOAD_TEST_GID:-1000}"
+    volumes:
+      - ./:/scripts:ro
+      - ./results:/results
