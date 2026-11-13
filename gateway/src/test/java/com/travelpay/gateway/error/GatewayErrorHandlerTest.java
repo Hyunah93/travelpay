@@ -1,14 +1,28 @@
 package com.travelpay.gateway.error;
 
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
+import java.net.SocketException;
 import java.time.Duration;
+import java.util.List;
 import java.util.Set;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import io.netty.channel.ConnectTimeoutException;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
@@ -20,6 +34,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.ErrorResponseException;
 import org.springframework.web.server.MethodNotAllowedException;
 import org.springframework.web.server.ResponseStatusException;
+import reactor.netty.http.client.PrematureCloseException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -35,6 +50,107 @@ class GatewayErrorHandlerTest {
 
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final GatewayErrorHandler handler = new GatewayErrorHandler(mapper);
+    private final ListAppender<ILoggingEvent> log = new ListAppender<>();
+
+    @BeforeEach
+    void captureLog() {
+        log.start();
+        ((Logger) LoggerFactory.getLogger(GatewayErrorHandler.class)).addAppender(log);
+    }
+
+    @AfterEach
+    void releaseLog() {
+        ((Logger) LoggerFactory.getLogger(GatewayErrorHandler.class)).detachAppender(log);
+    }
+
+    @Test
+    void aServiceClosingTheConnectionBeforeItsResponseIsA502() {
+        var exchange = exchange();
+
+        handler.handle(exchange, PrematureCloseException.TEST_EXCEPTION).block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.BAD_GATEWAY, exchange.getResponse().getStatusCode());
+        assertEquals("COMMON_BAD_GATEWAY", errorBody(exchange).get("code").stringValue());
+    }
+
+    @Test
+    void aWrappedEarlyCloseIsA502WithoutTheWrapperMessage() {
+        var exchange = exchange();
+        var failure = new IllegalStateException("DO_NOT_EXPOSE_WRAPPER", PrematureCloseException.TEST_EXCEPTION);
+
+        handler.handle(exchange, failure).block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.BAD_GATEWAY, exchange.getResponse().getStatusCode());
+        assertEquals("COMMON_BAD_GATEWAY", errorBody(exchange).get("code").stringValue());
+        assertFalse(errorBody(exchange).toString().contains("DO_NOT_EXPOSE"));
+    }
+
+    // 강제 종료(RST)는 전송 방식에 따라 Netty 기본 전송·JDK 소켓 예외로 옵니다.
+    @ParameterizedTest
+    @ValueSource(strings = {"recvAddress(..) failed: Connection reset by peer", "Connection reset"})
+    void aServiceResettingTheConnectionIsA502(String message) {
+        var exchange = exchange();
+
+        handler.handle(exchange, new SocketException(message)).block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.BAD_GATEWAY, exchange.getResponse().getStatusCode());
+        assertEquals("COMMON_BAD_GATEWAY", errorBody(exchange).get("code").stringValue());
+    }
+
+    @Test
+    void anotherIoFailureStaysAnUnexpected500() {
+        var exchange = exchange();
+
+        handler.handle(exchange, new IOException("Broken pipe")).block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, exchange.getResponse().getStatusCode());
+        assertEquals(1, errors().size());
+    }
+
+    // 다른 서비스의 장애로 생기는 응답은 요청마다 반복되므로 ERROR로 남기지 않습니다.
+    @ParameterizedTest
+    @MethodSource("upstreamFailures")
+    void expectedUpstreamFailuresAreNotLoggedAsErrors(Throwable failure, int status) {
+        var exchange = exchange();
+
+        handler.handle(exchange, failure).block(Duration.ofSeconds(2));
+
+        assertEquals(status, exchange.getResponse().getStatusCode().value());
+        assertTrue(errors().isEmpty(), errors().toString());
+    }
+
+    static List<Arguments> upstreamFailures() {
+        return List.of(
+                Arguments.of(PrematureCloseException.TEST_EXCEPTION, 502),
+                Arguments.of(new SocketException("Connection reset"), 502),
+                Arguments.of(new ConnectException("Connection refused"), 503),
+                Arguments.of(
+                        new BusinessException(CommonErrorCode.SERVICE_UNAVAILABLE), 503),
+                Arguments.of(
+                        new ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT, "Response took longer than timeout"), 504));
+    }
+
+    @Test
+    void anUnclassifiedFailureIsLoggedAsAnErrorWithItsTypeOnly() {
+        handler.handle(exchange(), new IllegalStateException("DO_NOT_LOG_DETAIL")).block(Duration.ofSeconds(2));
+
+        assertEquals(1, errors().size());
+        assertTrue(errors().getFirst().getFormattedMessage().contains(IllegalStateException.class.getName()));
+        assertFalse(errors().getFirst().getFormattedMessage().contains("DO_NOT_LOG_DETAIL"));
+    }
+
+    // 프레임워크가 분류한 500은 Gateway 자체 오류라 계속 ERROR로 남깁니다.
+    @Test
+    void aClassifiedInternalErrorIsStillLogged() {
+        handler.handle(exchange(), new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR))
+                .block(Duration.ofSeconds(2));
+
+        assertEquals(1, errors().size());
+    }
+
+    private List<ILoggingEvent> errors() {
+        return log.list.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+    }
 
     @Test
     void businessErrorUsesTheSharedJsonContract() {

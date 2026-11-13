@@ -33,6 +33,8 @@ class GatewayConfigurationFilesTest {
     private static final String[] SHARED_PREFIXES = {
             "spring.cloud.gateway.server.webflux.routes", "travelpay.gateway."};
     private static final String SESSION_CONFIG = "travelpay.gateway.session-verification";
+    private static final String ROUTES = "spring.cloud.gateway.server.webflux.routes";
+    private static final String USER_RESPONSE_TIMEOUT = ROUTES + "[0].metadata.response-timeout";
 
     @Test
     void localAndProdHaveTheSameRoutesAndGatewaySettings() throws IOException {
@@ -110,6 +112,21 @@ class GatewayConfigurationFilesTest {
         assertEquals(Duration.ofMillis(400), properties.connectTimeout());
         assertEquals(Duration.ofSeconds(2), properties.responseTimeout());
         assertEquals(Duration.ofSeconds(7), properties.totalTimeout());
+    }
+
+    // Gateway는 라우트 응답 제한을 밀리초 숫자로만 읽고, 숫자가 아니거나 비어 있으면 조용히 무시해 제한이 없어집니다.
+    // 업무 라우트와 전체 HTTP 클라이언트에는 응답 제한을 두지 않습니다(이번 범위 밖).
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void onlyTheUserRouteHasAResponseLimitInMilliseconds(String filename) throws IOException {
+        var environment = environmentFor(filename);
+
+        assertEquals("user-service", environment.getProperty(ROUTES + "[0].id"));
+        assertEquals(10_000L, Long.parseLong(environment.getRequiredProperty(USER_RESPONSE_TIMEOUT)));
+        for (var route = 1; environment.containsProperty(ROUTES + "[" + route + "].id"); route++) {
+            assertNull(environment.getProperty(ROUTES + "[" + route + "].metadata.response-timeout"));
+        }
+        assertNull(environment.getProperty("spring.cloud.gateway.server.webflux.httpclient.response-timeout"));
     }
 
     @Test

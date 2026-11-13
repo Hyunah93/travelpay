@@ -148,9 +148,11 @@ Csrf-Token: 현재 세션의 유효한 토큰
 | 503 | `COMMON_SERVICE_UNAVAILABLE` | DB·시도 제한 Redis 등 저장소 처리 실패 |
 | 503 | `USER_ACCOUNT_UPDATED_SESSION_UNAVAILABLE` | **DB 변경은 완료됐지만 세션 갱신에 실패함. 새 비밀번호로 다시 로그인** |
 
-기존 세션 인증·회원 상태·CSRF 오류도 적용됩니다. CSRF 없이 User에 직접 PATCH 요청하면 인증 검사 전에 `403 COMMON_CSRF_INVALID`가 될 수 있습니다. 유효한 CSRF가 있어도 로그인되지 않은 세션은 `401 COMMON_UNAUTHORIZED`입니다.
+기존 세션 인증·회원 상태·CSRF 오류도 적용됩니다. 로그인 세션이 있는데 CSRF가 없거나 다르면 인증 검사 전에 `403 COMMON_CSRF_INVALID`입니다. 로그인 세션이 없으면 CSRF와 관계없이 `401 COMMON_UNAUTHORIZED`이며, Gateway의 세션 확인 API와 같은 순서입니다.
 
 전용 부분 성공 코드인 `USER_ACCOUNT_UPDATED_SESSION_UNAVAILABLE`을 받으면 이전 비밀번호로 변경 요청을 자동 재시도하지 않습니다. 저장소 복구 후 CSRF 토큰을 조회하고 **새 비밀번호로 로그인**합니다. 일반 503만으로 DB 변경 여부를 단정하지 말고, 복구 후 로그인으로 확인합니다. 장애 응답만으로 쿠키를 임의로 만료시키지는 않으며, 기존 쿠키가 계속 유효하다는 보장도 없습니다.
+
+Gateway를 거친 요청이 10초 안에 응답을 받지 못하면 `504 COMMON_GATEWAY_TIMEOUT`입니다. 이때도 User의 처리가 계속돼 DB 변경과 세션 ID 교체가 완료될 수 있습니다. 같은 변경 요청을 자동으로 다시 보내지 않습니다. 기존 쿠키로 `GET /api/v1/users/me`를 호출해 `401`이면 다시 로그인하되, 세션 교체 외에 만료·관리자 세션 종료로도 401이 되므로 새 비밀번호를 먼저 시도하고 실패하면 이전 비밀번호로 확인합니다. `200`이어도 DB 변경 여부는 단정할 수 없습니다.
 
 ### DB 작업 제한 시간
 

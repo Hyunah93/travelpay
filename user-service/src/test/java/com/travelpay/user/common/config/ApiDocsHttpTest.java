@@ -167,9 +167,11 @@ class ApiDocsHttpTest {
 
     @Test
     void csrfMarksMatchWhatTheServerRequires() throws Exception {
+        var signedIn = signedInSession();
         for (var operation : documentedOperations()) {
-            // 로그인 전 세션은 있고 토큰만 뺍니다. 세션이 없으면 로그아웃은 CSRF 확인 없이 401이 됩니다.
-            var response = call(operation, preLoginSession(), false);
+            // 클라이언트가 실제로 부르는 상태에서 토큰만 뺍니다. 로그인이 필요한 API는 로그인 세션으로, 공개 API는 로그인 전 세션으로
+            // 부릅니다. 로그인 세션이 없으면 로그인이 필요한 API는 CSRF 확인 없이 401이 됩니다.
+            var response = call(operation, operation.needsLogin() ? signedIn : preLoginSession(), false);
             assertEquals(operation.needsCsrf(), isCsrfRejection(response),
                     operation + " → " + response.statusCode());
         }
@@ -220,7 +222,7 @@ class ApiDocsHttpTest {
     }
 
     // 로그인 전 세션 쿠키와 그 세션의 CSRF 토큰
-    private record PreLoginSession(String cookie, String csrfToken) {
+    private record ClientSession(String cookie, String csrfToken) {
     }
 
     // "메서드 경로" → 두 그룹 문서에 나온 API 정보
@@ -253,14 +255,43 @@ class ApiDocsHttpTest {
         return operations;
     }
 
-    private PreLoginSession preLoginSession() throws Exception {
+    private ClientSession preLoginSession() throws Exception {
         var response = get("/api/v1/auth/csrf");
         assertEquals(200, response.statusCode());
         var token = mapper.readTree(response.body()).path("data").path("token").asString();
-        return new PreLoginSession(sessionCookie(response), token);
+        return new ClientSession(sessionCookie(response), token);
     }
 
-    private HttpResponse<String> call(DocumentedOperation operation, PreLoginSession session, boolean withCsrf)
+    // 가입·로그인 API로 만든 회원의 로그인 세션과 그 세션의 CSRF 토큰입니다.
+    private ClientSession signedInSession() throws Exception {
+        var anonymous = preLoginSession();
+        var consents = mapper.createArrayNode();
+        for (var terms : mapper.readTree(get("/api/v1/terms").body()).path("data").path("terms")) {
+            if (terms.path("isRequired").asBoolean()) {
+                consents.addObject().put("termsCode", terms.path("termsCode").asString())
+                        .put("termsVersion", terms.path("termsVersion").asString());
+            }
+        }
+        var signup = mapper.createObjectNode().put("loginEmail", "api-docs-member@example.com")
+                .put("password", "ApiDocsMember-2026!").put("realName", "문서확인").put("phone", "010-5555-0001");
+        signup.set("consents", consents);
+        assertEquals(201, post("/api/v1/users", anonymous, signup.toString()).statusCode());
+        var login = post("/api/v1/auth/login", anonymous,
+                "{\"loginEmail\":\"api-docs-member@example.com\",\"password\":\"ApiDocsMember-2026!\"}");
+        assertEquals(200, login.statusCode());
+        var cookie = sessionCookie(login);
+        var csrf = send(HttpRequest.newBuilder(uri("/api/v1/auth/csrf")).header("Cookie", cookie).GET());
+        assertEquals(200, csrf.statusCode());
+        return new ClientSession(cookie, mapper.readTree(csrf.body()).path("data").path("token").asString());
+    }
+
+    private HttpResponse<String> post(String path, ClientSession session, String body) throws Exception {
+        return send(HttpRequest.newBuilder(uri(path)).header("Cookie", session.cookie())
+                .header(AuthHeaders.CSRF_TOKEN, session.csrfToken()).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body)));
+    }
+
+    private HttpResponse<String> call(DocumentedOperation operation, ClientSession session, boolean withCsrf)
             throws Exception {
         var path = operation.path().replace("{userId}", UUID.randomUUID().toString());
         var hasBody = Set.of("POST", "PUT", "PATCH").contains(operation.method());

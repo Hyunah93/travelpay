@@ -186,16 +186,49 @@ class GatewayRoutingTest {
         assertTrue(arrived.header("Cookie").isEmpty());
     }
 
-    // 관리자 API도 User 라우트로 같은 방식(세션 확인 뒤 쿠키와 함께)으로 전달됨
+    // User 라우트(관리자 API 포함)는 user-service가 직접 인증하므로 세션 확인 없이 쿠키와 함께 전달됨. 회원 헤더는 붙이지 않음
     @ParameterizedTest
     @ValueSource(strings = {"/api/v1/users/me", "/api/v1/admin/users", "/api/v1/admin/terms"})
-    void userServiceStillReceivesTheCookieOnItsProtectedRoutes(String path) {
-        client().get().uri(path).header("Cookie", "SESSION=abc").exchange().expectStatus().isOk();
+    void userServiceAuthenticatesItsProtectedRoutesFromTheCookieWithoutSessionVerification(String path) {
+        client().get().uri(path).header("Cookie", "SESSION=abc")
+                .header("User-Id", UUID.randomUUID().toString()).header("User-Role", "MASTER")
+                .exchange().expectStatus().isOk();
 
-        assertEquals(1, USER.received(SESSION_VERIFICATION).size());
+        assertTrue(USER.received(SESSION_VERIFICATION).isEmpty());
         var arrived = USER.received(path).getFirst();
         assertEquals(List.of("SESSION=abc"), arrived.header("Cookie"));
-        assertEquals(List.of(MEMBER_ID.toString()), arrived.header("User-Id"));
+        assertTrue(arrived.header("User-Id").isEmpty());
+        assertTrue(arrived.header("User-Role").isEmpty());
+    }
+
+    @Test
+    void aUserStateChangeReachesUserServiceWithItsCsrfTokenAndWithoutSessionVerification() {
+        client().patch().uri("/api/v1/users/me/password")
+                .header("Cookie", "SESSION=abc").header("Csrf-Token", "csrf-1").header("Original-Method", "GET")
+                .header("Content-Type", "application/json").bodyValue("{}")
+                .exchange().expectStatus().isOk();
+
+        assertTrue(USER.received(SESSION_VERIFICATION).isEmpty());
+        var arrived = USER.received("/api/v1/users/me/password").getFirst();
+        assertEquals("PATCH", arrived.method());
+        assertEquals(List.of("SESSION=abc"), arrived.header("Cookie"));
+        assertEquals(List.of("csrf-1"), arrived.header("Csrf-Token"));
+        assertTrue(arrived.header("Original-Method").isEmpty());
+    }
+
+    // 세션 확인을 거치지 않는 User 라우트의 거절도 user-service의 상태·본문 그대로 브라우저에 전달됨
+    @Test
+    void aRejectionFromUserServiceItselfReachesTheBrowserAsItIs() {
+        var body = """
+                {"success":false,"data":null,"error":{"code":"COMMON_UNAUTHORIZED","message":"m","details":[]}}
+                """;
+        USER.reply("/api/v1/users/me", Reply.json(401, body));
+
+        var result = client().get().uri("/api/v1/users/me").exchange().expectStatus().isEqualTo(401)
+                .expectBody().returnResult();
+
+        assertEquals(MAPPER.readTree(body), MAPPER.readTree(new String(result.getResponseBodyContent(), UTF_8)));
+        assertTrue(USER.received(SESSION_VERIFICATION).isEmpty());
     }
 
     @Test
@@ -398,9 +431,10 @@ class GatewayRoutingTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"TRACE", "PROPFIND", "get"})
-    void anUnsupportedMethodReturns405AndAllowBeforeCallingServices(String method) throws IOException {
-        var response = raw(method, "/api/v1/wallets/me");
+    @CsvSource({"TRACE,/api/v1/wallets/me", "PROPFIND,/api/v1/wallets/me", "get,/api/v1/wallets/me",
+            "TRACE,/api/v1/users/me", "PROPFIND,/api/v1/admin/users"})
+    void anUnsupportedMethodReturns405AndAllowBeforeCallingServices(String method, String path) throws IOException {
+        var response = raw(method, path);
 
         assertTrue(response.startsWith("HTTP/1.1 405"), response);
         assertTrue(response.contains("COMMON_METHOD_NOT_ALLOWED"), response);

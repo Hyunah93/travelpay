@@ -7,7 +7,7 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.web.util.pattern.PathPattern;
 import org.springframework.web.util.pattern.PathPatternParser;
 
-/** 로그인 없이 쓰는 API 목록. 여기 없는 요청은 모두 세션 확인 API를 거칩니다(새 경로도 목록에 넣기 전까지는 보호). */
+/** 로그인 없이 쓰는 API 목록. 여기 없는 업무 API 요청은 세션 확인 API를 거칩니다(새 경로도 목록에 넣기 전까지는 보호). */
 final class PublicEndpoints {
 
     private static final List<Endpoint> ENDPOINTS = List.of(

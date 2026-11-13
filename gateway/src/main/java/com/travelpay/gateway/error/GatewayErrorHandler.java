@@ -1,5 +1,6 @@
 package com.travelpay.gateway.error;
 
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
 import java.util.Collections;
@@ -24,6 +25,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebExceptionHandler;
 import reactor.core.publisher.Mono;
+import reactor.netty.http.client.PrematureCloseException;
 import tools.jackson.databind.json.JsonMapper;
 
 @Component
@@ -31,6 +33,9 @@ import tools.jackson.databind.json.JsonMapper;
 public class GatewayErrorHandler implements WebExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GatewayErrorHandler.class);
+
+    private static final Set<Integer> UPSTREAM_FAILURES = Set.of(CommonErrorCode.BAD_GATEWAY.getStatus(),
+            CommonErrorCode.SERVICE_UNAVAILABLE.getStatus(), CommonErrorCode.GATEWAY_TIMEOUT.getStatus());
 
     private final JsonMapper mapper;
 
@@ -75,9 +80,16 @@ public class GatewayErrorHandler implements WebExceptionHandler {
                 error = ErrorResponse.of(CommonErrorCode.SERVICE_UNAVAILABLE);
                 break;
             }
+            // 요청을 보낸 뒤 응답을 다 받기 전에 다른 서비스가 연결을 닫음(처리 중 종료 등). 이미 처리됐을 수 있어 재시도 가능한 503과 구분해 502
+            if (current instanceof PrematureCloseException || isConnectionReset(current)) {
+                status = HttpStatusCode.valueOf(CommonErrorCode.BAD_GATEWAY.getStatus());
+                error = ErrorResponse.of(CommonErrorCode.BAD_GATEWAY);
+                break;
+            }
         }
 
-        if (status.is5xxServerError()) {
+        // 502·503·504는 다른 서비스 장애 때 요청마다 생기는 예상된 응답(건수는 HTTP 지표). 진짜 원인이 묻히지 않게 Gateway 자체 오류만 ERROR
+        if (status.is5xxServerError() && !UPSTREAM_FAILURES.contains(status.value())) {
             log.error("Unexpected exception type: {}", exception.getClass().getName());
         }
         response.setStatusCode(status);
@@ -91,5 +103,11 @@ public class GatewayErrorHandler implements WebExceptionHandler {
 
         byte[] payload = mapper.writeValueAsBytes(ApiResponse.failure(error));
         return response.writeWith(Mono.fromSupplier(() -> response.bufferFactory().wrap(payload)));
+    }
+
+    // 강제 종료(RST)된 연결은 운영체제·전송 방식마다 예외 종류와 문구가 달라('Connection reset by peer' 등) 공통 부분으로 구분
+    private static boolean isConnectionReset(Throwable error) {
+        return error instanceof IOException && error.getMessage() != null
+                && error.getMessage().contains("Connection reset");
     }
 }
