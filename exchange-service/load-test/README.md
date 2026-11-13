@@ -9,6 +9,7 @@ DB만 쓸 때와 Redis를 쓸 때를 같은 방법으로 재서 비교합니다(
 | 견적 발급 | `quote-issue.js` | 외화 한 통화의 최신 환율 읽기 + 견적 저장 (quote-db: DB INSERT + 커밋 / quote-redis: Redis SET, DB 연결 안 씀) |
 | 원장 장애 영향 (#282) | `exchange-order.js`, `quote-freshness.js` | 가짜 원장을 느리게 해 환전 신청이 요청 스레드를 붙잡는지, 예약 체결이 환율 수집을 늦추는지 (아래 "원장 장애 측정") |
 | 원장 속도 (#317) | `ledger-speed.js` | 진짜 원장이 환전 거래 한 건을 기록하는 시간과 동시 건수별 처리량 (아래 "원장 속도 측정") |
+| 원장 회복 뒤 확정 속도 (#317) | `recovery-fill.js` | 원장 장애로 쌓인 `PROCESSING`을 복구 스케줄러가 모두 확정하는 시간 (아래 "원장 회복 뒤 확정 속도 측정") |
 
 견적 발급은 견적 저장소 전환(#223) 하나의 효과만 봅니다: #223 머지 직전(quote-db, 환율은 Redis·견적은 DB) → #223 머지 커밋(quote-redis, 둘 다 Redis).
 환율을 Redis에서 읽는 효과는 환율 조회 측정(v0 → v0.5 → v1)으로 이미 검증했으므로, 견적은 바뀐 변수 하나만 비교합니다.
@@ -36,6 +37,8 @@ DB만 쓸 때와 Redis를 쓸 때를 같은 방법으로 재서 비교합니다(
 | `compose.monitoring.k6-rw.yaml` | 캡처용: 공용 Prometheus가 k6 결과(remote write)를 받게 하는 실행 옵션 (`K6_PROMETHEUS_RW=1`과 함께) |
 | `ledger-speed.js` | k6 스크립트(#317, 닫힌 모델): 진짜 원장에 환전 모양 거래를 동시 N건씩 보내 한 건 응답 시간과 처리량을 잼 |
 | `measure-ledger-speed.sh` | 원장 속도 측정: 동시 1·5·20건 × 3회, 회차마다 원장 DB를 새로 만들고 잠금 대기·커넥션 풀을 1초마다 기록 |
+| `recovery-fill.js` | k6 스크립트(#317): 원장 장애 중 환전 신청을 정확히 N건 보내 `PROCESSING`을 쌓음 |
+| `measure-recovery.sh` | 원장 회복 뒤 확정 속도 측정 한 회차: 쌓기 → 장애 유지 → 회복 → `PROCESSING` 0건까지 1초마다 기록 → 요약 |
 | `pc-state.sh` | 측정하는 PC의 전원 모드·충전기·팀 서비스 포트·IntelliJ 상태를 JSON 한 줄로 (Windows) |
 | `standby-events.sh` | 두 시각 사이 Windows 대기 모드 진입 횟수 (Windows 시스템 로그) |
 | `results/` | 측정 결과 JSON (커밋하지 않음. 비교에 쓴 값은 측정 기록 문서에 옮겨 적음) |
@@ -468,6 +471,47 @@ cd exchange-service/load-test
 - 처리량의 천장은 동시 5건 근처입니다. 20건은 5건보다 오히려 처리량이 낮고, 한 건 시간은 3배입니다. 원장 앱 CPU는 8~14%라 자원 부족이 아니라 시스템 계정 잠금 때문에 줄을 선 것입니다.
 - 결제 송금 측정(2026-11-06, 원장 거래 등록 서버 평균 41.5ms)보다 빠른 이유: 그 측정은 PC에서 띄운 서비스라 PC↔Docker 포트 전달을 지났고, PC CPU가 97.5%였으며, 원장 Hibernate 배치 설정(#294) 전이었습니다.
 - 빈 DB에서 시작한 값이라, 데이터가 많이 쌓인 운영 DB에서는 조금 느릴 수 있습니다.
+
+### 원장 회복 뒤 확정 속도 측정 (#317)
+
+원장 장애로 쌓인 `PROCESSING` 주문을, 원장이 회복된 뒤 **복구 스케줄러가 모두 확정하는 데 걸리는 시간**을 잽니다. 진짜 환전 서비스에 가짜 원장을 붙이고, 회복 후 가짜 원장의 응답 시간은 위 원장 속도 측정의 동시 1건 p50(2.87ms)에 맞춰 3ms로 둡니다.
+
+한 회차의 흐름(`measure-recovery.sh <이름> <건수>`):
+
+1. 가짜 원장을 응답 없음(지연 6초, 앱은 5초에 포기)으로 두고 환전 신청을 정확히 N건 보냄(`recovery-fill.js`) → 서킷이 열려 모두 `PROCESSING`. N건이 아니면 무효
+2. 장애를 `OUTAGE_AFTER_FILL`초 더 유지
+3. 가짜 원장 지연을 `RECOVERED_DELAY_MS`(기본 3ms)로 바꿈 = 원장 회복
+4. `PROCESSING`이 0건이 될 때까지 1초마다 주문 상태별 수, 서킷 상태, 원장 호출 수, 복구 주기 수를 기록
+
+**장애를 더 유지하는 시간**: 주문은 신청할 때 원장에 한 번 보내 확인 횟수 1로 시작하고, 복구 스케줄러는 `마지막 확인 + 30초 × 2^확인 횟수`가 지난 주문만 고릅니다(신청 뒤 최소 60초).
+- 신청이 끝나자마자 회복하면, 원장은 멀쩡한데 규칙 때문에 아무것도 안 하는 최대 60초가 결과에 섞입니다.
+- 60초보다 길게 두면 장애 중에 복구가 몇 건을 다시 보냈다 실패해 그 주문의 대기가 2분, 4분으로 늘어나고, 회복 뒤에도 늦게 처리되는 "꼬리"가 생깁니다.
+- 그래서 기본은 **60초**(최소 재시도 간격)로 회복 순간 모든 주문이 대상이 되게 하고, 꼬리를 보는 **긴 장애는 5분**(대기가 1분 → 2분 → 4분까지 늘어나는 길이)으로 따로 잽니다.
+
+| 측정 | 건수 | 장애 유지 | 횟수 |
+| --- | --- | --- | --- |
+| 기본 | 300 / 1,000 / 1,500건 | 60초 | 1 / 3 / 1회 |
+| 긴 장애 | 1,000건 | 5분 | 3회 |
+
+실제 장애 때 몇 건이 쌓일지는 운영 데이터가 없어 모릅니다. 그래서 건수를 바꿔 가며 재고, 결과는 건수와 관계없는 **분당 확정 수**로 냅니다. 300건은 복구 한 주기(50건)를 6번 도는, 반복 동작이 드러나는 최소 크기입니다.
+
+```bash
+# 저장소 루트에서: 개선 전 jar (측정 끝나도 지우지 않음)
+git worktree add ../travelpay-recovery-pre317 b57c0fb && (cd ../travelpay-recovery-pre317 && ./gradlew :exchange-service:bootJar)
+# 측정 폴더에서: 신청은 견적(Redis 키)을 읽으므로 측정 Redis를 noeviction으로. 같은 셸에서 끝까지 잽니다
+cd exchange-service/load-test
+export MEASURE_REDIS_MAXMEMORY=2gb MEASURE_REDIS_POLICY=noeviction
+docker compose up -d --force-recreate --wait measure-redis
+J=exchange-service/build/libs/exchange-service-0.0.1-SNAPSHOT.jar
+OUTAGE_AFTER_FILL=60 APP_JAR=../../../travelpay-recovery-pre317/$J ./measure-recovery.sh recovery-pre-1000-r1 1000
+OUTAGE_AFTER_FILL=300 APP_JAR=../../../travelpay-recovery-pre317/$J ./measure-recovery.sh recovery-pre-long-1000-r1 1000
+```
+
+- 결과: `results/<이름>-fill.json`(신청 결과), `-server.tsv`·`-server.tsv.db`(1초 기록), `-server.json`(요약·측정 조건)
+- 요약 값: 다 처리한 시간, 50·90·99% 처리 시각(회복 기준 초), 꼬리 주문 수(99%에 닿은 순간 남은 `PROCESSING`), 분당 확정 수, 회복 뒤 원장 호출 수와 초당 최대, 서킷이 닫힌 시각, 복구 주기 수, 최종 상태별 수(`COMPLETED` 말고 다른 상태가 없는지)
+- 정해진 시간(개선 전 규칙으로 걸릴 시간의 2배 + 10분) 안에 0건이 안 되면 그 사실을 결과에 남깁니다. 1초 기록은 정해진 시간이 지나면 스스로 멈춥니다.
+
+**시험 (100건, 장애 유지 70초, 2회)**: 다 처리 125·126초. 99건은 회복 후 36초에 끝났지만, 회복 직전 복구가 다시 보냈다 실패한 1~2건의 대기가 2분으로 늘어 전체가 길어졌습니다. 복구 한 주기(50건)는 0.78초로 주문 하나에 약 16ms(원장 3ms 포함)였습니다(충전기 연결 시. 배터리일 때는 약 30% 느림). 정식 측정 결과는 측정 뒤 채웁니다.
 
 ## 모니터링 연결 (Grafana 캡처)
 
