@@ -19,7 +19,8 @@ Gateway는 브라우저 요청을 받아, 업무 API는 User에 세션 검증을
 | `ClientIpResolver`·`ClientIpProperties` | 신뢰 연결 대역과 IP 형식 확인 |
 | `PublicEndpoints`·`SessionAuthenticationFilter` | 공개 요청·User 라우트 분류와 세션 확인 결과에 따른 전달·거절 |
 | `SessionVerificationClient` | 필요한 헤더만 전달하고 검증 응답을 엄격히 해석, 약속에 없는 응답은 ERROR 로그 |
-| `SessionVerificationConfiguration`·`SessionVerificationProperties` | 내부 HTTP 클라이언트와 관측·제한 시간 설정 |
+| `SessionVerificationConfiguration`·`SessionVerificationProperties` | 내부 HTTP 클라이언트와 관측·제한 시간 설정, 서킷·동시 호출 상한 생성 |
+| `SessionVerificationProtectionProperties` | 서킷·동시 호출 상한 값과 시작 시 검증 |
 | `GatewayErrorHandler` | 공통 JSON·HTTP 상태·Allow·no-store 처리, 서비스 연결 실패 503·응답 전 연결 종료 502 |
 | `GatewayCorsConfiguration` | 허용 출처 검증과 프레임워크 CORS 거절 응답 연결 |
 
@@ -157,6 +158,17 @@ User의 검증 거절 401·403·409는 상태와 본문을 전달하고, 연결 
 User 라우트는 응답 헤더를 받기까지 10초(라우트 `metadata.response-timeout: 10000`, 밀리초, 로컬·배포 같은 값)로 제한하고, 넘으면 504 `COMMON_GATEWAY_TIMEOUT`입니다. 가장 느린 정상 처리(부하 중 비밀번호 변경 최대 약 0.7초)보다 충분히 길고, 대부분의 경우 User 안의 대기 상한(DB 연결 2초·트랜잭션 5초·Redis 명령마다 2초)이 먼저 끝나 User가 직접 응답하도록 정한 값입니다. 여러 대기가 한 요청에서 겹치면 이 상한에 먼저 닿을 수 있습니다. Gateway는 이 값이 숫자가 아니거나 비어 있으면 조용히 무시하므로 환경 변수로 바꾸지 않고 설정 파일에 숫자로 고정합니다. 504는 처리 실패 확정이 아닙니다. Gateway가 기다리기를 그만둬도 User의 처리가 계속돼 비밀번호 변경 같은 DB 변경이 완료될 수 있으므로, 클라이언트는 같은 요청을 자동으로 다시 보내지 않고 인증 상태와 처리 결과를 확인합니다. 응답을 이미 보내기 시작한 뒤 끊긴 경우는 새 오류 JSON으로 바꿀 수 없어 불완전한 응답으로 끝납니다.
 
 요청을 보낸 뒤 서비스가 응답을 끝까지 보내기 전에 연결을 닫으면(정상 종료·강제 종료), 브라우저에 응답을 보내기 시작하기 전이라면 502 `COMMON_BAD_GATEWAY`입니다. 이미 처리됐을 수 있어 다시 보내도 되는 연결 실패 503과 구분하며, Gateway는 자동으로 다시 보내지 않습니다. 502·503·504는 다른 서비스 장애 때 요청마다 생기는 응답이라 `GatewayErrorHandler`가 ERROR 로그를 남기지 않고(건수는 HTTP 지표), 분류하지 못한 예외와 Gateway 자체 5xx만 ERROR로 남깁니다.
+
+세션 확인 API 호출에는 동시 호출 상한과 서킷을 둡니다(`travelpay.gateway.session-verification.protection`, 로컬·배포 같은 값, 값이 없거나 범위를 벗어나면 시작하지 않음). 순서는 바깥부터 동시 호출 상한 → 서킷 → 전체 상한(5초) → 세션 확인 API입니다.
+
+| 항목 | 값 | 동작 |
+|---|---|---|
+| 동시 호출 상한 | 100 | 넘으면 기다리지 않고 바로 503. 허가를 기다리면 Gateway의 요청 처리 스레드가 멈추므로 대기는 0으로 고정. 부하 시험의 정상 최대 동시 50건의 두 배 |
+| 서킷 열림 조건 | 최근 10초 호출 20건 이상, 장애 50% 이상 | 장애는 503으로 바뀐 실패(5xx·연결 실패·시간 초과·해석할 수 없는 응답)만 셈. 401·403·409 거절은 성공으로 셈 |
+| 열림 | 5초 | 세션 확인 API를 부르지 않고 바로 503. 이전 결과로 통과시키지 않고 쿠키도 지우지 않음 |
+| 반열림 | 시험 호출 5건 | 그중 장애가 50% 미만이면 닫힘. 요청이 없어도 열림 시간이 지나면 반열림으로 바뀜 |
+
+동시 호출 상한의 거절은 User 장애가 아니라 서킷 통계에 들지 않습니다. 브라우저가 연결을 끊어 확인이 취소되면 허가를 돌려주고 성공·실패로 세지 않습니다. User 라우트는 세션 확인 API를 거치지 않으므로 서킷이 열려도 영향을 받지 않습니다. 상태는 `resilience4j_circuitbreaker_state{name="session-verification"}`·`resilience4j_circuitbreaker_not_permitted_calls_total`, 동시 호출은 `resilience4j_bulkhead_available_concurrent_calls`와 거절 수 `session_verification_bulkhead_rejected_total`로 보고, 서킷 상태가 바뀌면 WARN 로그를 남깁니다.
 
 Gateway 수신 기본 한도는 8KiB이고, User는 로컬·배포 모두 16KiB로 두어 Gateway가 붙이는 내부 헤더의 여유를 확보했습니다. 테스트용 큰 쿠키는 검증 입력이며 실제 앱이 추가 쿠키를 발급하는 구조가 아닙니다.
 

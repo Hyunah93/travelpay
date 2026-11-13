@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.TreeMap;
 
 import com.travelpay.gateway.auth.SessionVerificationProperties;
+import com.travelpay.gateway.auth.SessionVerificationProtectionProperties;
 import org.springframework.cloud.gateway.config.GlobalCorsProperties;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -127,6 +128,16 @@ class GatewayConfigurationFilesTest {
             assertNull(environment.getProperty(ROUTES + "[" + route + "].metadata.response-timeout"));
         }
         assertNull(environment.getProperty("spring.cloud.gateway.server.webflux.httpclient.response-timeout"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void sessionVerificationProtectionUsesTheMeasuredLimits(String filename) throws IOException {
+        var properties = Binder.get(environmentFor(filename)).bindOrCreate(
+                "travelpay.gateway.session-verification.protection", SessionVerificationProtectionProperties.class);
+
+        assertEquals(new SessionVerificationProtectionProperties(100, Duration.ofSeconds(10), 20, 50f,
+                Duration.ofSeconds(5), 5), properties);
     }
 
     @Test

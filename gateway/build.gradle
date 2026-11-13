@@ -9,6 +9,12 @@ dependencies {
     implementation 'org.springframework.cloud:spring-cloud-starter-netflix-eureka-client'
     implementation 'org.springframework.cloud:spring-cloud-starter-loadbalancer'
 
+    // 세션 확인 API 호출의 동시 호출 제한·서킷. 버전은 Spring Cloud BOM이 정함(다른 서비스와 같은 버전)
+    implementation 'io.github.resilience4j:resilience4j-circuitbreaker'
+    implementation 'io.github.resilience4j:resilience4j-bulkhead'
+    implementation 'io.github.resilience4j:resilience4j-reactor'
+    implementation 'io.github.resilience4j:resilience4j-micrometer'
+
     implementation 'org.springframework.boot:spring-boot-starter-actuator'
     runtimeOnly 'io.micrometer:micrometer-registry-prometheus'
 
