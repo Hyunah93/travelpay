@@ -262,6 +262,8 @@ def request(opener, path, body=None, csrf=None, expected=(200,), method=None):
     req = urllib.request.Request("http://127.0.0.1:28080" + path, encoded, headers, method=method)
     try:
         with opener.open(req, timeout=10) as response:
+            if response.status == 204 and 204 in expected:
+                return None  # 비밀번호 변경처럼 본문 없이 성공하는 API
             payload = json.load(response)
             if response.status not in expected or payload.get("success") is not True:
                 raise RuntimeError(f"준비 요청 실패: {path} HTTP {response.status}")
@@ -691,6 +693,129 @@ def fault(args):
     print(f"결과 저장: {directory.relative_to(ROOT)}", flush=True)
 
 
+PROBE_PASSWORDS = ("Auth-Load-Probe-2026!", "Auth-Load-Probe-2026?")
+
+
+def timed_request(opener, path, body=None, csrf=None, expected=(200,), method=None):
+    started = time.perf_counter()
+    data = request(opener, path, body, csrf, expected, method)
+    return (time.perf_counter() - started) * 1000, data
+
+
+def summarize_ms(values):
+    return {"samples": len(values), "p50": percentile(values, 0.5), "p95": percentile(values, 0.95),
+            "max": max(values) if values else None}
+
+
+def ensure_member(email, password, phone):
+    if existing_member(email):
+        return
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    csrf = request(opener, "/api/v1/auth/csrf")
+    terms = request(opener, "/api/v1/terms")["terms"]
+    request(opener, "/api/v1/users", {
+        "loginEmail": email, "password": password, "realName": "부하시험", "phone": phone,
+        "consents": [{"termsCode": term["termsCode"], "termsVersion": term["termsVersion"]}
+                     for term in terms if term["isRequired"]],
+    }, csrf, expected=(201,))
+
+
+def logged_in(email, password):
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    csrf = request(opener, "/api/v1/auth/csrf")
+    request(opener, "/api/v1/auth/login", {"loginEmail": email, "password": password}, csrf)
+    return opener
+
+
+def slow_ops(args):
+    """User 라우트 응답 제한 값의 근거: 비싼 정상 처리의 가장 느린 시간을 쉬는 상태와 User CPU가 꽉 찬 상태에서 잽니다.
+
+    측정 요청은 수동 확인용 공개 포트(28080)로 Gateway를 거칩니다. 포트 전달 시간이 더해지므로 제한 값을 정할 때는 보수적인 쪽입니다.
+    시험 DB 전용 계정만 만들고, 관리자 계정은 격리된 시험 DB에서만 MASTER로 바꿉니다.
+    """
+    running = running_services()
+    require_sessions(False)
+    services = BASE_SERVICES + tuple(service for service in BUSINESS_SERVICES if service in running)
+    directory = new_result_directory(f"slow-ops-{args.label}")
+    write_json(directory / "environment.json", dict(environment(services), workload=vars(args)))
+    probe, master = "auth-load-probe@example.test", "auth-load-master@example.test"
+    ensure_member(probe, PROBE_PASSWORDS[0], "010-9800-0001")
+    ensure_member(master, PROBE_PASSWORDS[0], "010-9800-0002")
+    db("UPDATE user_service.users SET role='MASTER' WHERE id=(SELECT user_id FROM user_service.user_credentials "
+       f"WHERE login_email='{master}')")
+    # 이전 실행에서 비밀번호를 바꿔 둔 채 끝났을 수 있으므로 두 후보로 로그인을 시도합니다.
+    def login_probe():
+        for index, password in enumerate(PROBE_PASSWORDS):
+            try:
+                return logged_in(probe, password), index
+            except RuntimeError:
+                continue
+        raise RuntimeError("측정용 회원으로 로그인할 수 없습니다.")
+    stamp = int(time.time())
+
+    def run_phase(name):
+        samples = {op: [] for op in ("login", "password-change", "signup", "admin-users", "admin-terms", "my-info")}
+        session, current = login_probe()
+        admin = logged_in(master, PROBE_PASSWORDS[0])
+        for index in range(args.samples):
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            csrf = request(opener, "/api/v1/auth/csrf")
+            elapsed, _ = timed_request(opener, "/api/v1/auth/login",
+                                       {"loginEmail": probe, "password": PROBE_PASSWORDS[current]}, csrf)
+            samples["login"].append(elapsed)
+            # 비밀번호 변경은 세션 ID·CSRF를 바꾸므로 매번 CSRF를 다시 받고, 두 비밀번호를 번갈아 씁니다.
+            csrf = request(session, "/api/v1/auth/csrf")
+            elapsed, _ = timed_request(session, "/api/v1/users/me/password",
+                                       {"currentPassword": PROBE_PASSWORDS[current],
+                                        "newPassword": PROBE_PASSWORDS[1 - current]}, csrf, expected=(204,),
+                                       method="PATCH")
+            samples["password-change"].append(elapsed)
+            current = 1 - current
+            fresh = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+            csrf = request(fresh, "/api/v1/auth/csrf")
+            terms = request(fresh, "/api/v1/terms")["terms"]
+            elapsed, _ = timed_request(fresh, "/api/v1/users", {
+                "loginEmail": f"auth-load-signup-{stamp}-{name}-{index}@example.test", "password": PROBE_PASSWORDS[0],
+                # 가입마다 다른 번호(실행마다 바뀌는 가운데 자리 + 단계·순번)를 써서 중복 409를 피합니다.
+                "realName": "부하시험", "phone": f"010-{6000 + stamp % 3000:04d}-{(name == 'load') * 5000 + index:04d}",
+                "consents": [{"termsCode": term["termsCode"], "termsVersion": term["termsVersion"]}
+                             for term in terms if term["isRequired"]],
+            }, csrf, expected=(201,))
+            samples["signup"].append(elapsed)
+            samples["admin-users"].append(timed_request(admin, "/api/v1/admin/users?page=0&size=20")[0])
+            samples["admin-terms"].append(timed_request(admin, "/api/v1/admin/terms")[0])
+            samples["my-info"].append(timed_request(session, "/api/v1/users/me")[0])
+        return {op: summarize_ms(values) for op, values in samples.items()}, samples
+
+    print("쉬는 상태 측정", flush=True)
+    idle, idle_raw = run_phase("idle")
+    print(f"부하 상태 측정: 내 정보 조회 {args.vus} VU를 함께 실행", flush=True)
+    load = k6_command("my-info.js", directory, "load-summary.json",
+                      {"VUS": args.vus, "DURATION": f"{args.load_seconds}s"})
+    with (directory / "load.log").open("w") as output:
+        process = subprocess.Popen(load, cwd=ROOT, env=k6_environment(), stdout=output, stderr=subprocess.STDOUT)
+        try:
+            time.sleep(20)  # User CPU가 상한에 닿을 때까지 기다립니다.
+            loaded, loaded_raw = run_phase("load")
+            if process.poll() is not None:
+                raise RuntimeError("부하가 측정 도중 끝났습니다. --load-seconds를 늘리세요.")
+        finally:
+            if process.poll() is None:
+                subprocess.run(["docker", "stop", "-t", "1", K6_NAME], capture_output=True, timeout=15)
+            process.wait(timeout=30)
+    write_json(directory / "slow-ops.json", {"idle": idle, "load": loaded,
+                                             "raw": {"idle": idle_raw, "load": loaded_raw}})
+    lines = ["# User 정상 처리의 가장 느린 시간", "", f"측정: {directory.name} · 작업마다 {args.samples}회 · "
+             f"부하 상태는 내 정보 조회 {args.vus} VU 동시 실행", "",
+             "| 작업 | 쉬는 상태 p50 / p95 / 최대(ms) | 부하 상태 p50 / p95 / 최대(ms) |", "|---|---|---|"]
+    for op in idle:
+        cell = lambda item: f"{item['p50']:.1f} / {item['p95']:.1f} / {item['max']:.1f}"
+        lines.append(f"| {op} | {cell(idle[op])} | {cell(loaded[op])} |")
+    lines += ["", "Gateway를 거친 전체 시간이며 공개 포트 전달 시간이 포함됩니다."]
+    (directory / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"결과 저장: {directory.relative_to(ROOT)}", flush=True)
+
+
 def monitoring():
     env = dict(os.environ, MONITORING_LOAD_TEST_NETWORK="travelpay-auth-load-test_default",
                MONITORING_LOAD_TEST_TARGETS_FILE=str(HERE / "prometheus-targets.yml"))
@@ -726,6 +851,11 @@ def main():
     broken.add_argument("--seconds", type=int, default=150, help="전체 부하 시간")
     broken.add_argument("--at", type=int, default=30, help="부하 시작 뒤 장애를 넣을 시각(초)")
     broken.add_argument("--duration", type=int, default=20, help="장애 유지 시간(초)")
+    slow = sub.add_parser("slow-ops", help="로그인·비밀번호 변경·가입·관리자 조회의 가장 느린 시간(쉬는 상태·부하 상태)")
+    slow.add_argument("--label", default="baseline")
+    slow.add_argument("--samples", type=int, default=20)
+    slow.add_argument("--vus", type=int, default=60, help="부하 상태에서 함께 돌릴 내 정보 조회 동시 사용자 수")
+    slow.add_argument("--load-seconds", type=int, default=300)
     args = parser.parse_args()
     label = getattr(args, "label", None)
     if label is not None and not re.fullmatch(r"[a-zA-Z0-9_-]+", label):
@@ -734,6 +864,10 @@ def main():
         prepare(args.users, args.wallets)
     elif args.operation == "monitoring":
         monitoring()
+    elif args.operation == "slow-ops":
+        if min(args.samples, args.vus, args.load_seconds) < 1:
+            parser.error("횟수·동시성·부하 시간은 양수여야 합니다.")
+        slow_ops(args)
     elif args.operation == "run":
         if min(args.vus + [args.seconds, args.warmup, args.repeats]) < 1 or args.prewarm < 0:
             parser.error("동시성·시간·반복 횟수는 양수, 사전 예열은 0 이상이어야 합니다.")

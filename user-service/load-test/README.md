@@ -86,7 +86,7 @@ python3 user-service/load-test/measure.py fault --type stop --label baseline
 
 Wallet·Ledger의 메모리·Heap은 운영 Task 크기와 같습니다. DB 계정·스키마는 팀 공용 초기화 SQL(`infra/postgres/init/01-service-schemas.sql`)을 그대로 씁니다. Wallet의 대사 스케줄러는 wallet 부하 시험처럼 끄고, 충전을 시험하지 않으므로 Mock Bank는 띄우지 않습니다. k6 메모리는 장애 시험에서 응답을 기다리는 VU가 늘어나는 것에 대비한 값이며 앱 측 결과에는 영향이 없습니다.
 
-User는 운영과 같은 DB 풀 최대 5·최소 1, 연결 획득 2초·검증 1초를 사용합니다. Redis는 `noeviction`, 디스크 저장 없음입니다. 운영 파일만 읽고 HTTP 시험망에서 필요한 Secure 쿠키만 해제합니다. HTTP 히스토그램·로그·추적 설정도 비교 양쪽에서 유지합니다. Eureka의 현재 갱신 5초·목록 조회 5초와 LoadBalancer 캐시 비활성화는 유지하며, User 중복 인증은 변경하지 않습니다.
+User는 운영과 같은 DB 풀 최대 5·최소 1, 연결 획득 2초·검증 1초를 사용합니다. Redis는 `noeviction`, 디스크 저장 없음입니다. 운영 파일만 읽고 HTTP 시험망에서 필요한 Secure 쿠키만 해제합니다. HTTP 히스토그램·로그·추적 설정도 비교 양쪽에서 유지합니다. Eureka의 현재 갱신 5초·목록 조회 5초와 LoadBalancer 캐시 비활성화는 유지하며, 인증 흐름 같은 앱 동작은 시험 설정으로 바꾸지 않습니다.
 
 CPU 상한은 PC별 사용 가능 자원의 차이를 줄이기 위한 시험 조건입니다. ECS의 CPU 예약과 같은 의미가 아니며, 이 결과로 AWS 최대 처리량을 단정할 수 없습니다. Docker Desktop의 CPU·메모리 할당, 다른 프로세스·컨테이너 부하도 결과에 영향을 줍니다.
 

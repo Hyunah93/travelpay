@@ -8,17 +8,18 @@ const rate = Number(__ENV.RATE || '40');
 const duration = __ENV.DURATION || '120s';
 const users = requireUsers(1, true);
 
-function scenario(exec) {
-  // 응답이 최대 5초 멈추면 동시에 rate × 5개가 떠 있습니다. 장애 중에 VU를 새로 만드느라 요청을 못 보내지 않도록
-  // rate × 6개를 미리 만들어 둡니다. 그래도 부족하면 dropped_iterations(손실 요청)로 드러납니다.
+// 응답이 최대 N초 멈추면 동시에 rate × N개가 떠 있습니다. 장애 중에 VU를 새로 만드느라 요청을 못 보내지 않도록
+// 최대 대기보다 1초 많은 만큼 미리 만들어 둡니다. 그래도 부족하면 dropped_iterations(손실 요청)로 드러납니다.
+// 최대 대기: User API는 Gateway의 User 라우트 응답 제한 10초, 업무 API는 세션 확인 전체 상한 5초입니다.
+function scenario(exec, maxWaitSeconds) {
   return {
     executor: 'constant-arrival-rate', rate, timeUnit: '1s', duration, exec,
-    preAllocatedVUs: rate * 6, maxVUs: rate * 10, gracefulStop: '40s',
+    preAllocatedVUs: rate * (maxWaitSeconds + 1), maxVUs: rate * (maxWaitSeconds + 5), gracefulStop: '40s',
   };
 }
 
 export const options = {
-  scenarios: { my_info: scenario('myInfo'), wallet_me: scenario('walletMe') },
+  scenarios: { my_info: scenario('myInfo', 10), wallet_me: scenario('walletMe', 5) },
   summaryTrendStats: ['avg', 'med', 'p(95)', 'p(99)', 'max'],
   // error_code: 연결 끊김·응답 도중 중단 같은 전송 오류를 상태 코드와 따로 남깁니다.
   systemTags: ['status', 'name', 'scenario', 'error_code'],
