@@ -602,8 +602,11 @@ def inject(kind, seconds, events):
     now = lambda: time.time() * 1000
     target = container(FAULT_TARGETS[kind])
     if kind in ("pause", "pause-db"):
+        issued = now()
         command(["docker", "pause", target])
-        events["faultStart"] = now()
+        # DB는 일시 정지가 진행되는 동안 실행 중인 조회도 멈추므로 명령을 보낸 시각을 장애 시작으로 봅니다.
+        # User pause는 기존 측정과 같은 기준(명령이 끝난 시각)을 유지합니다.
+        events["faultStart"] = issued if kind == "pause-db" else now()
         time.sleep(seconds)
         events["releaseRequested"] = now()
         command(["docker", "unpause", target])
