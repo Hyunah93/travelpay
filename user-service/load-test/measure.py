@@ -41,8 +41,10 @@ SCENARIOS = {
     "wallet-me": {"script": "wallet-me.js", "business": True, "service": "auth-wallet", "port": 18082,
                   "uri": "/api/v1/wallets/me"},
 }
-FAULT_TARGETS = {"pause": "auth-user", "stop": "auth-user", "lock-users": "auth-postgres",
-                 "lock-credentials": "auth-postgres"}
+# pause-db는 DB 서버가 멈춘 상황(SQL 취소 요청도 처리되지 않음)입니다. 이 시험의 모든 서비스가 같은 PostgreSQL을 쓰므로
+# Wallet의 DB 조회도 함께 멈춥니다.
+FAULT_TARGETS = {"pause": "auth-user", "pause-db": "auth-postgres", "stop": "auth-user",
+                 "lock-users": "auth-postgres", "lock-credentials": "auth-postgres"}
 # C2a는 인증 조회(회원 테이블만 읽음)를, C2b는 인증을 통과한 뒤의 마이페이지 조회(로그인 정보 테이블)만 막습니다.
 LOCK_TABLES = {"lock-users": "user_service.users", "lock-credentials": "user_service.user_credentials"}
 
@@ -599,7 +601,7 @@ def inject(kind, seconds, events):
     """장애를 넣고 seconds 뒤 풉니다. 시각(ms)은 events에 기록합니다. 대상은 k6가 아니라 이 시험의 컨테이너뿐입니다."""
     now = lambda: time.time() * 1000
     target = container(FAULT_TARGETS[kind])
-    if kind == "pause":
+    if kind in ("pause", "pause-db"):
         command(["docker", "pause", target])
         events["faultStart"] = now()
         time.sleep(seconds)

@@ -55,17 +55,18 @@ python3 user-service/load-test/measure.py run --scenario wallet-me --label basel
 python3 user-service/load-test/measure.py fault --type pause --label baseline
 python3 user-service/load-test/measure.py fault --type lock-users --label baseline
 python3 user-service/load-test/measure.py fault --type lock-credentials --label baseline
+python3 user-service/load-test/measure.py fault --type pause-db --label baseline
 python3 user-service/load-test/measure.py fault --type stop --label baseline
 ```
 
-순서는 성능 A → (업무 구성 켜기) 성능 B → 장애 `pause` → `lock-users` → `lock-credentials` → `stop`입니다. `stop`은 User JVM을 다시 시작하므로 마지막에 두고, 그 뒤 성능을 다시 재려면 앱을 재생성하고 사전 예열부터 합니다. 성능 A로 돌아갈 때는 업무 구성만 내립니다(`docker compose ... --profile business stop auth-wallet auth-ledger auth-kafka`).
+순서는 성능 A → (업무 구성 켜기) 성능 B → 장애 `pause` → `lock-users` → `lock-credentials` → `pause-db` → `stop`입니다. `stop`은 User JVM을 다시 시작하므로 마지막에 두고, 그 뒤 성능을 다시 재려면 앱을 재생성하고 사전 예열부터 합니다. 성능 A로 돌아갈 때는 업무 구성만 내립니다(`docker compose ... --profile business stop auth-wallet auth-ledger auth-kafka`).
 
 - `prepare`: CSRF 조회 → 필수 약관 동의·가입 → 로그인 → 본인 프로필 확인. `--wallets`면 로그인 뒤 CSRF를 다시 받아 지갑을 개설하고 조회해 지갑 ID를 저장합니다. VU마다 다른 회원·세션을 사용합니다. 재실행하면 같은 시험 계정으로 다시 로그인합니다.
 - `run`: 먼저 기록하지 않는 사전 예열(`--prewarm`, 기본 120초, 가장 높은 동시성)로 새 JVM의 JIT 비용을 덜어 내고, 회차별 예열 뒤 정상 RPS·p50·p95·p99·오류를 수집합니다. 개선 전후 모두 앱을 새로 띄운 뒤 같은 사전 예열을 써야 공정합니다. 로그인·가입 시간은 제외합니다. 대기 시간 없이 반복하므로 VU 수는 실제 서비스의 전체 사용자 수와 다릅니다.
 - 성능 A는 HTTP 200과 회원 ID·이메일·ACTIVE·USER, 성능 B는 200과 본인 지갑 ID·ACTIVE까지 검사합니다. 인증 오류, 다른 회원의 응답, 서버 오류가 있으면 결과를 보존하고 중단합니다. 임의의 응답 시간 목표는 설정하지 않습니다.
 - SQL(역할별)·Redis 명령 통계와 서버 HTTP 카운터를 전후로 비교해 SELECT·Redis 명령·I01 횟수를 검산합니다. 초기 계정 생성과 예열은 제외합니다. Redis의 측정용 INFO·AUTH와 healthcheck PING·연결 관리 명령도 제외합니다. 명령 수는 네트워크 왕복 횟수와 다릅니다.
 - 컨테이너별 cgroup `cpu.stat`을 회차 전후로 읽어 **요청당 CPU 시간(ms)**과 **CPU 상한 때문에 멈춘 주기 비율·시간**을 남깁니다. CPU 상한에 닿은 구성에서는 지연 백분위수에 상한 대기가 섞이므로, 개선 효과는 요청당 CPU 시간과 함께 판단합니다.
-- `fault`: 두 API에 API마다 일정한 도착률(기본 40/초)로 150초 동안 요청하고, 30초에 장애를 넣어 20초 뒤 풉니다. `pause`는 User 컨테이너 일시 정지, `stop`은 정상 종료 후 재시작, `lock-users`·`lock-credentials`는 다른 세션이 각 테이블에 `ACCESS EXCLUSIVE` 잠금을 잡는 마이그레이션 잠금 재현입니다. 인증 조회는 회원 테이블(`users`)만 읽으므로 `lock-users`는 인증을 막고, `lock-credentials`는 인증을 통과한 뒤 마이페이지 조회만 막습니다. 응답 도중 끊긴 요청처럼 상태 코드만으로 구분되지 않는 전송 오류는 k6 오류 코드로 따로 셉니다. 요청별 시각·상태·지연(k6 CSV)으로 장애 전·중·후 성공률, 장애 중 p95·최대 지연, 첫 실패까지 시간, 해제 뒤 회복(5초 연속 전부 200이 된 첫 초)을 계산합니다. 응답이 멈춰도 요청이 줄지 않도록 도착률 고정 방식을 쓰며, VU가 모자라 못 보낸 요청은 손실 요청으로 기록합니다. 장애 중 오류를 오류로 세는 시험이므로 성능 측정과 섞지 않습니다.
+- `fault`: 두 API에 API마다 일정한 도착률(기본 40/초)로 150초 동안 요청하고, 30초에 장애를 넣어 20초 뒤 풉니다. `pause`는 User 컨테이너 일시 정지, `pause-db`는 PostgreSQL 컨테이너 일시 정지(DB 서버가 멈춰 SQL 취소도 처리되지 않는 상황, 모든 서비스가 같은 DB를 써서 Wallet 조회도 함께 멈춤), `stop`은 정상 종료 후 재시작, `lock-users`·`lock-credentials`는 다른 세션이 각 테이블에 `ACCESS EXCLUSIVE` 잠금을 잡는 마이그레이션 잠금 재현입니다. 인증 조회는 회원 테이블(`users`)만 읽으므로 `lock-users`는 인증을 막고, `lock-credentials`는 인증을 통과한 뒤 마이페이지 조회만 막습니다. 응답 도중 끊긴 요청처럼 상태 코드만으로 구분되지 않는 전송 오류는 k6 오류 코드로 따로 셉니다. 요청별 시각·상태·지연(k6 CSV)으로 장애 전·중·후 성공률, 장애 중 p95·최대 지연, 첫 실패까지 시간, 해제 뒤 회복(5초 연속 전부 200이 된 첫 초)을 계산합니다. 응답이 멈춰도 요청이 줄지 않도록 도착률 고정 방식을 쓰며, VU가 모자라 못 보낸 요청은 손실 요청으로 기록합니다. 장애 중 오류를 오류로 세는 시험이므로 성능 측정과 섞지 않습니다.
 - 측정 중 jar·컨테이너·설정을 바꾸거나 수동 API를 호출하지 않습니다. 다른 부하 시험도 동시에 실행하지 않습니다.
 
 시험 계정의 고정 암호와 DB·Redis의 `load-test-only`는 이 독립 환경 전용입니다. 실제 비밀값을 넣지 않습니다. 세션 쿠키는 `data/sessions.json`에 저장하고 Git에서 제외합니다. 세션이 만료되거나 Redis를 재시작하면 `prepare`를 다시 실행합니다.
