@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -88,8 +89,8 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
     private static final long TIMEOUT_DELAY_MS = 1_500;
     /** 성공은 하지만 느린 호출 기준(150ms)을 넘는 지연. 개선 전 측정의 원장 3초 상황을 줄인 것 */
     private static final long SLOW_DELAY_MS = 300;
-    /** 서킷이 열린 뒤 시험 호출을 허락하기까지 기다리는 시간(wait-in-open 1초)보다 조금 길게 */
-    private static final Duration AFTER_WAIT_IN_OPEN = Duration.ofMillis(1_200);
+    /** 서킷이 열린 뒤 반열림으로 바뀌기를 기다리는 최대 시간(wait-in-open 1초에 여유를 둠) */
+    private static final Duration HALF_OPEN_WAIT_LIMIT = Duration.ofSeconds(5);
 
     @Container
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:18.6-bookworm")
@@ -169,7 +170,7 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
 
         // 원장 회복. 서킷이 시험 호출을 허락할 때까지 기다리고, 주문 대기 시간(30초 × 2)이 지난 시점에 복구한다
         ledgerDelayMs = 0;
-        Thread.sleep(AFTER_WAIT_IN_OPEN.toMillis());
+        awaitHalfOpen();
         clock.set(NOW.plus(Duration.ofMinutes(2)));
 
         ExchangeOrderRecoveryService.RecoveryResult result = recoveryService.recover(10);
@@ -204,7 +205,7 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
         placeNewOrder().andExpect(status().isAccepted());
         assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
 
-        Thread.sleep(AFTER_WAIT_IN_OPEN.toMillis());
+        awaitHalfOpen();
         clock.set(NOW.plus(Duration.ofMinutes(2)));
 
         ExchangeOrderRecoveryService.RecoveryResult result = recoveryService.recover(10);
@@ -214,6 +215,68 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
         assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
         // 처음 두 건 + 시험 호출 두 건. 다시 열린 뒤 세 번째 주문은 보내지 않는다
         assertEquals(4, LEDGER_CALLS.get());
+    }
+
+    /**
+     * 장애 중 헛걸음해 재시도 대기가 늘어난 주문(꼬리)도, 원장이 회복된 뒤 한 번의 복구 주기에 함께 확정된다(#317).
+     * 1. 원장 장애 중 신청 3건 → 서킷 열림, 모두 PROCESSING(확인 횟수 1)
+     * 2. 1분 뒤 원장이 아직 장애일 때 복구: 반열림 시험 호출 2건이 실패해 그 2건은 확인 횟수 2(다음 시도까지 2분)가 되고,
+     *    서킷이 다시 열려 세 번째 주문은 선점하지 않는다(확인 횟수 1 그대로)
+     * 3. 원장 회복 뒤(신청 2분 뒤) 복구: 대기가 끝난 세 번째 주문이 성공해 원장이 살아 있음을 확인하고,
+     *    아직 대기 중인 꼬리 2건도 대기와 관계없이 이어서 처리한다
+     */
+    @Test
+    void tailOrdersAreRecoveredInOneCycleOnceTheLedgerAnswers() throws Exception {
+        ledgerDelayMs = TIMEOUT_DELAY_MS;
+        placeNewOrder().andExpect(status().isAccepted());
+        placeNewOrder().andExpect(status().isAccepted());
+        placeNewOrder().andExpect(status().isAccepted());
+        assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
+
+        // 2. 원장은 아직 장애
+        awaitHalfOpen();
+        clock.set(NOW.plusSeconds(61));
+        ExchangeOrderRecoveryService.RecoveryCycle duringOutage = recoveryService.recoverPending(50, Duration.ofSeconds(20));
+
+        assertEquals(ExchangeOrderRecoveryService.EndReason.LEDGER_UNAVAILABLE, duringOutage.endedBy());
+        assertEquals(Map.of(1, 1, 2, 2), checkCounts(), "시험 호출에 실패한 2건만 확인 횟수가 오르고, 서킷이 막은 1건은 그대로");
+
+        // 3. 원장 회복. 꼬리 2건은 마지막 확인(+61초)에서 2분이 지나지 않아 아직 재시도 대기 중
+        ledgerDelayMs = 0;
+        awaitHalfOpen();
+        clock.set(NOW.plusSeconds(122));
+        ExchangeOrderRecoveryService.RecoveryCycle afterRecovery = recoveryService.recoverPending(50, Duration.ofSeconds(20));
+
+        assertEquals(3, afterRecovery.settled());
+        assertEquals(true, afterRecovery.backoffSkipped(), "꼬리 2건은 재시도 대기를 무시하고 처리됨");
+        assertEquals(3, countOrders("COMPLETED"));
+        assertEquals(CircuitBreaker.State.CLOSED, ledgerCircuit.getState());
+        // 신청 때 2건(세 번째는 서킷이 막음) + 장애 중 시험 호출 2건 + 회복 뒤 3건
+        assertEquals(7, LEDGER_CALLS.get());
+    }
+
+    /** 확인 횟수별 주문 수 */
+    private Map<Integer, Integer> checkCounts() {
+        Map<Integer, Integer> counts = new HashMap<>();
+        jdbcTemplate.query("SELECT ledger_check_count, count(*) AS n FROM " + SCHEMA + ".exchange_orders GROUP BY ledger_check_count",
+                rs -> {
+                    counts.put(rs.getInt("ledger_check_count"), rs.getInt("n"));
+                });
+        return counts;
+    }
+
+    /**
+     * 서킷이 열린 뒤 대기 시간(1초)이 지나 반열림으로 바뀔 때까지 기다린다. 전환은 서킷 내부 타이머가 하므로(#317, 호출 없이 반열림)
+     * 고정 시간만 쉬면 타이머가 조금 늦을 때 아직 열림이라, 복구가 원장을 부르지 않고 건너뛰어 테스트가 흔들린다
+     */
+    private void awaitHalfOpen() throws InterruptedException {
+        long deadline = System.nanoTime() + HALF_OPEN_WAIT_LIMIT.toNanos();
+        while (ledgerCircuit.getState() == CircuitBreaker.State.OPEN) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("서킷이 반열림으로 바뀌지 않았습니다");
+            }
+            Thread.sleep(20);
+        }
     }
 
     private int countOrders(String status) {

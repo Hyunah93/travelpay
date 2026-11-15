@@ -63,6 +63,15 @@ public interface ExchangeOrderRepository {
     List<ExchangeOrder> findRecoveryTargets(Instant now, int limit);
 
     /**
+     * 재시도 대기 시간과 관계없이, cycleStartedAt 이후로 원장에 보내지 않은 PROCESSING 주문을 limit건까지 돌려줍니다.
+     * 복구 한 주기에서 원장이 결과를 준 뒤(원장이 살아 있음을 확인한 뒤) 쓰는 조회입니다. 대기는 죽은 원장을 계속 두드리지 않으려는
+     * 것이라, 원장이 살아 있으면 장애 중 헛걸음으로 늘어난 대기를 기다릴 이유가 없습니다(#317).
+     * 이번 주기에 이미 보낸 주문(마지막 확인이 cycleStartedAt 이후)은 빼서 같은 주문을 한 주기에 두 번 보내지 않습니다.
+     * 정렬은 findRecoveryTargets와 같습니다.
+     */
+    List<ExchangeOrder> findNotCheckedSince(Instant cycleStartedAt, int limit);
+
+    /**
      * 신청 시각이 cutoff 이전(같은 시각 포함)인데 아직 PROCESSING인 주문 수입니다. 원장 결과를 오래 확정하지 못한(정체) 주문을 셉니다.
      * 상태는 바꾸지 않습니다. 재시도와 24시간 뒤 사람 확인으로 넘기는 규칙은 그대로입니다.
      */

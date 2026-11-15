@@ -33,6 +33,8 @@ class LedgerCircuitBreakerConfigurationTest {
         assertEquals(Duration.ofSeconds(2), config.getSlowCallDurationThreshold());
         assertEquals(50f, config.getSlowCallRateThreshold());
         assertEquals(5, config.getPermittedNumberOfCallsInHalfOpenState());
+        // 복구는 서킷이 열려 있으면 원장을 부르지 않으므로, 호출이 없어도 대기 시간이 지나면 반열림으로 바뀌어야 한다(#317)
+        assertTrue(config.isAutomaticTransitionFromOpenToHalfOpenEnabled());
     }
 
     /** 결과 모름(시간 초과·연결 실패·5xx)만 실패로 센다. 거절·요청 문제는 원장이 건강하다는 뜻이라 세지 않는다 */
