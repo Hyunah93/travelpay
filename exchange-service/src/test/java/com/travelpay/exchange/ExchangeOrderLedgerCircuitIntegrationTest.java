@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -214,6 +215,54 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
         assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
         // 처음 두 건 + 시험 호출 두 건. 다시 열린 뒤 세 번째 주문은 보내지 않는다
         assertEquals(4, LEDGER_CALLS.get());
+    }
+
+    /**
+     * 장애 중 헛걸음해 재시도 대기가 늘어난 주문(꼬리)도, 원장이 회복된 뒤 한 번의 복구 주기에 함께 확정된다(#317).
+     * 1. 원장 장애 중 신청 3건 → 서킷 열림, 모두 PROCESSING(확인 횟수 1)
+     * 2. 1분 뒤 원장이 아직 장애일 때 복구: 반열림 시험 호출 2건이 실패해 그 2건은 확인 횟수 2(다음 시도까지 2분)가 되고,
+     *    서킷이 다시 열려 세 번째 주문은 선점하지 않는다(확인 횟수 1 그대로)
+     * 3. 원장 회복 뒤(신청 2분 뒤) 복구: 대기가 끝난 세 번째 주문이 성공해 원장이 살아 있음을 확인하고,
+     *    아직 대기 중인 꼬리 2건도 대기와 관계없이 이어서 처리한다
+     */
+    @Test
+    void tailOrdersAreRecoveredInOneCycleOnceTheLedgerAnswers() throws Exception {
+        ledgerDelayMs = TIMEOUT_DELAY_MS;
+        placeNewOrder().andExpect(status().isAccepted());
+        placeNewOrder().andExpect(status().isAccepted());
+        placeNewOrder().andExpect(status().isAccepted());
+        assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
+
+        // 2. 원장은 아직 장애
+        awaitHalfOpen();
+        clock.set(NOW.plusSeconds(61));
+        ExchangeOrderRecoveryService.RecoveryCycle duringOutage = recoveryService.recoverPending(50, Duration.ofSeconds(20));
+
+        assertEquals(ExchangeOrderRecoveryService.EndReason.LEDGER_UNAVAILABLE, duringOutage.endedBy());
+        assertEquals(Map.of(1, 1, 2, 2), checkCounts(), "시험 호출에 실패한 2건만 확인 횟수가 오르고, 서킷이 막은 1건은 그대로");
+
+        // 3. 원장 회복. 꼬리 2건은 마지막 확인(+61초)에서 2분이 지나지 않아 아직 재시도 대기 중
+        ledgerDelayMs = 0;
+        awaitHalfOpen();
+        clock.set(NOW.plusSeconds(122));
+        ExchangeOrderRecoveryService.RecoveryCycle afterRecovery = recoveryService.recoverPending(50, Duration.ofSeconds(20));
+
+        assertEquals(3, afterRecovery.settled());
+        assertEquals(true, afterRecovery.backoffSkipped(), "꼬리 2건은 재시도 대기를 무시하고 처리됨");
+        assertEquals(3, countOrders("COMPLETED"));
+        assertEquals(CircuitBreaker.State.CLOSED, ledgerCircuit.getState());
+        // 신청 때 2건(세 번째는 서킷이 막음) + 장애 중 시험 호출 2건 + 회복 뒤 3건
+        assertEquals(7, LEDGER_CALLS.get());
+    }
+
+    /** 확인 횟수별 주문 수 */
+    private Map<Integer, Integer> checkCounts() {
+        Map<Integer, Integer> counts = new HashMap<>();
+        jdbcTemplate.query("SELECT ledger_check_count, count(*) AS n FROM " + SCHEMA + ".exchange_orders GROUP BY ledger_check_count",
+                rs -> {
+                    counts.put(rs.getInt("ledger_check_count"), rs.getInt("n"));
+                });
+        return counts;
     }
 
     /**
