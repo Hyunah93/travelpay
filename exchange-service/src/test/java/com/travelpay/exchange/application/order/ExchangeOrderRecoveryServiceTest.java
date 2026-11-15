@@ -238,6 +238,58 @@ class ExchangeOrderRecoveryServiceTest {
         verify(orderRepository, never()).findNotCheckedSince(NOW, 5);
     }
 
+    /**
+     * 처리할 양이 적으면 같은 주기 마무리 단계가 장애 끝자락 주문의 선점(10초)이 풀리기 전에 끝난다. 다음 주기에는 보낼 주문이 없어
+     * 원장이 결과를 주지 않지만, 직전 주기의 증거(원장이 처음 결과를 준 시각)로 마무리 단계를 돌아 그 주문을 다시 보낸다(#317 v4).
+     * v3까지는 이 주기에 증거가 없어 마무리 단계를 돌지 않았고, 그 주문이 재시도 대기(약 2분)를 기다렸다(v3 300건 측정)
+     */
+    @Test
+    void sweepsInTheNextCycleWithTheLastCycleLedgerAnswer() {
+        AtomicReference<Instant> now = new AtomicReference<>(NOW);
+        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, ledgerClient, clockOf(now));
+        // 주기 1: 원장이 결과를 줌(NOW에 보낸 주문이 확정). 장애 끝자락 주문은 선점이 남아 마무리 단계에서 확정되지 못함
+        ExchangeOrder blocked = withStatus(ExchangeOrderStatus.PROCESSING);
+        when(orderRepository.findRecoveryTargets(any(), eq(5))).thenReturn(orders(1), List.of());
+        when(ledgerProcessor.process(any())).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+        when(ledgerProcessor.process(blocked)).thenReturn(withStatus(ExchangeOrderStatus.PROCESSING),
+                withStatus(ExchangeOrderStatus.COMPLETED));
+        when(orderRepository.findNotCheckedSince(NOW, 5)).thenReturn(List.of(blocked));
+
+        RecoveryCycle first = timed.recoverPending(5, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(2, 2, 1, 1, 0, EndReason.NOTHING_LEFT, true), first);
+
+        // 주기 2(5초 뒤): 재시도 대기가 끝난 주문이 없어 원장에 보낼 게 없지만, 직전 주기의 증거로 마무리 단계를 돈다
+        now.set(NOW.plusSeconds(5));
+        RecoveryCycle second = timed.recoverPending(5, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(2, 1, 1, 0, 0, EndReason.NOTHING_LEFT, true), second);
+        verify(orderRepository, times(2)).findNotCheckedSince(NOW, 5);
+    }
+
+    /**
+     * 직전 증거는 원장이 처음 결과를 준 시각 + 선점 유효 시간(10초) 뒤에 시작한 주기까지만 쓴다. 그 주기에는 그보다 먼저 선점된
+     * 주문의 선점이 모두 풀려 있으므로 마무리 단계를 한 번 더 돌 이유가 없다. 원장이 계속 결과를 주지 않으면 평소처럼 재시도 대기를 따른다
+     */
+    @Test
+    void forgetsTheLedgerAnswerOnceTheClaimLeaseHasPassed() {
+        AtomicReference<Instant> now = new AtomicReference<>(NOW);
+        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, ledgerClient, clockOf(now));
+        when(orderRepository.findRecoveryTargets(any(), eq(5))).thenReturn(orders(1), List.of());
+        when(ledgerProcessor.process(any())).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+        when(orderRepository.findNotCheckedSince(any(), eq(5))).thenReturn(List.of());
+        timed.recoverPending(5, Duration.ofSeconds(20));
+
+        // 증거(NOW) + 10초에 시작한 주기: 마지막으로 마무리 단계를 돈다
+        now.set(NOW.plus(ExchangeOrderLedgerProcessor.CLAIM_LEASE));
+        assertEquals(true, timed.recoverPending(5, Duration.ofSeconds(20)).backoffSkipped());
+
+        // 그다음 주기: 증거가 없어 마무리 단계를 돌지 않는다
+        now.set(NOW.plus(ExchangeOrderLedgerProcessor.CLAIM_LEASE).plusSeconds(5));
+        assertEquals(false, timed.recoverPending(5, Duration.ofSeconds(20)).backoffSkipped());
+        verify(orderRepository, times(2)).findNotCheckedSince(NOW, 5);
+    }
+
     /** 이번 주기에 원장이 결과를 준 적이 없으면(살아 있는지 모름) 대기를 무시하지 않는다. 죽은 원장을 두드리지 않게 */
     @Test
     void keepsWaitingWhenTheLedgerHasNotAnswered() {
