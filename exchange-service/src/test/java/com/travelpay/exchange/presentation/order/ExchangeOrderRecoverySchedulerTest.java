@@ -5,13 +5,14 @@ import java.time.Duration;
 import com.travelpay.exchange.application.order.ExchangeOrderBacklogMonitor;
 import com.travelpay.exchange.application.order.ExchangeOrderRecoveryService;
 import org.junit.jupiter.api.Test;
-import org.mockito.InOrder;
 import org.springframework.dao.DataAccessResourceFailureException;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.mockito.Mockito.inOrder;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -29,14 +30,20 @@ class ExchangeOrderRecoverySchedulerTest {
         verify(recoveryService).recoverPending(20, BUDGET);
     }
 
-    /** 적체 지표는 복구보다 먼저 갱신합니다. 복구가 오래 걸려도 지표가 늦어지지 않게 하려는 것입니다. */
+    /** 복구는 자주(5초) 돌고 적체 지표는 따로(30초) 센다. 복구 주기에서는 지표를 세지 않는다(#317) */
     @Test
-    void refreshesBacklogBeforeRecovering() {
+    void recoveryDoesNotRefreshBacklog() {
         new ExchangeOrderRecoveryScheduler(recoveryService, backlogMonitor, 20, BUDGET).recover();
 
-        InOrder order = inOrder(backlogMonitor, recoveryService);
-        order.verify(backlogMonitor).refresh();
-        order.verify(recoveryService).recoverPending(20, BUDGET);
+        verify(backlogMonitor, never()).refresh();
+    }
+
+    @Test
+    void refreshesBacklogOnItsOwnSchedule() {
+        new ExchangeOrderRecoveryScheduler(recoveryService, backlogMonitor, 20, BUDGET).refreshBacklog();
+
+        verify(backlogMonitor).refresh();
+        verify(recoveryService, never()).recoverPending(anyInt(), any());
     }
 
     @Test
@@ -44,7 +51,6 @@ class ExchangeOrderRecoverySchedulerTest {
         when(recoveryService.recoverPending(50, BUDGET)).thenThrow(new DataAccessResourceFailureException("db down"));
 
         assertDoesNotThrow(() -> new ExchangeOrderRecoveryScheduler(recoveryService, backlogMonitor, 50, BUDGET).recover());
-        verify(backlogMonitor).refresh();
     }
 
     @Test
