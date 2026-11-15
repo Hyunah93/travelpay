@@ -24,11 +24,12 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 실제 설정 파일의 값으로, 세션 확인 API 장애가 이어지면 서킷이 열려 업무 API가 세션 확인 없이 바로 503을 받고
- * 세션 확인을 거치지 않는 User API는 그대로 동작하는지 확인합니다.
+ * 실제 설정 파일의 실패 기준으로, 세션 확인 API 장애가 이어지면 서킷이 열려 업무 API가 세션 확인 없이 바로 503을 받고
+ * 세션 확인을 거치지 않는 User API는 그대로 동작하는지 확인합니다. 열림 유지 시간만 테스트에서 30초로 늘려 느린 CI의 자동 전환을 피합니다.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "eureka.client.enabled=false",
+        "travelpay.gateway.session-verification.protection.open-duration=30s",
         "logging.level.root=WARN"
 })
 class GatewaySessionVerificationCircuitTest {

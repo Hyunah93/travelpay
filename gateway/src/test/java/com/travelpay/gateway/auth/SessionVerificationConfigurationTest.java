@@ -3,6 +3,7 @@ package com.travelpay.gateway.auth;
 import java.time.Duration;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
 
@@ -13,6 +14,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SessionVerificationConfigurationTest {
 
     private final SessionVerificationConfiguration configuration = new SessionVerificationConfiguration();
+
+    @Test
+    void circuitSettingsComeFromTheProtectionProperties() {
+        var properties = new SessionVerificationProtectionProperties(7, Duration.ofSeconds(9), 23, 67f,
+                Duration.ofSeconds(13), 3);
+
+        var circuitBreaker = configuration.sessionVerificationCircuitBreaker(properties, new SimpleMeterRegistry());
+        var config = circuitBreaker.getCircuitBreakerConfig();
+
+        assertEquals(SlidingWindowType.TIME_BASED, config.getSlidingWindowType());
+        assertEquals(9, config.getSlidingWindowSize());
+        assertEquals(23, config.getMinimumNumberOfCalls());
+        assertEquals(67f, config.getFailureRateThreshold());
+        assertEquals(13_000L, config.getWaitIntervalFunctionInOpenState().apply(1));
+        assertEquals(3, config.getPermittedNumberOfCallsInHalfOpenState());
+        assertTrue(config.isAutomaticTransitionFromOpenToHalfOpenEnabled());
+    }
 
     // 거절된 503은 로그를 남기지 않으므로 지표로만 알 수 있음
     @Test

@@ -21,11 +21,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cloud.client.loadbalancer.reactive.ReactorLoadBalancerExchangeFilterFunction;
+import org.springframework.cloud.gateway.config.HttpClientProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.netty.http.client.HttpClient;
+import reactor.netty.resources.ConnectionProvider;
 
 /** 세션 확인 API 전용 WebClient·서킷·동시 호출 상한을 만듭니다. WebClient는 빈으로 내놓지 않아 다른 호출과 섞이지 않습니다. */
 @Configuration(proxyBeanMethods = false)
@@ -42,9 +44,18 @@ class SessionVerificationConfiguration {
 
     @Bean
     SessionVerificationClient sessionVerificationClient(ReactorLoadBalancerExchangeFilterFunction loadBalancer,
-            ObservationRegistry observationRegistry, SessionVerificationProperties properties) {
+            ObservationRegistry observationRegistry, SessionVerificationProperties properties,
+            HttpClientProperties routingClient) {
+        // HttpClient.create()의 공용 연결 풀은 쉰 연결을 정리하지 않음. user-service(Tomcat 기본)가 60초 쉰 연결을 닫는 순간
+        // 그 연결로 보낸 확인 요청은 응답 전에 끊겨 503(서킷에도 장애로 셈)이 되므로, 전용 풀도 라우팅과 같은 idle 상한으로 재사용 시 폐기.
+        // 연결 수 상한은 공용 풀과 같은 500(동시 호출 상한보다 커서 연결을 기다리지 않음)
+        var connections = ConnectionProvider.builder(PROTECTION_NAME).maxConnections(500);
+        var maxIdleTime = routingClient.getPool().getMaxIdleTime();
+        if (maxIdleTime != null) {
+            connections.maxIdleTime(maxIdleTime);
+        }
         // 연결·응답 제한 시간. 넘으면 SessionVerificationClient가 503으로 바꿈
-        var httpClient = HttpClient.create()
+        var httpClient = HttpClient.create(connections.build())
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, Math.toIntExact(properties.connectTimeout().toMillis()))
                 .responseTimeout(properties.responseTimeout());
         var webClient = WebClient.builder()

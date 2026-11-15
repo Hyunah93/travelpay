@@ -10,6 +10,7 @@ import java.util.TreeMap;
 import com.travelpay.gateway.auth.SessionVerificationProperties;
 import com.travelpay.gateway.auth.SessionVerificationProtectionProperties;
 import org.springframework.cloud.gateway.config.GlobalCorsProperties;
+import org.springframework.cloud.gateway.config.HttpClientProperties;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -136,8 +137,19 @@ class GatewayConfigurationFilesTest {
         var properties = Binder.get(environmentFor(filename)).bindOrCreate(
                 "travelpay.gateway.session-verification.protection", SessionVerificationProtectionProperties.class);
 
-        assertEquals(new SessionVerificationProtectionProperties(100, Duration.ofSeconds(10), 20, 50f,
-                Duration.ofSeconds(5), 5), properties);
+        assertEquals(new SessionVerificationProtectionProperties(100, Duration.ofSeconds(5), 20, 50f,
+                Duration.ofSeconds(2), 5), properties);
+    }
+
+    // 다른 서비스가 쉰 연결을 닫는 60초(Tomcat 기본)보다 짧은 30초 넘게 쉰 연결은 꺼낼 때 버려, 닫히는 연결의 재사용을 줄임
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void routingConnectionsAreDroppedBeforeServicesCloseIdleConnections(String filename) throws IOException {
+        var properties = Binder.get(environmentFor(filename)).bindOrCreate(
+                "spring.cloud.gateway.server.webflux.httpclient", HttpClientProperties.class);
+
+        assertEquals(Duration.ofSeconds(30), properties.getPool().getMaxIdleTime());
+        assertTrue(properties.getPool().getMaxIdleTime().compareTo(Duration.ofSeconds(60)) < 0);
     }
 
     @Test
