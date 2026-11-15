@@ -193,7 +193,7 @@ class ExchangeOrderRecoveryServiceTest {
 
     /**
      * 대기가 지난 주문을 처리하다 원장이 결과를 주면(살아 있음), 대기가 남은 주문(장애 중 헛걸음한 꼬리)도 이번 주기에 처리한다.
-     * 이번 주기에 이미 보낸 주문은 고르지 않도록 주기 시작 시각을 기준으로 조회한다
+     * 원장이 결과를 주기 시작한 뒤에 보낸 주문은 고르지 않도록, 처음 확정된 주문을 보낸 시각을 기준으로 조회한다
      */
     @Test
     void processesOrdersStillWaitingOnceTheLedgerAnswers() {
@@ -206,6 +206,36 @@ class ExchangeOrderRecoveryServiceTest {
         assertEquals(new RecoveryCycle(3, 3, 3, 0, 0, EndReason.NOTHING_LEFT, true), cycle);
         verify(orderRepository, times(2)).findNotCheckedSince(NOW, 2);
         verify(ledgerProcessor, times(3)).process(any());
+    }
+
+    /**
+     * 장애 끝자락에 보낸 주문(5초 기다리다 시간 초과)은 원장이 결과를 주기 전에 보낸 것이라, 원장이 살아난 걸 확인하면 같은 주기에
+     * 다시 보낼 대상이 된다. 주기 시작 시각이 아니라 처음 확정된 주문을 보낸 시각(시간 초과 뒤)을 기준으로 조회한다.
+     * 주기 시작 시각을 기준으로 하면 이 주문은 "이번 주기에 이미 보낸 주문"으로 빠져 늘어난 재시도 대기(약 2분)를 기다렸다(#317 v2 측정)
+     */
+    @Test
+    void retriesOrderSentBeforeTheLedgerAnsweredInTheSameCycle() {
+        AtomicReference<Instant> now = new AtomicReference<>(NOW);
+        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, ledgerClient, clockOf(now));
+        List<ExchangeOrder> targets = orders(2);
+        when(orderRepository.findRecoveryTargets(any(), eq(5))).thenReturn(targets);
+        // 첫 주문: 장애 끝자락에 보내 5초 기다리다 시간 초과(PROCESSING으로 남음). 그사이 원장이 회복됨
+        when(ledgerProcessor.process(targets.get(0))).thenAnswer(invocation -> {
+            now.set(now.get().plusSeconds(5));
+            return withStatus(ExchangeOrderStatus.PROCESSING);
+        });
+        // 둘째 주문: 원장이 바로 결과를 줌
+        when(ledgerProcessor.process(targets.get(1))).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+        Instant ledgerAnsweredFrom = NOW.plusSeconds(5);
+        ExchangeOrder tail = withStatus(ExchangeOrderStatus.PROCESSING);
+        when(orderRepository.findNotCheckedSince(ledgerAnsweredFrom, 5)).thenReturn(List.of(tail));
+        when(ledgerProcessor.process(tail)).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+
+        RecoveryCycle cycle = timed.recoverPending(5, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(2, 3, 2, 1, 0, EndReason.NOTHING_LEFT, true), cycle);
+        verify(orderRepository).findNotCheckedSince(ledgerAnsweredFrom, 5);
+        verify(orderRepository, never()).findNotCheckedSince(NOW, 5);
     }
 
     /** 이번 주기에 원장이 결과를 준 적이 없으면(살아 있는지 모름) 대기를 무시하지 않는다. 죽은 원장을 두드리지 않게 */
