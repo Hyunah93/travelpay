@@ -162,7 +162,7 @@ statuses=$(psql_q -F ' ' -c "SELECT status, count(*) FROM exchange_service.excha
 awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
     FNR == NR {
         if ($1 >= from) {
-            done = n - $2
+            done = $3   # COMPLETED 수 (FAILED·MANUAL_REVIEW는 처리 비율에 넣지 않음)
             if (tFirst == "" && $3 > 0) tFirst = $1 - from
             if (t50 == "" && done >= n * 0.5) t50 = $1 - from
             if (t90 == "" && done >= n * 0.9) t90 = $1 - from
@@ -179,21 +179,22 @@ awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
         if (first == "") {
             first = $1
             if (pre != "") { c0 = preCalls; rc0 = preRc; rs0 = preRs; prev = pre; prevCalls = preCalls }
-            else { c0 = $4; rc0 = $6; rs0 = $7 }
         }
         if (prev != "" && $1 > prev && ($4 - prevCalls) / ($1 - prev) > maxCalls) maxCalls = ($4 - prevCalls) / ($1 - prev)
         if (closedAt == "" && $2 != "" && $2 + 0 == 0 && $3 + 0 == 0) closedAt = $1 - from
         prev = $1; prevCalls = $4; lastCalls = $4; rc1 = $6; rs1 = $7
     }
     END {
+        # 회복 직전 표본이 없으면 회복 뒤 누적값의 기준을 알 수 없어 null로 둔다(회복 뒤 첫 표본을 기준으로 하면 그 사이 호출이 빠짐)
         cycles = rc1 - rc0
         printf "  \"secondsTo50Percent\": %s,\n  \"secondsTo90Percent\": %s,\n  \"secondsTo99Percent\": %s,\n  \"tailOrdersAt99Percent\": %s,\n", \
             (t50 == "" ? "null" : t50), (t90 == "" ? "null" : t90), (t99 == "" ? "null" : t99), (tail == "" ? "null" : tail)
-        printf "  \"ledgerCallsAfterRecovery\": %d,\n  \"ledgerCallsPerSecMax\": %.1f,\n", lastCalls - c0, maxCalls
+        printf "  \"ledgerCallsAfterRecovery\": %s,\n  \"ledgerCallsPerSecMax\": %.1f,\n", (pre == "" ? "null" : lastCalls - c0), maxCalls
         printf "  \"circuitClosedSecondsAfterRecovery\": %s,\n", (closedAt == "" ? "null" : closedAt)
         printf "  \"secondsToFirstConfirm\": %s,\n", (tFirst == "" ? "null" : tFirst)
         printf "  \"ledgerCallsDuringOutage\": %s,\n", (outFirst == "" ? "null" : outLast - outFirst)
-        printf "  \"recoveryCycles\": %d,\n  \"recoveryCycleAvgSeconds\": %.2f,\n", cycles, (cycles > 0 ? (rs1 - rs0) / cycles : 0)
+        if (pre == "") printf "  \"recoveryCycles\": null,\n  \"recoveryCycleAvgSeconds\": null,\n"
+        else printf "  \"recoveryCycles\": %d,\n  \"recoveryCycleAvgSeconds\": %.2f,\n", cycles, (cycles > 0 ? (rs1 - rs0) / cycles : 0)
     }' "$samples.db" "$samples" >"$summary.tmp"
 # 환율 수집이 복구에 밀리지 않았는지(스케줄러 스레드 2개를 복구·예약 만료와 나눠 씀): 가짜 환율 JPY 수집 시각 사이
 # 최대 간격(초, 평소 5초). 장애 구간(신청 시작 ~ 회복)과 회복 구간(회복 ~ 다 처리)을 따로 본다
@@ -205,6 +206,13 @@ rate_gap() {
 rate_gap_outage=$(rate_gap "$fill_started" "$recovered_at")
 rate_gap_recovery=$(rate_gap "$recovered_at" "$([ "$drained_at" != null ] && echo "$drained_at" || date +%s)")
 echo "  \"rateCollectionMaxGapSeconds\": {\"outage\": ${rate_gap_outage}, \"recovery\": ${rate_gap_recovery}}," >>"$summary.tmp"
+# 다 처리는 PROCESSING이 0건(서비스와 같이 COMPLETED·FAILED·MANUAL_REVIEW 모두 확정)으로 잰다. 다만 이 측정은 지갑을 충분히
+# 충전하고 회복한 가짜 원장이 늘 성공하므로 전부 COMPLETED여야 정상이다. 다른 상태가 있으면 원장 호출 없이 끝난 주문이 처리
+# 속도에 섞였을 수 있어 무효로 두고, 결과 파일에도 valid=false로 남겨 성공 결과로 쓰지 않게 한다.
+# 처리 비율(50·90·99%)은 위에서 COMPLETED 수로 세므로, 유효 회차에서는 PROCESSING이 아닌 주문 수와 같다
+not_completed=$(psql_q -c "SELECT count(*) FROM exchange_service.exchange_orders WHERE status NOT IN ('COMPLETED', 'PROCESSING')")
+valid=true
+[ "$not_completed" = 0 ] || valid=false
 drain_seconds=null
 per_minute=null
 if [ "$drained_at" != null ]; then
@@ -214,6 +222,7 @@ fi
 {
     echo "{"
     echo "  \"label\": \"${LABEL}\","
+    echo "  \"valid\": ${valid},"
     echo "  \"orders\": ${ORDERS},"
     echo "  \"drainSeconds\": ${drain_seconds},"
     echo "  \"confirmedPerMinute\": ${per_minute},"
@@ -226,11 +235,7 @@ rm -f "$summary.tmp"
 if [ "$drained_at" = null ]; then
     echo "      ${MAX_WAIT}초 안에 PROCESSING이 0이 되지 않았습니다. 결과의 finalStatus를 보세요." >&2
 fi
-# 다 처리는 PROCESSING이 0건(서비스와 같이 COMPLETED·FAILED·MANUAL_REVIEW 모두 확정)으로 잰다. 다만 이 측정은 지갑을 충분히
-# 충전하고 회복한 가짜 원장이 늘 성공하므로 전부 COMPLETED여야 정상이다. 다른 상태가 있으면 원장 호출 없이 끝난 주문이 처리
-# 속도에 섞였을 수 있어 무효로 둔다
-not_completed=$(psql_q -c "SELECT count(*) FROM exchange_service.exchange_orders WHERE status NOT IN ('COMPLETED', 'PROCESSING')")
-if [ "$not_completed" != 0 ]; then
+if [ "$valid" != true ]; then
     echo "무효 측정: COMPLETED가 아닌 확정 주문이 ${not_completed}건 있습니다. 최종 상태: {${statuses}}" >&2
     exit 1
 fi
