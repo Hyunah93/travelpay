@@ -157,7 +157,30 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = timed.recoverPending(2, Duration.ofSeconds(15));
 
-        assertEquals(new RecoveryCycle(2, 4, 4, 0, 0, EndReason.TIME_BUDGET, false), cycle);
+        // 두 번째 묶음은 고른 시점(20초)에 이미 제한 시간이 지나 한 건도 보내지 않는다
+        assertEquals(new RecoveryCycle(2, 4, 2, 0, 0, EndReason.TIME_BUDGET, false), cycle);
+        verify(ledgerProcessor, times(2)).process(any());
+    }
+
+    /**
+     * 제한 시간은 주문을 보내기 전마다 확인한다. 원장이 느린 호출 기준(2초)보다 조금 빠르게(1.9초) 성공하면 서킷은 열리지 않는데,
+     * 묶음이 끝날 때만 확인하면 50건 묶음이 약 95초 동안 스케줄러 스레드를 붙잡는다(PR #341 리뷰)
+     */
+    @Test
+    void stopsWithinABatchOnceTheTimeBudgetPasses() {
+        AtomicReference<Instant> now = new AtomicReference<>(NOW);
+        ExchangeOrderRecoveryService timed = new ExchangeOrderRecoveryService(orderRepository, ledgerProcessor, ledgerClient, clockOf(now));
+        when(orderRepository.findRecoveryTargets(any(), eq(50))).thenReturn(orders(50));
+        when(ledgerProcessor.process(any())).thenAnswer(invocation -> {
+            now.set(now.get().plusMillis(1_900));
+            return withStatus(ExchangeOrderStatus.COMPLETED);
+        });
+
+        RecoveryCycle cycle = timed.recoverPending(50, Duration.ofSeconds(20));
+
+        // 0, 1.9, … 19.0초에 보낸 11건까지 처리하고, 20.9초가 된 다음 주문 앞에서 멈춘다
+        assertEquals(new RecoveryCycle(1, 50, 11, 0, 0, EndReason.TIME_BUDGET, false), cycle);
+        verify(ledgerProcessor, times(11)).process(any());
     }
 
     // ---- 서킷이 열려 있으면 고르지도 않음(#317) ----
