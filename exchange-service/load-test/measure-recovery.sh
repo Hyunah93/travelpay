@@ -154,16 +154,22 @@ fi
 echo "[6/6] 정리"
 statuses=$(psql_q -F ' ' -c "SELECT status, count(*) FROM exchange_service.exchange_orders GROUP BY status ORDER BY status" | awk '{ printf "%s\"%s\": %d", (n++ ? ", " : ""), $1, $2 }')
 # 회복 뒤 구간만: 50·90·99% 처리 시각과 꼬리 주문 수(99%에 닿은 순간 남은 PROCESSING), 원장 호출 수(초당 최대),
-# 서킷이 닫힌 시각, 복구 주기 수와 평균 주기 시간(빈 주기 포함)
-awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" '
+# 서킷이 닫힌 시각, 복구 주기 수와 평균 주기 시간(빈 주기 포함), 첫 확정 시각(회복을 알아채기까지 걸린 시간).
+# 장애 구간(신청이 끝난 뒤 ~ 회복 전)에 원장에 실제로 보낸 호출 수(서킷 반열림 시험·복구가 보낸 것)도 센다
+awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
     FNR == NR {
         if ($1 >= from) {
             done = n - $2
+            if (tFirst == "" && $3 > 0) tFirst = $1 - from
             if (t50 == "" && done >= n * 0.5) t50 = $1 - from
             if (t90 == "" && done >= n * 0.9) t90 = $1 - from
             if (t99 == "" && done >= n * 0.99) { t99 = $1 - from; tail = $2 }
         }
         next
+    }
+    $1 >= fe && $1 < from {
+        if (outFirst == "") outFirst = $4
+        outLast = $4
     }
     $1 >= from {
         if (prev != "" && $4 - prevCalls > maxCalls) maxCalls = $4 - prevCalls
@@ -177,8 +183,20 @@ awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" '
             (t50 == "" ? "null" : t50), (t90 == "" ? "null" : t90), (t99 == "" ? "null" : t99), (tail == "" ? "null" : tail)
         printf "  \"ledgerCallsAfterRecovery\": %d,\n  \"ledgerCallsPerSecMax\": %d,\n", lastCalls - c0, maxCalls
         printf "  \"circuitClosedSecondsAfterRecovery\": %s,\n", (closedAt == "" ? "null" : closedAt)
+        printf "  \"secondsToFirstConfirm\": %s,\n", (tFirst == "" ? "null" : tFirst)
+        printf "  \"ledgerCallsDuringOutage\": %s,\n", (outFirst == "" ? "null" : outLast - outFirst)
         printf "  \"recoveryCycles\": %d,\n  \"recoveryCycleAvgSeconds\": %.2f,\n", cycles, (cycles > 0 ? (rs1 - rs0) / cycles : 0)
     }' "$samples.db" "$samples" >"$summary.tmp"
+# 환율 수집이 복구에 밀리지 않았는지(스케줄러 스레드 2개를 복구·예약 만료와 나눠 씀): 가짜 환율 JPY 수집 시각 사이
+# 최대 간격(초, 평소 5초). 장애 구간(신청 시작 ~ 회복)과 회복 구간(회복 ~ 다 처리)을 따로 본다
+rate_gap() {
+    local v
+    v=$(psql_q -c "SELECT round(max(gap)::numeric, 1) FROM (SELECT collected_at, extract(epoch FROM collected_at - lag(collected_at) OVER (ORDER BY collected_at)) AS gap FROM exchange_service.exchange_rates WHERE source = 'MOCK' AND target_currency = 'JPY') g WHERE collected_at > to_timestamp($1) AND collected_at <= to_timestamp($2)")
+    echo "${v:-null}"
+}
+rate_gap_outage=$(rate_gap "$fill_started" "$recovered_at")
+rate_gap_recovery=$(rate_gap "$recovered_at" "$([ "$drained_at" != null ] && echo "$drained_at" || date +%s)")
+echo "  \"rateCollectionMaxGapSeconds\": {\"outage\": ${rate_gap_outage}, \"recovery\": ${rate_gap_recovery}}," >>"$summary.tmp"
 drain_seconds=null
 per_minute=null
 if [ "$drained_at" != null ]; then
@@ -200,5 +218,5 @@ rm -f "$summary.tmp"
 if [ "$drained_at" = null ]; then
     echo "      ${MAX_WAIT}초 안에 PROCESSING이 0이 되지 않았습니다. 결과의 finalStatus를 보세요." >&2
 fi
-echo "      결과: $(grep -o '"drainSeconds": [0-9a-z]*\|"secondsTo50Percent": [0-9a-z]*\|"secondsTo99Percent": [0-9a-z]*\|"tailOrdersAt99Percent": [0-9a-z]*\|"confirmedPerMinute": [0-9.a-z]*\|"recoveryCycles": [0-9]*\|"ledgerCallsPerSecMax": [0-9]*\|"circuitClosedSecondsAfterRecovery": [0-9a-z]*' "$summary" | tr '\n' ' ')"
+echo "      결과: $(grep -o '"drainSeconds": [0-9a-z]*\|"secondsToFirstConfirm": [0-9a-z]*\|"ledgerCallsDuringOutage": [0-9a-z]*\|"secondsTo50Percent": [0-9a-z]*\|"secondsTo99Percent": [0-9a-z]*\|"tailOrdersAt99Percent": [0-9a-z]*\|"confirmedPerMinute": [0-9.a-z]*\|"recoveryCycles": [0-9]*\|"ledgerCallsPerSecMax": [0-9]*\|"circuitClosedSecondsAfterRecovery": [0-9a-z]*' "$summary" | tr '\n' ' ')"
 echo "      최종 상태: {${statuses}}"
