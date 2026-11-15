@@ -4,9 +4,11 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
 import java.net.SocketException;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeoutException;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -14,6 +16,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.netty.channel.ConnectTimeoutException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,6 +37,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.ErrorResponseException;
 import org.springframework.web.server.MethodNotAllowedException;
 import org.springframework.web.server.ResponseStatusException;
+import reactor.netty.channel.AbortedException;
 import reactor.netty.http.client.PrematureCloseException;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -49,7 +53,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class GatewayErrorHandlerTest {
 
     private final JsonMapper mapper = JsonMapper.builder().build();
-    private final GatewayErrorHandler handler = new GatewayErrorHandler(mapper);
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+    private final GatewayErrorHandler handler = new GatewayErrorHandler(mapper, meterRegistry);
     private final ListAppender<ILoggingEvent> log = new ListAppender<>();
 
     @BeforeEach
@@ -107,6 +112,41 @@ class GatewayErrorHandlerTest {
         assertEquals(1, errors().size());
     }
 
+    @ParameterizedTest
+    @MethodSource("failuresBeforeSending")
+    void aFailureBeforeSendingIsA503WithoutAnErrorLog(Throwable failure, String cause) {
+        var exchange = exchange();
+
+        handler.handle(exchange, failure).block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, exchange.getResponse().getStatusCode());
+        assertEquals("COMMON_SERVICE_UNAVAILABLE", errorBody(exchange).get("code").stringValue());
+        assertFalse(errorBody(exchange).toString().contains("DO_NOT_EXPOSE"));
+        assertTrue(errors().isEmpty(), errors().toString());
+        assertEquals(1.0, upstreamFailures("503", cause));
+    }
+
+    static List<Arguments> failuresBeforeSending() {
+        return List.of(
+                Arguments.of(new UnknownHostException("DO_NOT_EXPOSE_HOST"), "UnknownHostException"),
+                Arguments.of(new IllegalStateException("DO_NOT_EXPOSE_WRAPPER",
+                        new UnknownHostException("DO_NOT_EXPOSE_HOST")), "UnknownHostException"),
+                Arguments.of(AbortedException.beforeSend(), "AbortedException"),
+                Arguments.of(new IllegalStateException("DO_NOT_EXPOSE_WRAPPER", AbortedException.beforeSend()),
+                        "AbortedException"));
+    }
+
+    @Test
+    void anAbortWithoutTheBeforeSendMarkerStaysAnUnexpected500() {
+        var exchange = exchange();
+
+        handler.handle(exchange, new AbortedException("DO_NOT_EXPOSE_UNCLASSIFIED_ABORT"))
+                .block(Duration.ofSeconds(2));
+
+        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, exchange.getResponse().getStatusCode());
+        assertEquals(1, errors().size());
+    }
+
     // 다른 서비스의 장애로 생기는 응답은 요청마다 반복되므로 ERROR로 남기지 않습니다.
     @ParameterizedTest
     @MethodSource("upstreamFailures")
@@ -130,6 +170,21 @@ class GatewayErrorHandlerTest {
                         new ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT, "Response took longer than timeout"), 504));
     }
 
+    // 로그 대신 지표로 원인을 봄: 가장 안쪽 원인 예외별로 셈
+    @Test
+    void expectedUpstreamFailuresAreCountedByTheirRootCause() {
+        handler.handle(exchange(), new ConnectException("Connection refused")).block(Duration.ofSeconds(2));
+        handler.handle(exchange(), new BusinessException(CommonErrorCode.SERVICE_UNAVAILABLE,
+                new IllegalStateException("wrapper", new TimeoutException()))).block(Duration.ofSeconds(2));
+        handler.handle(exchange(), PrematureCloseException.TEST_EXCEPTION).block(Duration.ofSeconds(2));
+        handler.handle(exchange(), new IllegalStateException("not an upstream failure")).block(Duration.ofSeconds(2));
+
+        assertEquals(1.0, upstreamFailures("503", "ConnectException"));
+        assertEquals(1.0, upstreamFailures("503", "TimeoutException"));
+        assertEquals(1.0, upstreamFailures("502", "PrematureCloseException"));
+        assertEquals(3, meterRegistry.find(GatewayErrorHandler.UPSTREAM_FAILURE_METRIC).counters().size());
+    }
+
     @Test
     void anUnclassifiedFailureIsLoggedAsAnErrorWithItsTypeOnly() {
         handler.handle(exchange(), new IllegalStateException("DO_NOT_LOG_DETAIL")).block(Duration.ofSeconds(2));
@@ -146,6 +201,11 @@ class GatewayErrorHandlerTest {
                 .block(Duration.ofSeconds(2));
 
         assertEquals(1, errors().size());
+    }
+
+    private double upstreamFailures(String status, String cause) {
+        return meterRegistry.get(GatewayErrorHandler.UPSTREAM_FAILURE_METRIC).tags("status", status, "cause", cause)
+                .counter().count();
     }
 
     private List<ILoggingEvent> errors() {

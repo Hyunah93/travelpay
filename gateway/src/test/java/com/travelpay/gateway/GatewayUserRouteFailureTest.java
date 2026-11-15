@@ -123,6 +123,24 @@ class GatewayUserRouteFailureTest {
         assertTrue(errors().isEmpty(), errors().toString());
     }
 
+    // 응답 헤더만 보내고 본문 전에 끊으면 502이며, 그 응답의 헤더(쿠키·이동 주소·길이)가 오류 응답에 섞이면 안 됨
+    @Test
+    void headersOfAResponseCutBeforeItsBodyDoNotLeakIntoThe502() throws IOException {
+        USER.behave(Behavior.HEADERS_THEN_CLOSE);
+
+        var response = raw("GET", "/api/v1/users/me");
+
+        assertTrue(response.startsWith("HTTP/1.1 502"), response);
+        var head = response.substring(0, response.indexOf("\r\n\r\n")).toLowerCase(java.util.Locale.ROOT);
+        assertFalse(head.contains("set-cookie"), response);
+        assertFalse(head.contains("location"), response);
+        assertFalse(head.contains("content-length: " + RawUserService.DECLARED_LENGTH), response);
+        // Gateway가 직접 붙인 헤더(CORS의 Vary)는 남아야 함
+        assertTrue(head.contains("vary: origin"), response);
+        var body = response.substring(response.indexOf("\r\n\r\n") + 4);
+        assertTrue(body.contains("\"COMMON_BAD_GATEWAY\""), response);
+    }
+
     @Test
     void aUserResponseCutOffAfterItStartedIsNotReplacedWithAnErrorJson() throws IOException {
         USER.behave(Behavior.CUT_OFF_BODY);
@@ -160,7 +178,7 @@ class GatewayUserRouteFailureTest {
                 .responseTimeout(Duration.ofSeconds(20)).build();
     }
 
-    enum Behavior { NEVER_RESPOND, CLOSE_BEFORE_RESPONSE, RESET_BEFORE_RESPONSE, CUT_OFF_BODY }
+    enum Behavior { NEVER_RESPOND, CLOSE_BEFORE_RESPONSE, RESET_BEFORE_RESPONSE, HEADERS_THEN_CLOSE, CUT_OFF_BODY }
 
     /** 요청을 읽은 뒤 정해 둔 방식으로 응답을 멈추거나 끊는 user-service 대역입니다. 받은 요청의 경로를 기록합니다. */
     static final class RawUserService implements AutoCloseable {
@@ -249,6 +267,13 @@ class GatewayUserRouteFailureTest {
                     }
                     // 닫을 때 남은 데이터를 버리고 RST를 보내게 합니다.
                     case RESET_BEFORE_RESPONSE -> socket.setSoLinger(true, 0);
+                    case HEADERS_THEN_CLOSE -> {
+                        var output = socket.getOutputStream();
+                        output.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                                + DECLARED_LENGTH + "\r\nSet-Cookie: SESSION=upstream-new; Path=/\r\nLocation: /leak\r\n\r\n")
+                                .getBytes(UTF_8));
+                        output.flush();
+                    }
                     case CUT_OFF_BODY -> {
                         var output = socket.getOutputStream();
                         output.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
