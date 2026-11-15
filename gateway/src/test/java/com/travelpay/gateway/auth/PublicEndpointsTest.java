@@ -12,20 +12,19 @@ class PublicEndpointsTest {
 
     @ParameterizedTest
     @CsvSource({
-            "GET,/api/v1/auth/csrf",
-            "GET,/api/v1/terms",
-            "POST,/api/v1/users",
-            "POST,/api/v1/auth/login",
-            "POST,/api/v1/auth/logout",
             "GET,/api/v1/exchange-rates",
             "GET,/api/v1/exchange-rates/USD"
     })
-    void anEndpointThatNeedsNoLoginIsPublic(String method, String path) {
+    void aBusinessEndpointThatNeedsNoLoginIsPublic(String method, String path) {
         assertTrue(PublicEndpoints.contains(request(method, path)));
     }
 
     @ParameterizedTest
+    // User API(회원가입·로그인·로그아웃 포함)는 User 라우트라 이 목록과 관계없이 user-service가 판단
     @CsvSource({
+            "GET,/api/v1/auth/csrf",
+            "POST,/api/v1/users",
+            "POST,/api/v1/auth/logout",
             "GET,/api/v1/users/me",
             "PATCH,/api/v1/users",
             "POST,/api/v1/terms",
