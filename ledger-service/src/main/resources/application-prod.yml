@@ -34,6 +34,12 @@ travelpay:
   auth:
     header-context:
       enabled: true
+  ledger:
+    integrity:
+      # 정합성 검사(GET /internal/v1/ledger/integrity) 검사별로 돌려주는 위반 최대 건수
+      violation-limit: 100
+      # 검사 트랜잭션 timeout(초). 거래 처리 timeout(3초)과 별도
+      timeout-seconds: 30
 
 server:
   port: 8080
