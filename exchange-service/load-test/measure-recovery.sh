@@ -9,11 +9,11 @@
 #   4. PROCESSING이 0이 될 때까지 1초마다 주문 상태별 수·서킷 상태·원장 호출 수·복구 주기 수를 기록
 #
 # 사용법: [OUTAGE_AFTER_FILL=120] [RECOVERED_DELAY_MS=3] APP_JAR=<jar> ./measure-recovery.sh <LABEL> <ORDERS>
-#   예: APP_JAR=../../../travelpay-recovery-pre317/$J ./measure-recovery.sh recovery-pre-1000-r1 1000
+#   예: APP_JAR=../../../travelpay-recovery-v0/$J ./measure-recovery.sh recovery-v0-1000-r1 1000
 #   결과: results/<LABEL>-fill.json(신청 결과) + -server.tsv(1초 기록) + -server.json(요약·측정 조건)
 set -euo pipefail
 
-LABEL=${1:?LABEL을 주세요 (예: recovery-pre-1000-r1)}
+LABEL=${1:?LABEL을 주세요 (예: recovery-v0-1000-r1)}
 ORDERS=${2:?쌓을 주문 수를 주세요 (예: 1000)}
 OUTAGE_AFTER_FILL=${OUTAGE_AFTER_FILL:-120}
 RECOVERED_DELAY_MS=${RECOVERED_DELAY_MS:-3}

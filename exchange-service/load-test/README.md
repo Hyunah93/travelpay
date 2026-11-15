@@ -495,16 +495,24 @@ cd exchange-service/load-test
 
 실제 장애 때 몇 건이 쌓일지는 운영 데이터가 없어 모릅니다. 그래서 건수를 바꿔 가며 재고, 결과는 건수와 관계없는 **분당 확정 수**로 냅니다. 300건은 복구 한 주기(50건)를 6번 도는, 반복 동작이 드러나는 최소 크기입니다.
 
+버전은 세 개이며, 결과 이름 앞부분(`recovery-v0-…`)과 jar를 둔 worktree(`../travelpay-recovery-v0`)에 같은 이름을 씁니다. 측정이 끝나도 worktree는 지우지 않습니다.
+
+| 버전 | 커밋 | 바뀐 점 |
+| --- | --- | --- |
+| v0 | `b57c0fb` | 개선 전: 30초마다 50건만 처리 |
+| v1 | `79ddd32` | 한 주기 안에서 50건씩 쉬지 않고 이어서 처리(제한 시간 20초) |
+| v2 | (최종) | v1 + 서킷이 열려 있으면 건너뛰기·원장이 응답하면 재시도 대기 무시·주기 5초 |
+
 ```bash
-# 저장소 루트에서: 개선 전 jar (측정 끝나도 지우지 않음)
-git worktree add ../travelpay-recovery-pre317 b57c0fb && (cd ../travelpay-recovery-pre317 && ./gradlew :exchange-service:bootJar)
+# 저장소 루트에서: 버전별 jar (v1은 79ddd32로 같은 방법)
+git worktree add ../travelpay-recovery-v0 b57c0fb && (cd ../travelpay-recovery-v0 && ./gradlew :exchange-service:bootJar)
 # 측정 폴더에서: 신청은 견적(Redis 키)을 읽으므로 측정 Redis를 noeviction으로. 같은 셸에서 끝까지 잽니다
 cd exchange-service/load-test
 export MEASURE_REDIS_MAXMEMORY=2gb MEASURE_REDIS_POLICY=noeviction
 docker compose up -d --force-recreate --wait measure-redis
 J=exchange-service/build/libs/exchange-service-0.0.1-SNAPSHOT.jar
-OUTAGE_AFTER_FILL=60 APP_JAR=../../../travelpay-recovery-pre317/$J ./measure-recovery.sh recovery-pre-1000-r1 1000
-OUTAGE_AFTER_FILL=300 APP_JAR=../../../travelpay-recovery-pre317/$J ./measure-recovery.sh recovery-pre-long-1000-r1 1000
+OUTAGE_AFTER_FILL=60 APP_JAR=../../../travelpay-recovery-v0/$J ./measure-recovery.sh recovery-v0-1000-r1 1000
+OUTAGE_AFTER_FILL=300 APP_JAR=../../../travelpay-recovery-v0/$J ./measure-recovery.sh recovery-v0-long-1000-r1 1000
 ```
 
 - 결과: `results/<이름>-fill.json`(신청 결과), `-server.tsv`·`-server.tsv.db`(1초 기록), `-server.json`(요약·측정 조건)
