@@ -88,8 +88,8 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
     private static final long TIMEOUT_DELAY_MS = 1_500;
     /** 성공은 하지만 느린 호출 기준(150ms)을 넘는 지연. 개선 전 측정의 원장 3초 상황을 줄인 것 */
     private static final long SLOW_DELAY_MS = 300;
-    /** 서킷이 열린 뒤 시험 호출을 허락하기까지 기다리는 시간(wait-in-open 1초)보다 조금 길게 */
-    private static final Duration AFTER_WAIT_IN_OPEN = Duration.ofMillis(1_200);
+    /** 서킷이 열린 뒤 반열림으로 바뀌기를 기다리는 최대 시간(wait-in-open 1초에 여유를 둠) */
+    private static final Duration HALF_OPEN_WAIT_LIMIT = Duration.ofSeconds(5);
 
     @Container
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:18.6-bookworm")
@@ -169,7 +169,7 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
 
         // 원장 회복. 서킷이 시험 호출을 허락할 때까지 기다리고, 주문 대기 시간(30초 × 2)이 지난 시점에 복구한다
         ledgerDelayMs = 0;
-        Thread.sleep(AFTER_WAIT_IN_OPEN.toMillis());
+        awaitHalfOpen();
         clock.set(NOW.plus(Duration.ofMinutes(2)));
 
         ExchangeOrderRecoveryService.RecoveryResult result = recoveryService.recover(10);
@@ -204,7 +204,7 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
         placeNewOrder().andExpect(status().isAccepted());
         assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
 
-        Thread.sleep(AFTER_WAIT_IN_OPEN.toMillis());
+        awaitHalfOpen();
         clock.set(NOW.plus(Duration.ofMinutes(2)));
 
         ExchangeOrderRecoveryService.RecoveryResult result = recoveryService.recover(10);
@@ -214,6 +214,20 @@ class ExchangeOrderLedgerCircuitIntegrationTest {
         assertEquals(CircuitBreaker.State.OPEN, ledgerCircuit.getState());
         // 처음 두 건 + 시험 호출 두 건. 다시 열린 뒤 세 번째 주문은 보내지 않는다
         assertEquals(4, LEDGER_CALLS.get());
+    }
+
+    /**
+     * 서킷이 열린 뒤 대기 시간(1초)이 지나 반열림으로 바뀔 때까지 기다린다. 전환은 서킷 내부 타이머가 하므로(#317, 호출 없이 반열림)
+     * 고정 시간만 쉬면 타이머가 조금 늦을 때 아직 열림이라, 복구가 원장을 부르지 않고 건너뛰어 테스트가 흔들린다
+     */
+    private void awaitHalfOpen() throws InterruptedException {
+        long deadline = System.nanoTime() + HALF_OPEN_WAIT_LIMIT.toNanos();
+        while (ledgerCircuit.getState() == CircuitBreaker.State.OPEN) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("서킷이 반열림으로 바뀌지 않았습니다");
+            }
+            Thread.sleep(20);
+        }
     }
 
     private int countOrders(String status) {
