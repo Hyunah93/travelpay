@@ -312,6 +312,28 @@ class ExchangeOrderPersistenceIntegrationTest {
     }
 
     /**
+     * 원장이 살아 있음을 확인한 뒤의 조회(#317): 재시도 대기가 남은 주문도 고르고, 이번 주기에 이미 확인한 주문과 확정된 주문은 뺀다.
+     */
+    @Test
+    void notCheckedSinceIgnoresBackoffButSkipsOrdersCheckedThisCycle() {
+        Instant cycleStartedAt = Instant.parse("2026-11-01T03:00:00Z");
+        UUID neverChecked = processingOrder("a", 0, null, cycleStartedAt.minusSeconds(5));
+        // 장애 중 헛걸음으로 대기가 4분 남은 주문도 고른다
+        UUID waitingLong = processingOrder("b", 3, cycleStartedAt.minusSeconds(10), cycleStartedAt.minus(Duration.ofMinutes(6)));
+        // 이번 주기에 이미 보낸 주문(주기 시작과 같은 시각 포함)은 고르지 않는다
+        processingOrder("c", 2, cycleStartedAt, cycleStartedAt.minus(Duration.ofMinutes(3)));
+        processingOrder("d", 2, cycleStartedAt.plusSeconds(1), cycleStartedAt.minus(Duration.ofMinutes(3)));
+        UUID manualReview = processingOrder("e", 1, cycleStartedAt.minusSeconds(60), cycleStartedAt.minus(Duration.ofHours(30)));
+        orderRepository.settleIfProcessing(manualReview,
+                Settlement.manualReview(ManualReviewReason.LEDGER_CONFLICT), cycleStartedAt);
+
+        List<UUID> targets = orderRepository.findNotCheckedSince(cycleStartedAt, 10).stream().map(ExchangeOrder::getId).toList();
+
+        assertEquals(List.of(neverChecked, waitingLong), targets);
+        assertEquals(1, orderRepository.findNotCheckedSince(cycleStartedAt, 1).size());
+    }
+
+    /**
      * 정체 = 신청 시각이 기준(지금 - 30분) 이전이고 아직 PROCESSING인 주문. 기준과 같은 시각은 세고, 1초라도 늦으면 세지 않는다.
      * 확정된 주문(COMPLETED·MANUAL_REVIEW)은 아무리 오래됐어도 세지 않는다.
      */

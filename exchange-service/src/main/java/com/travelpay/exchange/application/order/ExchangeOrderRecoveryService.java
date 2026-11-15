@@ -39,9 +39,11 @@ public class ExchangeOrderRecoveryService {
      * 확정하지 못했습니다(50건 처리에 약 0.6초, 나머지는 쉬는 시간).
      *
      * 이렇게 되면 주기를 끝냅니다.
-     * - 가져온 대상이 batchSize보다 적음: 밀린 게 없음
+     * - 가져온 대상이 batchSize보다 적음: 밀린 게 없음. 단 이 주기에 원장이 결과를 준 적이 있으면(원장이 살아 있음),
+     *   재시도 대기와 관계없이 이번 주기에 아직 보내지 않은 PROCESSING을 이어서 처리한다. 장애 중 헛걸음으로 대기가 2~4분
+     *   늘어난 주문이, 원장이 회복된 뒤에도 그 대기를 기다려 늦게 확정되던 꼬리를 없애려는 것이다
      * - 원장 서킷이 열려 있거나 원장이 연달아 결과를 주지 못함: 아직 장애라 다음 주기에 다시 봄.
- *   서킷이 열려 있으면 주문을 고르지도 않아 확인 횟수가 오르지 않는다
+     *   서킷이 열려 있으면 주문을 고르지도 않아 확인 횟수가 오르지 않는다
      * - 한 묶음에서 확정한 주문이 없음: 오류가 이어지는 등 더 돌아도 진전이 없음
      * - timeBudget이 지남: 스케줄러 스레드(환율 수집·예약 만료와 나눠 씀)를 오래 붙잡지 않게 남은 건 다음 주기로 넘김
      * 원장에는 지금처럼 한 건씩 보냅니다. 동시에 보내면 환전 거래가 모두 같은 시스템 계정을 잠가 처리량이 늘지 않습니다
@@ -49,7 +51,10 @@ public class ExchangeOrderRecoveryService {
      */
     public RecoveryCycle recoverPending(int batchSize, Duration timeBudget) {
         Objects.requireNonNull(timeBudget, "timeBudget");
-        Instant deadline = clock.instant().plus(timeBudget);
+        Instant cycleStartedAt = clock.instant();
+        Instant deadline = cycleStartedAt.plus(timeBudget);
+        boolean ledgerAnswered = false;
+        boolean backoffSkipped = false;
         int batches = 0;
         int found = 0;
         int settled = 0;
@@ -57,15 +62,21 @@ public class ExchangeOrderRecoveryService {
         int errors = 0;
         EndReason endedBy;
         while (true) {
-            Batch batch = recoverBatch(batchSize);
+            Batch batch = recoverBatch(batchSize, backoffSkipped ? cycleStartedAt : null);
             batches++;
             found += batch.result().found();
             settled += batch.result().settled();
             unsettled += batch.result().unsettled();
             errors += batch.result().errors();
+            // 확정(COMPLETED·FAILED·MANUAL_REVIEW)은 원장이 결과를 줬다는 뜻이다 = 원장이 살아 있다
+            ledgerAnswered |= batch.result().settled() > 0;
             if (batch.ledgerUnavailable()) {
                 endedBy = EndReason.LEDGER_UNAVAILABLE;
             } else if (batch.result().found() < batchSize) {
+                if (!backoffSkipped && ledgerAnswered && clock.instant().isBefore(deadline)) {
+                    backoffSkipped = true;
+                    continue;
+                }
                 endedBy = EndReason.NOTHING_LEFT;
             } else if (batch.result().settled() == 0) {
                 endedBy = EndReason.NO_PROGRESS;
@@ -76,10 +87,10 @@ public class ExchangeOrderRecoveryService {
             }
             break;
         }
-        RecoveryCycle cycle = new RecoveryCycle(batches, found, settled, unsettled, errors, endedBy);
+        RecoveryCycle cycle = new RecoveryCycle(batches, found, settled, unsettled, errors, endedBy, backoffSkipped);
         if (found > 0) {
-            log.info("환전 주문 복구 주기: batches={}, found={}, settled={}, unsettled={}, errors={}, endedBy={}",
-                    batches, found, settled, unsettled, errors, endedBy);
+            log.info("환전 주문 복구 주기: batches={}, found={}, settled={}, unsettled={}, errors={}, endedBy={}, backoffSkipped={}",
+                    batches, found, settled, unsettled, errors, endedBy, backoffSkipped);
         }
         if (endedBy == EndReason.TIME_BUDGET) {
             log.warn("복구 제한 시간({})이 지나 남은 주문은 다음 주기로 넘깁니다: settled={}", timeBudget, settled);
@@ -89,17 +100,22 @@ public class ExchangeOrderRecoveryService {
 
     /** 대상 주문 한 묶음을 처리하고 결과 건수를 돌려줍니다. 한 주문의 예상 밖 오류는 다른 주문 처리를 막지 않습니다. */
     public RecoveryResult recover(int limit) {
-        return recoverBatch(limit).result();
+        return recoverBatch(limit, null).result();
     }
 
-    private Batch recoverBatch(int limit) {
+    /**
+     * notCheckedSince가 null이면 재시도 대기가 지난 주문을, 아니면 대기와 관계없이 그 시각 이후로 보내지 않은 주문을 고릅니다.
+     */
+    private Batch recoverBatch(int limit, Instant notCheckedSince) {
         // 서킷이 열려 원장에 보낼 수 없으면 주문을 고르지도 않는다. 선점하면 보내지도 못하고 확인 횟수(재시도 대기)만 올라,
         // 원장이 회복된 뒤에도 그 주문이 늦게 처리된다(#317)
         if (!ledgerClient.isAvailable()) {
             log.debug("원장 서킷이 열려 있어 이번 복구는 건너뜁니다");
             return new Batch(new RecoveryResult(0, 0, 0, 0), true);
         }
-        List<ExchangeOrder> targets = orderRepository.findRecoveryTargets(clock.instant(), limit);
+        List<ExchangeOrder> targets = notCheckedSince == null
+                ? orderRepository.findRecoveryTargets(clock.instant(), limit)
+                : orderRepository.findNotCheckedSince(notCheckedSince, limit);
         int settled = 0;
         int unsettled = 0;
         int errors = 0;
@@ -150,8 +166,13 @@ public class ExchangeOrderRecoveryService {
     public record RecoveryResult(int found, int settled, int unsettled, int errors) {
     }
 
-    /** 복구 한 주기(묶음 여러 개)의 합계와 주기를 끝낸 이유입니다. */
-    public record RecoveryCycle(int batches, int found, int settled, int unsettled, int errors, EndReason endedBy) {
+    /**
+     * 복구 한 주기(묶음 여러 개)의 합계와 주기를 끝낸 이유입니다.
+     *
+     * @param backoffSkipped 원장이 살아 있음을 확인한 뒤 재시도 대기와 관계없이 남은 주문을 처리했는지
+     */
+    public record RecoveryCycle(int batches, int found, int settled, int unsettled, int errors, EndReason endedBy,
+                                boolean backoffSkipped) {
     }
 
     /** 복구 주기를 끝낸 이유 */

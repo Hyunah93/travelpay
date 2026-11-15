@@ -112,8 +112,10 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = service.recoverPending(2, Duration.ofSeconds(20));
 
-        assertEquals(new RecoveryCycle(3, 5, 5, 0, 0, EndReason.NOTHING_LEFT), cycle);
+        // 원장이 결과를 줬으므로 끝내기 전에 대기와 관계없는 조회를 한 번 더 한다(남은 게 없어 0건)
+        assertEquals(new RecoveryCycle(4, 5, 5, 0, 0, EndReason.NOTHING_LEFT, true), cycle);
         verify(orderRepository, times(3)).findRecoveryTargets(any(), eq(2));
+        verify(orderRepository, times(1)).findNotCheckedSince(NOW, 2);
     }
 
     /** 원장이 연달아 결과를 주지 못하면(아직 장애) 다음 묶음을 가져오지 않는다. 죽은 원장을 계속 두드리지 않게 */
@@ -138,7 +140,7 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = service.recoverPending(2, Duration.ofSeconds(20));
 
-        assertEquals(new RecoveryCycle(1, 2, 0, 0, 2, EndReason.NO_PROGRESS), cycle);
+        assertEquals(new RecoveryCycle(1, 2, 0, 0, 2, EndReason.NO_PROGRESS, false), cycle);
     }
 
     /** 밀린 게 남아도 제한 시간이 지나면 끝낸다. 스케줄러 스레드를 오래 붙잡지 않고 남은 건 다음 주기로 넘긴다 */
@@ -155,7 +157,7 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = timed.recoverPending(2, Duration.ofSeconds(15));
 
-        assertEquals(new RecoveryCycle(2, 4, 4, 0, 0, EndReason.TIME_BUDGET), cycle);
+        assertEquals(new RecoveryCycle(2, 4, 4, 0, 0, EndReason.TIME_BUDGET, false), cycle);
     }
 
     // ---- 서킷이 열려 있으면 고르지도 않음(#317) ----
@@ -167,7 +169,7 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = service.recoverPending(50, Duration.ofSeconds(20));
 
-        assertEquals(new RecoveryCycle(1, 0, 0, 0, 0, EndReason.LEDGER_UNAVAILABLE), cycle);
+        assertEquals(new RecoveryCycle(1, 0, 0, 0, 0, EndReason.LEDGER_UNAVAILABLE, false), cycle);
         verify(orderRepository, never()).findRecoveryTargets(any(), anyInt());
         verify(ledgerProcessor, never()).process(any());
     }
@@ -183,8 +185,39 @@ class ExchangeOrderRecoveryServiceTest {
 
         RecoveryCycle cycle = service.recoverPending(3, Duration.ofSeconds(20));
 
-        assertEquals(new RecoveryCycle(1, 3, 1, 0, 0, EndReason.LEDGER_UNAVAILABLE), cycle);
+        assertEquals(new RecoveryCycle(1, 3, 1, 0, 0, EndReason.LEDGER_UNAVAILABLE, false), cycle);
         verify(ledgerProcessor, times(1)).process(any());
+    }
+
+    // ---- 원장이 살아 있으면 늘어난 재시도 대기를 기다리지 않음(#317) ----
+
+    /**
+     * 대기가 지난 주문을 처리하다 원장이 결과를 주면(살아 있음), 대기가 남은 주문(장애 중 헛걸음한 꼬리)도 이번 주기에 처리한다.
+     * 이번 주기에 이미 보낸 주문은 고르지 않도록 주기 시작 시각을 기준으로 조회한다
+     */
+    @Test
+    void processesOrdersStillWaitingOnceTheLedgerAnswers() {
+        when(orderRepository.findRecoveryTargets(any(), eq(2))).thenReturn(orders(1));
+        when(orderRepository.findNotCheckedSince(NOW, 2)).thenReturn(orders(2), List.of());
+        when(ledgerProcessor.process(any())).thenReturn(withStatus(ExchangeOrderStatus.COMPLETED));
+
+        RecoveryCycle cycle = service.recoverPending(2, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(3, 3, 3, 0, 0, EndReason.NOTHING_LEFT, true), cycle);
+        verify(orderRepository, times(2)).findNotCheckedSince(NOW, 2);
+        verify(ledgerProcessor, times(3)).process(any());
+    }
+
+    /** 이번 주기에 원장이 결과를 준 적이 없으면(살아 있는지 모름) 대기를 무시하지 않는다. 죽은 원장을 두드리지 않게 */
+    @Test
+    void keepsWaitingWhenTheLedgerHasNotAnswered() {
+        when(orderRepository.findRecoveryTargets(any(), eq(2))).thenReturn(orders(1));
+        when(ledgerProcessor.process(any())).thenReturn(withStatus(ExchangeOrderStatus.PROCESSING));
+
+        RecoveryCycle cycle = service.recoverPending(2, Duration.ofSeconds(20));
+
+        assertEquals(new RecoveryCycle(1, 1, 0, 1, 0, EndReason.NOTHING_LEFT, false), cycle);
+        verify(orderRepository, never()).findNotCheckedSince(any(), anyInt());
     }
 
     private static Clock clockOf(AtomicReference<Instant> now) {

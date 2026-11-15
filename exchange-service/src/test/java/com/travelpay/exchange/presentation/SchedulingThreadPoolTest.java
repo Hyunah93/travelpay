@@ -87,7 +87,7 @@ class SchedulingThreadPoolTest {
         doAnswer(invocation -> {
             recoveryStarted.countDown();
             releaseRecovery.await();
-            return new ExchangeOrderRecoveryService.RecoveryCycle(1, 1, 0, 1, 0, ExchangeOrderRecoveryService.EndReason.LEDGER_UNAVAILABLE);
+            return new ExchangeOrderRecoveryService.RecoveryCycle(1, 1, 0, 1, 0, ExchangeOrderRecoveryService.EndReason.LEDGER_UNAVAILABLE, false);
         }).when(recoveryService).recoverPending(anyInt(), any());
 
         // 실제 앱처럼 "20s" 같은 설정값을 Duration으로 바꾸는 변환기를 쓴다(복구 제한 시간 time-budget)
