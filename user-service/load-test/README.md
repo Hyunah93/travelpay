@@ -1,6 +1,6 @@
 # User·Gateway 인증 성능 측정
 
-현재 인증 구조의 **개선 전 기준선**을 만들고, 변경 후 같은 조건으로 비교합니다. 운영 AWS와 기존 개발 DB·Redis에는 요청하지 않습니다.
+인증 구조의 개선 전·후를 같은 조건으로 비교합니다. 현재 코드는 User 보호 API의 중복 I01 호출 제거가 반영된 상태입니다. 개선 전 기준선은 당시 코드·jar로 실행한 결과를 사용하며, `--label baseline`만 붙인다고 이전 구조가 되지는 않습니다. 운영 AWS와 기존 개발 DB·Redis에는 요청하지 않습니다.
 
 | 시나리오 | 요청 | 목적 | 업무 구성 |
 |---|---|---|---|
@@ -9,8 +9,8 @@
 | 장애 C | 위 두 API에 일정한 도착률로 요청하는 중 User 일시 정지·정지, 회원 테이블 잠금 | 장애 중 상태·응답 시간과 회복 과정 | 켬 |
 
 ```text
-성능 A: k6 → auth-gateway:8080 → User I01 → Redis 세션·DB 회원 확인
-                              → User /users/me → Redis 세션·DB 회원 확인 → 본인 정보 조회
+성능 A(현재): k6 → auth-gateway:8080 → User /users/me
+                                  → Redis 세션·DB 회원 확인 → 본인 정보 조회
 성능 B: k6 → auth-gateway:8080 → User I01 → Redis 세션·DB 회원 확인
                               → Wallet /wallets/me → Wallet DB 조회
 ```
@@ -19,11 +19,11 @@ Gateway·User·Wallet은 실제 Eureka에서 주소를 찾습니다. 부하 요�
 
 ## 실행
 
-저장소 루트에서 실행합니다. Docker Compose, JDK 21, Python 3.9 이상이 필요합니다. 기존 로컬 모니터링의 `.env` 설정은 그대로 사용합니다.
+저장소 루트에서 실행합니다. Docker Compose, JDK 21, Python 3.11 이상이 필요합니다. 기존 로컬 모니터링의 `.env` 설정은 그대로 사용합니다. 셸에 `COMPOSE_PROJECT_NAME`이 있어도 이 시험 구성을 가리키도록 compose 명령에는 `-p travelpay-auth-load-test`를 붙입니다(측정기도 같은 프로젝트를 명시합니다).
 
 ```bash
 ./gradlew :eureka-server:bootJar :gateway:bootJar :user-service:bootJar
-docker compose -f user-service/load-test/compose.yaml up -d --wait --wait-timeout 240
+docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml up -d --wait --wait-timeout 240
 python3 user-service/load-test/measure.py monitoring
 python3 user-service/load-test/measure.py prepare --users 100
 ```
@@ -31,8 +31,8 @@ python3 user-service/load-test/measure.py prepare --users 100
 앱 코드를 바꿔 다시 빌드했다면 JVM도 반드시 새로 만듭니다. `up -d`만으로는 바인드한 jar의 내용 변경이 실행 중 앱에 반영되지 않습니다. DB·Redis는 유지합니다.
 
 ```bash
-docker compose -f user-service/load-test/compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 240 auth-eureka
-docker compose -f user-service/load-test/compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 240 auth-user auth-gateway
+docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 240 auth-eureka
+docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 240 auth-user auth-gateway
 python3 user-service/load-test/measure.py prepare --users 100
 ```
 
@@ -49,7 +49,7 @@ python3 user-service/load-test/measure.py run --scenario my-info --label baselin
 
 ```bash
 ./gradlew :ledger-service:bootJar :wallet-service:bootJar
-docker compose -f user-service/load-test/compose.yaml --profile business up -d --wait --wait-timeout 300
+docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml --profile business up -d --wait --wait-timeout 300
 python3 user-service/load-test/measure.py prepare --users 100 --wallets
 python3 user-service/load-test/measure.py run --scenario wallet-me --label baseline-b --vus 10 30 60 --seconds 60 --warmup 30 --repeats 3
 python3 user-service/load-test/measure.py fault --type pause --label baseline
@@ -59,17 +59,42 @@ python3 user-service/load-test/measure.py fault --type pause-db --label baseline
 python3 user-service/load-test/measure.py fault --type stop --label baseline
 ```
 
-순서는 성능 A → (업무 구성 켜기) 성능 B → 장애 `pause` → `lock-users` → `lock-credentials` → `pause-db` → `stop`입니다. `stop`은 User JVM을 다시 시작하므로 마지막에 두고, 그 뒤 성능을 다시 재려면 앱을 재생성하고 사전 예열부터 합니다. 성능 A로 돌아갈 때는 업무 구성만 내립니다(`docker compose ... --profile business stop auth-wallet auth-ledger auth-kafka`).
+순서는 성능 A → (업무 구성 켜기) 성능 B → 장애 `pause` → `lock-users` → `lock-credentials` → `pause-db` → `stop`입니다. `stop`은 User JVM을 다시 시작하므로 마지막에 두고, 그 뒤 성능을 다시 재려면 앱을 재생성하고 사전 예열부터 합니다. 성능 A로 돌아갈 때는 업무 구성만 내립니다(`docker compose -p travelpay-auth-load-test ... --profile business stop auth-wallet auth-ledger auth-kafka`).
 
 - `prepare`: CSRF 조회 → 필수 약관 동의·가입 → 로그인 → 본인 프로필 확인. `--wallets`면 로그인 뒤 CSRF를 다시 받아 지갑을 개설하고 조회해 지갑 ID를 저장합니다. VU마다 다른 회원·세션을 사용합니다. 재실행하면 같은 시험 계정으로 다시 로그인합니다.
 - `run`: 먼저 기록하지 않는 사전 예열(`--prewarm`, 기본 120초, 가장 높은 동시성)로 새 JVM의 JIT 비용을 덜어 내고, 회차별 예열 뒤 정상 RPS·p50·p95·p99·오류를 수집합니다. 개선 전후 모두 앱을 새로 띄운 뒤 같은 사전 예열을 써야 공정합니다. 로그인·가입 시간은 제외합니다. 대기 시간 없이 반복하므로 VU 수는 실제 서비스의 전체 사용자 수와 다릅니다.
 - 성능 A는 HTTP 200과 회원 ID·이메일·ACTIVE·USER, 성능 B는 200과 본인 지갑 ID·ACTIVE까지 검사합니다. 인증 오류, 다른 회원의 응답, 서버 오류가 있으면 결과를 보존하고 중단합니다. 임의의 응답 시간 목표는 설정하지 않습니다.
 - SQL(역할별)·Redis 명령 통계와 서버 HTTP 카운터를 전후로 비교해 SELECT·Redis 명령·I01 횟수를 검산합니다. 초기 계정 생성과 예열은 제외합니다. Redis의 측정용 INFO·AUTH와 healthcheck PING·연결 관리 명령도 제외합니다. 명령 수는 네트워크 왕복 횟수와 다릅니다.
 - 컨테이너별 cgroup `cpu.stat`을 회차 전후로 읽어 **요청당 CPU 시간(ms)**과 **CPU 상한 때문에 멈춘 주기 비율·시간**을 남깁니다. CPU 상한에 닿은 구성에서는 지연 백분위수에 상한 대기가 섞이므로, 개선 효과는 요청당 CPU 시간과 함께 판단합니다.
-- `fault`: 두 API에 API마다 일정한 도착률(기본 40/초)로 150초 동안 요청하고, 30초에 장애를 넣어 20초 뒤 풉니다. `pause`는 User 컨테이너 일시 정지, `pause-db`는 PostgreSQL 컨테이너 일시 정지(DB 서버가 멈춰 SQL 취소도 처리되지 않는 상황, 모든 서비스가 같은 DB를 써서 Wallet 조회도 함께 멈춤), `stop`은 정상 종료 후 재시작, `lock-users`·`lock-credentials`는 다른 세션이 각 테이블에 `ACCESS EXCLUSIVE` 잠금을 잡는 마이그레이션 잠금 재현입니다. 인증 조회는 회원 테이블(`users`)만 읽으므로 `lock-users`는 인증을 막고, `lock-credentials`는 인증을 통과한 뒤 마이페이지 조회만 막습니다. 응답 도중 끊긴 요청처럼 상태 코드만으로 구분되지 않는 전송 오류는 k6 오류 코드로 따로 셉니다. 요청별 시각·상태·지연(k6 CSV)으로 장애 전·중·후 성공률, 장애 중 p95·최대 지연, 첫 실패까지 시간, 해제 뒤 회복(5초 연속 전부 200이 된 첫 초)을 계산합니다. 응답이 멈춰도 요청이 줄지 않도록 도착률 고정 방식을 쓰며, VU가 모자라 못 보낸 요청은 손실 요청으로 기록합니다. 장애 중 오류를 오류로 세는 시험이므로 성능 측정과 섞지 않습니다.
+- `fault`: 두 API에 API마다 일정한 도착률(기본 40/초)로 150초 동안 요청하고, 30초에 장애를 넣어 20초 뒤 풉니다. 응답이 멈춰도 요청이 줄지 않도록 도착률 고정 방식을 쓰며, VU가 모자라 못 보낸 요청은 손실 요청으로 기록합니다. 두 API의 정상 응답을 확인하고 k6가 실행 중일 때만 장애를 넣습니다. 종류별 의미와 결과 해석은 아래를 따릅니다.
 - 측정 중 jar·컨테이너·설정을 바꾸거나 수동 API를 호출하지 않습니다. 다른 부하 시험도 동시에 실행하지 않습니다.
 
 시험 계정의 고정 암호와 DB·Redis의 `load-test-only`는 이 독립 환경 전용입니다. 실제 비밀값을 넣지 않습니다. 세션 쿠키는 `data/sessions.json`에 저장하고 Git에서 제외합니다. 세션이 만료되거나 Redis를 재시작하면 `prepare`를 다시 실행합니다.
+
+## 장애 측정과 복원
+
+| 종류 | 재현하는 상황 | `faultStart` / `faultEnd` 기준 |
+|---|---|---|
+| `pause` | User JVM 일시 정지 | pause 명령 완료 / unpause 명령 완료 |
+| `pause-db` | DB 서버 정지로 SQL 취소도 처리하지 못함. 같은 DB를 쓰는 Wallet도 영향받음 | pause 명령 요청 / unpause 명령 완료 |
+| `lock-users` | 회원 테이블의 `ACCESS EXCLUSIVE` 잠금으로 인증 조회 차단 | 잠금 SQL 명령 요청 / COMMIT 명령 완료 |
+| `lock-credentials` | 로그인 정보 테이블 잠금으로 인증 후 마이페이지 조회 차단 | 잠금 SQL 명령 요청 / COMMIT 명령 완료 |
+| `stop` | User 정상 종료 후 재시작 | stop 명령 요청 / start 명령 완료. 실제 healthy 시각은 별도 기록 |
+
+DB 일시 정지는 명령 완료 전부터 진행 중인 SQL에 영향을 줄 수 있어 요청 시각부터 셉니다. SQL 잠금도 실제 잠금 획득 시각을 별도 측정하지 않으므로 명령 처리·잠금 획득 대기가 포함됩니다. 모든 종류는 명령 실행 직전의 `injectionRequested`도 남깁니다. 시각은 호스트 Python과 Docker k6의 같은 Unix 시계를 전제로 하며, 시계가 어긋나면 첫 실패·회복 계산도 어긋납니다.
+
+- 전·중·후 성공률과 p95·최대 지연은 **요청 시작 시각**으로 구분합니다. 첫 실패는 **장애 시작 뒤 처음 완료된 실패 응답**이므로, 직전에 보낸 요청도 포함합니다. 전송 오류는 k6 오류 코드로 따로 셉니다.
+- 회복은 해제 뒤 시작한 요청이 5초 연속 모두 200인 첫 초입니다. 서버 기동·Eureka 갱신 시간도 포함하며 서킷의 CLOSED 전환 시각과 다릅니다. 안정 구간을 찾지 못하면 미회복으로 남깁니다.
+- 유효성은 k6 정상 종료, 손실 요청 0건, API별 전·중·후 표본, 장애 전에 완료된 실패 0건으로 판정합니다. 미회복은 측정 무효와 다른 결과입니다. 후행 User 지표를 못 읽어도 `observationError`를 남기고 CSV 분석·요약을 보존합니다. JVM 시작 시각이 바뀌거나 없어 비교할 수 없는 전후 카운터는 `null`입니다.
+- Ctrl+C·SIGTERM·POSIX SIGHUP은 같은 복원 경로를 거칩니다. `nohup`처럼 SIGHUP을 무시하도록 실행했다면 그 설정을 유지해 터미널을 닫아도 측정이 계속됩니다. 대상 컨테이너가 실행 중인지, `travelpay-fault-lock` 잠금 세션이 제거됐는지 확인하고 `aborted.json`을 남깁니다. 일시적인 컨테이너 복원 실패는 최대 3번까지만 시도하고, 실패하면 명시적으로 알립니다. SIGKILL·호스트 종료처럼 정리 코드를 실행할 수 없는 중단은 이 방식으로 복원을 보장하지 않습니다.
+
+`stop` 시험은 JRE에 jar를 마운트한 이 Compose의 종료·기동을 측정합니다. 운영 이미지의 Eureka 선행 등록 해제·drain 진입점과 ECS 롤링 배포를 재현하는 시험은 아닙니다.
+
+로그인·비밀번호 변경·가입·관리자 조회처럼 비용이 큰 정상 처리는 별도로 확인합니다. 아래 명령은 각 작업 20회를 쉬는 상태와 `/users/me` 60 VU 부하 상태에서 비교합니다. 수동 HTTP 클라이언트가 호스트의 28080을 거치므로 이 결과에는 포트 전달 시간이 포함됩니다. Docker 내부 경로의 성능 A·B 처리량과 구분해 시간 제한의 여유를 확인하는 데 씁니다.
+
+```bash
+python3 user-service/load-test/measure.py slow-ops --label normal-operations --samples 20 --vus 60 --load-seconds 300
+```
 
 ## 포트·자원
 
@@ -104,7 +129,7 @@ CPU 상한은 PC별 사용 가능 자원의 차이를 줄이기 위한 시험 �
 시험 종료 후 일반 모니터링 연결로 되돌리려면:
 
 ```bash
-docker compose -f compose.monitoring.yaml up -d prometheus
+docker compose -p travelpay-monitoring -f compose.monitoring.yaml up -d prometheus
 ```
 
 ## 결과와 비교
@@ -115,7 +140,7 @@ docker compose -f compose.monitoring.yaml up -d prometheus
 
 ```bash
 python3 -m unittest discover -s user-service/load-test -p 'test_*.py'
-docker compose -f user-service/load-test/compose.yaml down
+docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml down
 ```
 
 `down`은 이 시험 프로젝트만 종료합니다. 시험 DB는 메모리 파일시스템에 있어 PostgreSQL 컨테이너를 삭제하면 사라집니다. 다음 실행 때 `prepare`부터 다시 진행합니다. 기존 개발 인프라와 모니터링은 종료하지 않습니다.

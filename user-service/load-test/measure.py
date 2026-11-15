@@ -4,6 +4,7 @@
 import argparse
 import csv
 from datetime import datetime, timezone
+import functools
 import hashlib
 import http.cookiejar
 import json
@@ -12,8 +13,10 @@ import os
 from pathlib import Path
 import platform
 import re
+import signal
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -31,7 +34,8 @@ BUSINESS_SERVICES = ("auth-kafka", "auth-ledger", "auth-wallet")
 APP_MODULES = {"auth-gateway": "gateway", "auth-user": "user-service", "auth-eureka": "eureka-server",
                "auth-ledger": "ledger-service", "auth-wallet": "wallet-service"}
 # 업무 구성 컨테이너에도 exec할 수 있게 business 프로필을 켭니다. 이 도구는 compose up을 하지 않습니다.
-COMPOSE = ["docker", "compose", "--project-directory", str(HERE), "-f", str(HERE / "compose.yaml"),
+# COMPOSE_PROJECT_NAME 환경 변수가 있어도 이 시험 구성을 가리키도록 프로젝트를 명시합니다(환경 변수가 compose.yaml의 name보다 우선).
+COMPOSE = ["docker", "compose", "-p", PROJECT, "--project-directory", str(HERE), "-f", str(HERE / "compose.yaml"),
            "--profile", "business"]
 SCENARIOS = {
     # 성능 A: 처음 기준선과 같은 조건이 되도록 업무 구성을 끈 상태에서만 측정합니다.
@@ -47,6 +51,10 @@ FAULT_TARGETS = {"pause": "auth-user", "pause-db": "auth-postgres", "stop": "aut
                  "lock-users": "auth-postgres", "lock-credentials": "auth-postgres"}
 # C2a는 인증 조회(회원 테이블만 읽음)를, C2b는 인증을 통과한 뒤의 마이페이지 조회(로그인 정보 테이블)만 막습니다.
 LOCK_TABLES = {"lock-users": "user_service.users", "lock-credentials": "user_service.user_credentials"}
+# 잠금 시험 세션의 application_name. 중단됐을 때 이 이름의 세션만 찾아 끊습니다.
+LOCK_SESSION = "travelpay-fault-lock"
+# fault.js의 tags.name. 두 API 모두 표본이 있어야 장애 측정으로 씁니다.
+FAULT_ENDPOINTS = ("me", "wallet")
 
 
 def command(args, timeout=60):
@@ -57,8 +65,14 @@ def compose(*args, timeout=60):
     return command(COMPOSE + list(args), timeout)
 
 
+@functools.cache
 def container(service):
-    return f"{PROJECT}-{service}-1"
+    """이 시험 프로젝트에서 서비스의 컨테이너 ID. 찾은 ID를 재사용해 측정 구간에 docker 호출을 더하지 않고,
+    계측·장애 주입·복원이 같은 컨테이너를 가리키게 합니다(stop·start는 ID를 유지)."""
+    ids = compose("ps", "--all", "-q", service).split()
+    if len(ids) != 1:
+        raise RuntimeError(f"{PROJECT}에서 {service} 컨테이너를 하나로 찾지 못했습니다: {ids}")
+    return ids[0]
 
 
 def write_json(path, value):
@@ -66,8 +80,8 @@ def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def metric_total(text, name, labels=None):
-    total = 0.0
+def metric_total(text, name, labels=None, *, missing=0.0):
+    total, found = 0.0, False
     for line in text.splitlines():
         match = re.fullmatch(r"([^{}\s]+)(?:\{(.*)\})?\s+(\S+)(?:\s+\S+)?", line)
         if not match or match[1] != name:
@@ -75,7 +89,8 @@ def metric_total(text, name, labels=None):
         actual = dict(re.findall(r'(\w+)="((?:\\.|[^"\\])*)"', match[2] or ""))
         if all(actual.get(key) == value for key, value in (labels or {}).items()):
             total += float(match[3])
-    return total
+            found = True
+    return total if found else missing
 
 
 def sql_delta(before, after):
@@ -178,6 +193,12 @@ def parse_k6_requests(lines):
     return rows
 
 
+def written_requests(path):
+    """k6가 지금까지 쓴 CSV의 요청. 쓰는 중인 마지막 줄은 뺍니다."""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    return parse_k6_requests(text[:text.rfind("\n") + 1].splitlines(keepends=True))
+
+
 def percentile(values, ratio):
     # 최근접 순위 방식: 값의 ratio 비율이 이 값 이하가 되는 가장 작은 표본입니다.
     ordered = sorted(values)
@@ -202,6 +223,31 @@ def succeeded(row):
     return outcome(row) == "200"
 
 
+def missing_samples(rows, names=FAULT_ENDPOINTS):
+    """정상 응답이 한 건도 없는 API. 장애를 넣기 전에 비어 있으면 k6가 늦게 떴거나 실패해 비교할 장애 전 구간이 없습니다."""
+    return [name for name in names if not any(row["name"] == name and succeeded(row) for row in rows)]
+
+
+def fault_problems(report, dropped, exit_code, names=FAULT_ENDPOINTS):
+    """장애 측정을 비교 자료로 쓸 수 없는 이유. 시스템이 회복했는지와는 따로 판정하며, 비어 있어야 유효합니다."""
+    problems = []
+    if exit_code:
+        problems.append(f"k6 종료 코드 {exit_code}")
+    if dropped:
+        problems.append(f"보내지 못한 요청 {dropped}건(정한 부하가 전달되지 않음)")
+    for name in names:
+        item = report.get(name)
+        if item is None:
+            problems.append(f"{name}: 요청 없음")
+            continue
+        empty = [window for window in ("before", "during", "after") if item[window]["requests"] == 0]
+        if empty:
+            problems.append(f"{name}: 표본 없는 구간 {empty}")
+        if item["failedBeforeFault"]:
+            problems.append(f"{name}: 장애 전부터 실패 {item['failedBeforeFault']}건")
+    return problems
+
+
 def analyze_fault(requests, fault_start, fault_end, stable_seconds=5):
     """요청 시작 시각으로 장애 전·중·후를 나누고, 회복 시각(장애 해제 뒤 stable_seconds 동안 모두 200이 된 첫 초)을 구합니다."""
     report = {}
@@ -215,7 +261,8 @@ def analyze_fault(requests, fault_start, fault_end, stable_seconds=5):
             durations = [row["durationMs"] for row in part]
             return {"requests": len(part), "successes": statuses.get("200", 0), "statusCounts": statuses,
                     "p95Ms": percentile(durations, 0.95), "maxMs": max(durations) if durations else None}
-        failures = sorted(row["end"] for row in rows if not succeeded(row) and row["start"] >= fault_start)
+        # 처음 실패를 관측한 응답 시각. 장애 직전에 보냈다가 장애 뒤 실패한 진행 중 요청도 포함합니다.
+        failures = sorted(row["end"] for row in rows if not succeeded(row) and row["end"] >= fault_start)
         seconds = {}
         for row in rows:
             if row["start"] >= fault_end:
@@ -234,6 +281,8 @@ def analyze_fault(requests, fault_start, fault_end, stable_seconds=5):
             "after": window(lambda start: start >= fault_end),
             "firstFailureAfterFaultMs": failures[0] - fault_start if failures else None,
             "recoverySecondsAfterRelease": recovery,
+            # 장애를 넣기 전에 이미 실패 응답이 돌아온 요청. 장애 순간 처리 중이던 요청의 실패는 장애의 영향이라 넣지 않음
+            "failedBeforeFault": sum(1 for row in rows if row["end"] < fault_start and not succeeded(row)),
         }
     return report
 
@@ -597,10 +646,11 @@ def write_summary(directory, args, runs, services):
     (directory / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def inject(kind, seconds, events):
+def inject(kind, target, seconds, events):
     """장애를 넣고 seconds 뒤 풉니다. 시각(ms)은 events에 기록합니다. 대상은 k6가 아니라 이 시험의 컨테이너뿐입니다."""
     now = lambda: time.time() * 1000
-    target = container(FAULT_TARGETS[kind])
+    # 명령 실행 도중 종료 신호가 와도 이미 시도한 장애는 복원합니다.
+    events["injectionRequested"] = now()
     if kind in ("pause", "pause-db"):
         issued = now()
         command(["docker", "pause", target])
@@ -630,15 +680,106 @@ def inject(kind, seconds, events):
         # 마이그레이션의 테이블 잠금을 재현합니다. ACCESS EXCLUSIVE는 일반 SELECT도 막습니다(PostgreSQL 잠금 문서).
         sql = f"BEGIN; LOCK TABLE {LOCK_TABLES[kind]} IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep({seconds}); COMMIT;"
         events["faultStart"] = now()
-        compose("exec", "-T", "auth-postgres", "psql", "-U", "auth_test_admin", "-d", "travelpay",
-                "-v", "ON_ERROR_STOP=1", "-c", sql, timeout=seconds + 30)
+        compose("exec", "-T", "-e", f"PGAPPNAME={LOCK_SESSION}", "auth-postgres", "psql", "-U", "auth_test_admin",
+                "-d", "travelpay", "-v", "ON_ERROR_STOP=1", "-c", sql, timeout=seconds + 30)
         events["faultEnd"] = now()
+
+
+def restore_container(target):
+    """대상 상태를 다시 확인하며 일시적인 복원 명령 실패를 제한된 횟수만 재시도합니다."""
+    state = lambda: command(["docker", "inspect", "--format", "{{.State.Status}}", target])
+    current, last_error = "unknown", None
+    for attempt in range(3):
+        try:
+            current = state()
+            if current == "paused":
+                command(["docker", "unpause", target])
+            elif current != "running":
+                command(["docker", "start", target])
+            current = state()
+            if current == "running":
+                # 중단된 pause 명령은 CLI가 끝난 뒤에도 Docker가 마저 처리할 수 있으므로 잠시 뒤 한 번 더 확인
+                time.sleep(0.5)
+                current = state()
+                if current == "running":
+                    return
+        except Exception as error:
+            last_error = error
+        if attempt < 2:
+            time.sleep(0.2)
+    raise RuntimeError(f"장애 대상 {target}이 실행 중이 아닙니다: {current}") from last_error
+
+
+def release_lock_sessions(rounds=4):
+    """잠금 시험 세션을 끊고(잠금도 풀림) 남은 세션이 없는지 확인합니다. 중단 직전에 실행한 psql은 컨테이너 안에서 계속 돌아
+    늦게 접속할 수 있으므로 몇 초 동안 되풀이합니다."""
+    for round_ in range(rounds):
+        if round_:
+            time.sleep(0.5)
+        db(f"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE application_name = '{LOCK_SESSION}'")
+        left = db(f"SELECT count(*) FROM pg_stat_activity WHERE application_name = '{LOCK_SESSION}'")
+    if left != "0":
+        raise RuntimeError(f"잠금 시험 세션 {left}개를 끊지 못했습니다.")
+
+
+def abort_fault(directory, kind, target, events, failure):
+    """중단된 장애 시험의 대상을 되돌리고 결과를 aborted.json에 남깁니다. 되돌리지 못하면 그 오류로 알립니다."""
+    # 되돌리는 도중 다시 중단돼도 실패로 남도록 먼저 False로 둠
+    attempted = "injectionRequested" in events or "faultStart" in events
+    record = {"type": kind, "events": events, "failure": f"{type(failure).__name__}: {failure}",
+              "injectionAttempted": attempted, "restored": False}
+    try:
+        if not attempted:
+            # 준비 실패에서는 대상에 장애를 넣지 않았으므로 복원 명령도 실행하지 않습니다.
+            record["restored"] = True
+            return
+        if kind in LOCK_TABLES:
+            release_lock_sessions()
+        else:
+            if kind == "stop" and "faultStart" in events and "faultEnd" not in events:
+                # 중지 명령 도중 끊겼으면 JVM은 이미 종료 신호를 받아, 아직 실행 중으로 보여도 곧 멈춤. 멈춘 뒤 다시 시작
+                command(["docker", "stop", "-t", "30", target], timeout=60)
+            restore_container(target)
+        record["restored"] = True
+    except Exception as error:
+        record["restoreError"] = f"{type(error).__name__}: {error}"
+        raise RuntimeError(f"장애 시험이 중단됐고 대상을 되돌리지 못했습니다. 직접 확인하세요: {error}") from error
+    finally:
+        write_json(directory / "aborted.json", record)
+
+
+def fault_observations(before, after):
+    """동일 JVM의 카운터만 비교합니다. 후행 지표나 시작 시각이 없으면 값을 추정하지 않습니다."""
+    started_before = metric_total(before, "process_start_time_seconds") or None
+    started_after = metric_total(after or "", "process_start_time_seconds") or None
+    same_jvm = started_before is not None and started_before == started_after
+
+    def delta(name, labels=None, *, initially_zero=False):
+        if not same_jvm:
+            return None
+        old = metric_total(before, name, labels, missing=0.0 if initially_zero else None)
+        new = metric_total(after, name, labels, missing=None)
+        if old is None or new is None:
+            return None
+        difference = new - old
+        return difference if difference >= 0 else None
+
+    return {
+        "hikariConnectionTimeouts": delta("hikaricp_connections_timeout_total"),
+        # HTTP 타이머는 첫 호출 때 등록되므로 전 표본이 없고 후 표본이 생겼다면 0부터 센 값입니다.
+        "i01Requests": delta("http_server_requests_seconds_count", {"uri": "/internal/v1/auth/session"},
+                             initially_zero=True),
+        "jvmStartedAtBefore": started_before,
+        "jvmStartedAtAfter": started_after,
+        "note": "JVM 교체·지표 누락·카운터 초기화로 비교할 수 없는 값은 null입니다.",
+    }
 
 
 def fault(args):
     require_stack(running_services(), business=True)
     require_sessions(True)
     services = BASE_SERVICES + BUSINESS_SERVICES
+    target = container(FAULT_TARGETS[args.type])
     directory = new_result_directory(f"fault-{args.type}-{args.label}")
     write_json(directory / "environment.json", dict(environment(services), workload=vars(args)))
     before = app_metrics("auth-user", 18081)
@@ -648,38 +789,50 @@ def fault(args):
     events = {"k6Launched": time.time() * 1000}
     with (directory / "k6.log").open("w") as output:
         process = subprocess.Popen(args_k6, cwd=ROOT, env=k6_environment(), stdout=output, stderr=subprocess.STDOUT)
+        inject_at = time.monotonic() + args.at
         try:
-            time.sleep(args.at)
-            inject(args.type, args.duration, events)
+            # 1초 전에 확인해, 장애를 넣는 시각은 이전 측정과 같게(k6 실행 뒤 args.at초) 둠
+            time.sleep(args.at - 1)
+            missing = missing_samples(written_requests(directory / "requests.csv"))
+            if missing:
+                raise RuntimeError(f"장애 전 정상 요청이 없는 API {missing}가 있어 장애를 넣지 않았습니다. "
+                                   f"{directory.name}/k6.log를 확인하세요.")
+            time.sleep(max(0.0, inject_at - time.monotonic()))
+            if process.poll() is not None:
+                raise RuntimeError("k6가 장애 주입 전에 종료돼 장애를 넣지 않았습니다.")
+            inject(args.type, target, args.duration, events)
             code = process.wait(timeout=args.seconds + 120)
-        except BaseException:
-            subprocess.run(["docker", "stop", "-t", "1", K6_NAME], capture_output=True, timeout=15)
-            # 장애를 넣은 채 끝나지 않게 되돌립니다.
-            target = container(FAULT_TARGETS[args.type])
-            subprocess.run(["docker", "unpause", target], capture_output=True, timeout=15)
-            subprocess.run(["docker", "start", target], capture_output=True, timeout=30)
+        except BaseException as failure:
+            try:
+                subprocess.run(["docker", "stop", "-t", "1", K6_NAME], capture_output=True, timeout=15)
+            finally:
+                # k6 정리가 실패하거나 다시 중단돼도 장애를 넣은 채 끝나지 않게 되돌립니다.
+                abort_fault(directory, args.type, target, events, failure)
             raise
-    after = app_metrics("auth-user", 18081)
+    observation_error = None
+    try:
+        after = app_metrics("auth-user", 18081)
+    except Exception as error:
+        # User가 회복하지 못한 결과도 CSV에서 분석합니다. 지표를 얻지 못한 것을 카운터 0으로 취급하지 않습니다.
+        after = None
+        observation_error = f"{type(error).__name__}: User 후행 지표 조회 실패 ({error})"
     with (directory / "requests.csv").open(encoding="utf-8") as lines:
         requests = parse_k6_requests(lines)
     summary = json.loads((directory / "k6-summary.json").read_text(encoding="utf-8"))
     report = analyze_fault(requests, events["faultStart"], events["faultEnd"])
-    i01 = {"uri": "/internal/v1/auth/session"}
-    def counter_delta(name, labels=None):
-        # stop 시험처럼 User가 다시 시작되면 카운터가 0부터 다시 세어 전후 차이가 의미 없습니다.
-        delta = metric_total(after, name, labels) - metric_total(before, name, labels)
-        return delta if delta >= 0 else None
-    observations = {
-        "hikariConnectionTimeouts": counter_delta("hikaricp_connections_timeout_total"),
-        "i01Requests": counter_delta("http_server_requests_seconds_count", i01),
-        "note": "User 재시작으로 카운터가 초기화된 값은 null입니다.",
-    }
+    observations = fault_observations(before, after)
+    problems = fault_problems(report, summary["droppedIterations"], code)
     result = {"type": args.type, "rate": args.rate, "events": events, "k6": summary, "k6ExitCode": code,
-              "userObservations": observations, "endpoints": report,
+              "validity": {"valid": not problems, "problems": problems},
+              "userObservations": observations, "observationError": observation_error, "endpoints": report,
               "timeline": fault_timeline(requests, events["faultStart"])}
     write_json(directory / "fault-analysis.json", result)
     lines = [f"# 장애 {args.type} 측정", "", f"측정: {directory.name} · 엔드포인트별 도착률 {args.rate}/초 · "
              f"장애 {args.duration}초 · 손실 요청 {summary['droppedIterations']}", "",
+             "측정 유효성: " + ("유효" if not problems else "무효 - " + "; ".join(problems)), ""]
+    if observation_error:
+        lines += [observation_error + ". 요청 기록의 분석은 유지했습니다.", ""]
+    lines += [
              "| API | 장애 전 성공률 | 장애 중 요청 | 장애 중 상태 | 장애 중 p95(ms) | 장애 중 최대(ms) | 첫 실패(장애 후 ms) | 해제 뒤 회복(초) |",
              "|---|---|---|---|---|---|---|---|"]
     for name, item in report.items():
@@ -689,12 +842,14 @@ def fault(args):
         statuses = ", ".join(f"{key} {count}" for key, count in sorted(item["during"]["statusCounts"].items()))
         lines.append(f"| {name} | {rate:.1f}% | {item['during']['requests']} | {statuses} | "
                      f"{number(item['during']['p95Ms'])} | {number(item['during']['maxMs'])} | "
-                     f"{number(item['firstFailureAfterFaultMs'])} | {item['recoverySecondsAfterRelease']} |")
+                     f"{number(item['firstFailureAfterFaultMs'])} | "
+                     f"{item['recoverySecondsAfterRelease'] if item['recoverySecondsAfterRelease'] is not None else '미회복'} |")
+    lines += ["", "전·중·후 구간은 요청 시작, 첫 실패는 응답 완료 시각 기준입니다. "
+              "장애 전에 시작한 요청도 장애 이후에 실패할 수 있습니다."]
     (directory / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    invalid = [name for name, item in report.items() if item["before"]["successes"] != item["before"]["requests"]]
-    if code or invalid:
+    if problems:
         # 장애 시험 스크립트에는 임계값이 없으므로 0이 아닌 종료 코드는 실행 오류입니다.
-        raise RuntimeError(f"유효하지 않은 장애 측정: 종료 코드 {code}, 장애 전부터 실패한 API {invalid}. 원본을 보존했습니다.")
+        raise RuntimeError(f"유효하지 않은 장애 측정: {problems}. 원본을 보존했습니다.")
     print(f"결과 저장: {directory.relative_to(ROOT)}", flush=True)
 
 
@@ -824,7 +979,8 @@ def slow_ops(args):
 def monitoring():
     env = dict(os.environ, MONITORING_LOAD_TEST_NETWORK="travelpay-auth-load-test_default",
                MONITORING_LOAD_TEST_TARGETS_FILE=str(HERE / "prometheus-targets.yml"))
-    monitoring_compose = ["docker", "compose", "-f", "compose.monitoring.yaml", "-f",
+    # COMPOSE_PROJECT_NAME이 있어도 기존 모니터링 프로젝트를 다시 만들도록 이름을 명시합니다(compose.monitoring.yaml의 name).
+    monitoring_compose = ["docker", "compose", "-p", "travelpay-monitoring", "-f", "compose.monitoring.yaml", "-f",
                           "compose.monitoring.load-test.yaml"]
     # 브랜치 전환 등으로 호스트 폴더가 교체되면 기존 bind mount가 이전 폴더를 계속 볼 수 있습니다.
     # 설정을 다시 마운트하되 메트릭·로그·Grafana 저장 볼륨은 그대로 사용합니다.
@@ -834,7 +990,24 @@ def monitoring():
                    cwd=ROOT, env=env, check=True)
 
 
+def install_termination_handlers():
+    """POSIX 터미널 종료도 Ctrl+C와 같은 예외·복원 경로로 보냅니다."""
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        # nohup처럼 무시하도록 물려받은 신호는 그대로 둠. 일부러 분리 실행한 측정이 터미널 종료로 끊기지 않게 함
+        if sig is not None and signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, terminate)
+
+
 def main():
+    # Docker 시각(소수부 9자리)을 datetime.fromisoformat으로 읽으려면 3.11 이상이 필요합니다.
+    if sys.version_info < (3, 11):
+        sys.exit("Python 3.11 이상이 필요합니다.")
+    # 종료 요청(SIGTERM)도 Ctrl+C처럼 예외로 바꿔, 장애·k6를 되돌리는 정리 경로를 거치게 합니다.
+    install_termination_handlers()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
     prep = sub.add_parser("prepare", help="실제 가입·로그인으로 사용자별 세션 준비")
