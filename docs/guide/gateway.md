@@ -195,6 +195,8 @@ Gateway는 외부 W3C·B3 부모 trace를 추출하지 않고 새 traceId를 시
 
 이 정책에서는 프런트가 보낸 traceId와 내부 traceId가 연결되지 않습니다. traceId는 인증·멱등성 키로 사용하지 않습니다. 다른 서비스의 내부 W3C 추출은 유지하므로 내부 호출의 연결은 계속됩니다.
 
+`spring.reactor.context-propagation: auto`는 유지합니다. 이를 `limited`로 바꾸면 서비스 간 W3C 연결이 유지되더라도 요청 오류 로그의 traceId가 빠질 수 있습니다. CPU 비용만 보고 변경하지 않으며, `GatewayTraceLogHttpTest`에서 세션 검증 오류·빈 본문·잘못된 JSON·동시 요청·요청이 유발한 서킷 상태 변경의 로그가 해당 요청과 연결되는지 확인합니다.
+
 ## Cloudflare → ALB → Gateway 배포 시 연결할 것
 
 현재 코드·설정의 검증과 실제 클라우드 배포는 구분합니다. 다음은 배포 때 적용할 기준입니다.

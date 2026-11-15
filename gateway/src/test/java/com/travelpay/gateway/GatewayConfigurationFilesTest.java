@@ -57,6 +57,13 @@ class GatewayConfigurationFilesTest {
         assertFalse(properties.getBaggage().isEnabled());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void requestLogsKeepAutomaticContextPropagation(String filename) throws IOException {
+        // AUTO hook는 JVM 전역이라 다른 테스트 컨텍스트가 켠 상태를 빌리지 않고 YAML 자체도 확인합니다.
+        assertEquals("auto", environmentFor(filename).getProperty("spring.reactor.context-propagation"));
+    }
+
     @Test
     void localCorsWaitsForAnExplicitFrontendPort() throws IOException {
         var configuration = corsFor(environmentFor("application.yml"));
