@@ -15,6 +15,8 @@ public enum LedgerErrorCode implements ErrorCode {
     LEDGER_INVALID_CURSOR("LEDGER_INVALID_CURSOR", "커서가 올바르지 않습니다.", 400),
     LEDGER_CURSOR_MISMATCH("LEDGER_CURSOR_MISMATCH", "커서의 조회 조건과 요청 조건이 다릅니다.", 400),
     LEDGER_REFERENCE_CONFLICT("LEDGER_REFERENCE_CONFLICT", "같은 참조로 다른 내용의 거래가 이미 있습니다.", 409),
+    /** 다른 정합성 검사가 실행 중. 기다리지 않고 바로 돌려준다 */
+    LEDGER_INTEGRITY_CHECK_IN_PROGRESS("LEDGER_INTEGRITY_CHECK_IN_PROGRESS", "다른 정합성 검사가 실행 중입니다.", 409),
     LEDGER_REJECTED_INSUFFICIENT_BALANCE("LEDGER_REJECTED_INSUFFICIENT_BALANCE", "잔액이 부족해 거래가 거절됐습니다.", 422),
     LEDGER_REJECTED_WALLET_SUSPENDED("LEDGER_REJECTED_WALLET_SUSPENDED", "사용할 수 없는 계정이라 거래가 거절됐습니다.", 422),
     LEDGER_REJECTED_ACCOUNT_NOT_FOUND("LEDGER_REJECTED_ACCOUNT_NOT_FOUND", "계정이 없어 거래가 거절됐습니다.", 422),

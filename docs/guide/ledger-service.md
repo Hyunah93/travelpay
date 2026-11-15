@@ -1,6 +1,6 @@
 # 원장 서비스 실행·사용 가이드
 
-ledger-service는 모든 도메인(충전·송금·결제·환불·환전)의 자금 이동을 복식부기로 기록합니다. 계정별 잔액을 가지고 있고, 거래 하나의 항목을 한 DB 트랜잭션으로 함께 반영하거나 함께 거절합니다. 다른 서비스가 내부 API로만 호출하며 Gateway로 열지 않습니다.
+ledger-service는 모든 도메인(충전·송금·결제·환불·환전·정산)의 자금 이동을 복식부기로 기록합니다. 계정별 잔액을 가지고 있고, 거래 하나의 항목을 한 DB 트랜잭션으로 함께 반영하거나 함께 거절합니다. 다른 서비스가 내부 API로만 호출하며 Gateway로 열지 않습니다.
 
 ## 로컬 실행
 
@@ -46,6 +46,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | `POST /internal/v1/ledger/transactions/cancel` | 거래 취소(같은 reference를 취소 기록으로 막음) | 201(취소 기록)·200(이미 거래 있음) |
 | `GET /internal/v1/ledger/transactions?referenceType=&referenceId=` | reference로 거래 단건 조회 | 200 |
 | `GET /internal/v1/ledger/transactions/period?referenceType=&from=&to=` | 기간 거래 목록(커서) | 200 |
+| `GET /internal/v1/ledger/integrity` | 원장 내부 정합성 검사(찾기만 하고 고치지 않음) | 200(위반이 있어도 200) |
 
 - 모두 `/internal/**` 경로입니다. Gateway 외부 라우트에 없으므로 브라우저에서 부를 수 없고, 서비스끼리 Eureka 이름(`ledger-service`)이나 직접 주소로 호출합니다.
 - 응답 본문은 `success`·`data`·`error` 공통 형식입니다([common 가이드](common.md#공통-응답오류)). ID는 모두 UUID, 금액은 통화별 최소 단위 정수(KRW 원, JPY 엔, CNY 펀), 시각은 UTC ISO-8601입니다.
@@ -76,7 +77,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 
 | 항목 | 규칙 |
 |---|---|
-| `referenceType` | 필수. `CHARGE`·`PAYMENT`·`PAYMENT_REFUND`·`TRANSFER`·`EXCHANGE` |
+| `referenceType` | 필수. `CHARGE`·`PAYMENT`·`PAYMENT_REFUND`·`TRANSFER`·`EXCHANGE`·`SETTLEMENT` |
 | `referenceId` | 필수, UUID. 도메인의 원 거래 ID(충전 ID, 송금 ID 등) |
 | `userId` | 선택. 기록용이며 계정 조회에 쓰지 않음 |
 | `description` | 선택, 255자 이하 |
@@ -87,7 +88,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | `entries[].currency` | `KRW`·`JPY`·`CNY` |
 | `entries[].direction` | `DEBIT`(차변, 잔액 감소) 또는 `CREDIT`(대변, 잔액 증가) |
 | `entries[].amount` | 0보다 큰 정수 |
-| `entries[].entryType` | [entry_type 허용 값](#entry_type-허용-값) 11개 중 하나 |
+| `entries[].entryType` | [entry_type 허용 값](#entry_type-허용-값) 13개 중 하나 |
 
 ### 계정 지정
 
@@ -103,7 +104,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 - 항목 2건 이상 20건 이하
 - 통화별로 `DEBIT` 합 = `CREDIT` 합
 - 금액은 0보다 큼. 금액 0 항목은 보내지 않습니다(예: 환전 수수료 0이면 수수료 쌍을 뺌)
-- `entryType`은 허용 값 11개 중 하나
+- `entryType`은 허용 값 13개 중 하나
 - 요청 enum(`referenceType`·`ownerType`·`accountType`·`currency`·`direction`·`entryType`)은 **정확한 이름 문자열만** 받습니다. 숫자(`0`), 숫자 문자열(`"0"`), 소문자(`"charge_in"`)는 400 `COMMON_INVALID_REQUEST`입니다.
 
 ### 반영과 거절 판단
@@ -115,6 +116,9 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 5. 계정별 순변동(대변 합 − 차변 합)을 더해 `USER` 계정 잔액이 음수가 되면 `INSUFFICIENT_BALANCE`로 거절합니다. `SYSTEM` 계정은 음수를 허용합니다. 항목 순서와 관계없이 순변동으로 판단합니다.
 6. 거래·항목·잔액을 한 트랜잭션으로 저장합니다(제한 시간 3초).
 
+- 항목 INSERT와 계정 UPDATE는 JDBC batch(`spring.jpa.properties.hibernate.jdbc.batch_size: 50`, `order_inserts`·`order_updates: true`, `application.yml`·`application-prod.yml`)로 커밋 때 묶어 보냅니다. 계정을 잠근 뒤 DB 왕복을 줄여 잠금 보유 시간을 줄이기 위해서입니다(#294). 송금 수취인 집중 측정에서 잠금 뒤 왕복이 6회 → 4회, 건당 잠금 보유 시간이 6.69ms → 5.93ms였습니다.
+- 거래 INSERT는 `saveAndFlush`로 따로 보내, 같은 reference 충돌(UNIQUE 위반)이 나는 시점은 batch를 켜기 전과 같습니다.
+
 ### 계정 잠금 순서
 
 `LedgerOppositeTransferIntegrationTest`로 확인한 결과입니다.
@@ -123,6 +127,8 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 - 테스트 중 `pg_stat_activity`에서 관측한 실제 SQL의 잠금 절은 `FOR NO KEY UPDATE`였습니다.
 - 같은 두 지갑 사이의 반대 방향 송금(A→B, B→A) 두 건이 모두 앞 계정에서 대기하는 동안, 다른 연결이 뒤 계정에 `FOR NO KEY UPDATE NOWAIT`를 걸어 바로 성공했습니다. 대기 중인 요청이 뒤 계정을 먼저 잠그지 않았다는 실행 근거입니다.
 - 반대 방향 동시 송금을 50회 반복한 검증에서 송금 형태(`TRANSFER_OUT`/`TRANSFER_IN`) 원장 거래 100건이 모두 `POSTED`되었고, DB 교착 횟수(`pg_stat_database.deadlocks`) 증가량은 0이었습니다.
+
+트랜잭션 격리 수준은 READ COMMITTED이며, 트랜잭션마다 명시하지 않고 Hikari 커넥션 설정(`spring.datasource.hikari.transaction-isolation: TRANSACTION_READ_COMMITTED`, `application.yml`·`application-prod.yml` 같은 블록)으로 고정합니다. 계정을 잠그고 기다린 뒤 최신 커밋 행을 읽는 동작이 이 격리 수준을 전제로 합니다.
 
 ### entry_type 허용 값
 
@@ -139,12 +145,12 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | 환전(보내는 금액) | `EXCHANGE` | `USER` 지갑(보내는 통화), `EXCHANGE_OUT` | `SYSTEM FX_POSITION`(보내는 통화), `EXCHANGE_OUT` |
 | 환전(수수료) | `EXCHANGE` | `USER` 지갑(보내는 통화), `EXCHANGE_FEE` | `SYSTEM FEE_REVENUE`(보내는 통화), `EXCHANGE_FEE` |
 | 환전(받는 금액) | `EXCHANGE` | `SYSTEM FX_POSITION`(받는 통화), `EXCHANGE_IN` | `USER` 지갑(받는 통화), `EXCHANGE_IN` |
-| 정산 | `SETTLEMENT` | (결제 담당 확인 중), `SETTLEMENT_OUT` | (결제 담당 확인 중), `SETTLEMENT_IN` |
+| 정산 | `SETTLEMENT` | `USER` 가맹점 지갑, `SETTLEMENT_OUT` | `USER` 가맹점 주인 개인 지갑, `SETTLEMENT_IN` |
 
 - 환전은 한 거래에 6항목(수수료 0이면 4항목)입니다. 통화별로 차변·대변이 맞습니다.
 - 환불은 `originalTransactionId`에 결제의 원장 거래 ID를 넣습니다.
 - 충전은 원화만 있습니다(`CHARGE_SOURCE` 계정이 KRW뿐).
-- - 정산은 V7에서 참조 유형과 항목 유형만 추가했습니다. 차변·대변 계정은 결제 담당 확인 후 채웁니다.
+- 정산은 가맹점 지갑의 정산금을 가맹점 주인의 개인 지갑으로 옮깁니다(결제 서비스 `PaymentLedgerFeignClient` 기준). 두 항목 모두 `USER` 계정입니다.
 
 ### 응답
 
@@ -352,6 +358,40 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 - 현재 시각에 가까운 열린 구간이 아니라 이미 끝난 닫힌 기간(`to`가 충분히 지난 시각)을 조회합니다. 거래 기록 트랜잭션 제한 시간은 3초입니다.
 - 이전 조회 구간과 겹치게 다시 조회하고 `transactionId`로 중복을 제거합니다.
 
+## 정합성 검사
+
+`GET /internal/v1/ledger/integrity`. 네이티브 SQL이나 DB 직접 수정으로 원장이 어긋났는지 원장 데이터만으로 검사합니다. 찾기만 하고 고치지 않습니다.
+
+| 순서 | 응답 필드 | 검사 | 검사 대상(`checkedCount`) | 위반 단위·정렬 |
+|---|---|---|---|---|
+| 1 | `accountBalance` | 계정 잔액 = 그 계정 POSTED 거래 항목의 (CREDIT 합 − DEBIT 합) | 모든 계정 | 계정, `accountId` 순 |
+| 2 | `postedTransactionBalance` | POSTED 거래마다 통화별 DEBIT 합 = CREDIT 합 | POSTED 거래 | (거래, 통화), `transactionId`·`currency` 순 |
+| 3 | `rejectedTransactionEntries` | REJECTED 거래에 항목이 없음 | REJECTED 거래 | 거래, `transactionId` 순 |
+| 4 | `currencyTotal` | 통화별 전체 계정 잔액 합 = 0(요약) | 모든 계정 | 통화, `currency` 순 |
+
+- 모든 계정의 시작 잔액은 0입니다(시드 V3·V4, 계정 개설). 그래서 1과 4는 시작 잔액을 보정하지 않습니다. `balance_after`는 검사하지 않습니다.
+- 응답 `data`: `checkedAt`(첫 검사 직전 시각), `consistent`(전체 위반 0), `totalViolationCount`, `violationLimit`, 그리고 검사별로 `{checkedCount, violationCount, returnedCount, truncated, violations}`가 있습니다. `violations`는 정렬한 뒤 앞쪽부터 `violationLimit`건까지 담고, 더 있으면 `truncated: true`입니다. 합계 값(`postedNet`·`debitSum`·`creditSum`·`totalBalance`)은 bigint 범위를 넘을 수 있어 정수 그대로 돌려줍니다.
+- **읽은 시점**: 검사마다 SQL 한 문장입니다. 한 문장 안에서는 모든 테이블을 같은 시점으로 읽으므로, 잔액과 항목 합계를 다른 시점에 읽어 생기는 오탐이 없습니다. 네 검사는 차례로 실행되므로 **검사끼리는 읽은 시점이 다를 수 있습니다**(응답 전체가 한 시점의 스냅샷은 아님). 격리 수준은 따로 지정하지 않습니다(Hikari의 READ COMMITTED).
+- 읽기 전용 트랜잭션으로 실행합니다. timeout은 거래 처리(3초)와 별도로 `travelpay.ledger.integrity.timeout-seconds`(기본 30)이고, 넘으면 503 `COMMON_SERVICE_UNAVAILABLE`입니다. 위반 최대 건수는 `travelpay.ledger.integrity.violation-limit`(기본 100)입니다.
+- **동시 실행**: 검사 트랜잭션 안에서 `pg_try_advisory_xact_lock(1279608903, 1)`(정수 두 개 형태, `0x4C454447`="LEDG", 1=정합성 검사)을 기다리지 않고 시도합니다. 다른 검사가 쥐고 있으면 409 `LEDGER_INTEGRITY_CHECK_IN_PROGRESS`입니다. 트랜잭션이 끝나면(timeout 롤백 포함) 자동으로 풀립니다. Flyway는 bigint 하나 형태의 advisory lock을 쓰고, PostgreSQL에서 bigint 하나 키와 정수 두 개 키는 키 공간이 겹치지 않습니다(PostgreSQL 문서 Advisory Lock Functions).
+- 읽기만 하므로 거래 등록의 계정 잠금을 막지 않습니다. 다만 1·2는 `ledger_entries` 전체를 집계합니다(인덱스로 줄일 수 없음).
+
+### 측정 결과 (2026-11-15)
+
+| 데이터 | 거래 수 | API 응답 | 위반 |
+|---|---|---|---|
+| 성능 테스트 생성 데이터 | 1만 | 22.8 ms | 0 |
+| 성능 테스트 생성 데이터 | 10만 | 164.1 ms | 0 |
+| 성능 테스트 생성 데이터 | 120만 | 2,121.1 ms | 0 |
+| 지갑 부하 측정 DB(실제 API로 만든 거래) | POSTED 206,240 | 약 0.33 s | 0 |
+
+- 생성 데이터는 `LedgerIntegrityCheckPerformanceTest`(5회 중앙값), 실제 흐름 데이터는 측정 DB에 `curl`로 3회 호출한 값입니다. 측정 조건이 달라 직접 비교하지 않고 규모 감각으로만 봅니다.
+- 시간 대부분은 검사 2(거래별 차대)입니다. 120만 거래에서 (거래, 통화) 묶음이 약 130만 개라 해시 집계가 work_mem(4MB)을 넘어 디스크를 씁니다.
+- 검사 2 개선을 실험했지만 적용하지 않았습니다(`LedgerIntegrityQueryExperimentTest`). 디스크를 없애면(work_mem 192MB) 두 번 측정에서 약 6~9% 빨라졌지만 검사 한 번에 메모리 약 312MB를 써서 운영 RDS 메모리(4GiB)의 약 8%를 차지합니다. 인덱스 순서로 집계하면 약 55% 느려졌습니다. 병렬 비용 힌트는 약 34% 빨랐지만 SQL이 아닌 플래너 설정이고 워커 2개와 임시 파일 약 470MB를 씁니다. 운영 RDS는 vCPU 2개라 다른 서비스 쿼리와 CPU를 나눠 쓰게 되므로 쓰지 않습니다.
+- 실제 흐름 데이터에는 REJECTED 거래가 없어 검사 3은 조작 테스트와 성능 데이터(REJECTED 2%)로만 확인했습니다.
+- timeout 30초는 120만 거래 2.1초 대비 약 14배 여유입니다. 검사는 `ledger_entries` 전체를 집계해 커넥션을 수 초 쓸 수 있어(운영 풀 5), 한 번에 하나만 실행합니다.
+- 운영 RDS는 db.t4g.medium(vCPU 2, 버스트형)이고 work_mem·병렬 설정은 기본값입니다(`infra/aws/rds.tf`). 측정 환경(CPU 32)보다 CPU가 작아 시간이 다를 수 있으니, 운영에서 처음 실행할 때 시간을 확인합니다.
+
 ## 시스템 계정
 
 마이그레이션이 시드합니다(`owner_type = SYSTEM`, `wallet_id = NULL`, 잔액 0, `ACTIVE`). 음수 잔액을 허용합니다.
@@ -379,6 +419,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 404 | `LEDGER_ACCOUNT_NOT_FOUND` | 지갑 계정 조회에서 계정 없음 |
 | 404 | `LEDGER_TRANSACTION_NOT_FOUND` | reference의 거래 없음 |
 | 409 | `LEDGER_REFERENCE_CONFLICT` | 같은 reference로 다른 내용의 거래가 이미 있음 |
+| 409 | `LEDGER_INTEGRITY_CHECK_IN_PROGRESS` | 다른 정합성 검사가 실행 중(기다리지 않음) |
 | 422 | `LEDGER_REJECTED_INSUFFICIENT_BALANCE` | `USER` 계정 잔액 부족 거절 |
 | 422 | `LEDGER_REJECTED_WALLET_SUSPENDED` | 항목 계정 중 `ACTIVE`가 아닌 계정이 있어 거절 |
 | 422 | `LEDGER_REJECTED_ACCOUNT_NOT_FOUND` | 항목 계정이 없어 거절 |
@@ -451,7 +492,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 ```
 
 - `LedgerRequestHasherTest`는 DB 없이 실행됩니다.
-- DB 통합 테스트(`LedgerEntryTypeIntegrationTest`, `LedgerTransactionQueryIntegrationTest`, `LedgerTransactionPeriodIntegrationTest`, `LedgerSameReferenceIntegrationTest`, `LedgerOppositeTransferIntegrationTest`, `LedgerDatabaseFailureIntegrationTest`)는 Testcontainers로 PostgreSQL 컨테이너(`postgres:18.6-bookworm`)를 띄우고 Flyway를 적용해 실행합니다. `.env`나 로컬 compose DB는 필요 없고 Docker만 실행 중이면 됩니다. Docker가 없으면 건너뜁니다(통과가 아님).
+- DB 통합 테스트(`LedgerEntryTypeIntegrationTest`, `LedgerTransactionQueryIntegrationTest`, `LedgerTransactionPeriodIntegrationTest`, `LedgerSameReferenceIntegrationTest`, `LedgerOppositeTransferIntegrationTest`, `LedgerDatabaseFailureIntegrationTest`, `LedgerCancelIntegrationTest`, `LedgerIntegrityCheckIntegrationTest`, `LedgerIntegrityTamperIntegrationTest`, `ConnectionIsolationIntegrationTest`)는 Testcontainers로 PostgreSQL 컨테이너(`postgres:18.6-bookworm`)를 띄우고 Flyway를 적용해 실행합니다. `.env`나 로컬 compose DB는 필요 없고 Docker만 실행 중이면 됩니다. Docker가 없으면 건너뜁니다(통과가 아님).
 
 ### 성능 측정
 
@@ -459,8 +500,10 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 ./gradlew :ledger-service:performanceTest
 ```
 
-- `@Tag("performance")` 테스트(`LedgerTransactionPeriodPerformanceTest`)는 기본 `test`에서 빠지고 이 태스크로만 실행됩니다.
-- 기간 목록의 V6 인덱스 전후를 측정합니다. Flyway를 V5까지만 적용한 뒤 규모(1만·10만·120만 거래)마다 데이터를 만들고 인덱스 없이 측정 → V6 실행 → 다시 측정합니다. 결과는 표준 출력의 `===== PERF REPORT =====` 구간에 나옵니다.
+- `@Tag("performance")` 테스트(`LedgerTransactionPeriodPerformanceTest`, `LedgerIntegrityCheckPerformanceTest`, `LedgerIntegrityQueryExperimentTest`)는 기본 `test`에서 빠지고 이 태스크로만 실행됩니다. 하나만 돌리려면 `--tests`로 클래스를 지정합니다(태그가 붙은 테스트를 모두 실행하므로).
+- `LedgerIntegrityCheckPerformanceTest`는 규모(1만·10만·120만 거래)마다 위와 같은 방식으로 데이터를 만듭니다. 여기에 REJECTED 거래 2%(PAYMENT 자리)를 넣고 계정 잔액을 POSTED 항목 합으로 맞춘 뒤, API 위반 0(오탐 없음)을 확인합니다. 그다음 검사 SQL 네 개의 실행 시간(5회 중앙값)과 디스크 사용 여부, API 응답 시간을 측정합니다. 1만 규모에서 회원 0의 KRW 순합계가 음수가 되지 않도록 송금 상대를 활동 회원 안에서 고릅니다(10만·120만은 원래와 같음).
+- `LedgerIntegrityQueryExperimentTest`는 검사 2 SQL의 대안(집계 먼저, 정렬 입력, work_mem, 병렬 비용 힌트)을 120만 거래에서 교차 실행해 비교한 기록입니다. 데이터 생성은 `LedgerIntegrityCheckPerformanceTest`에서 복사했습니다. 결론은 위 [측정 결과](#측정-결과-2026-11-15)에 있습니다.
+- `LedgerTransactionPeriodPerformanceTest`는 기간 목록의 V6 인덱스 전후를 측정합니다. Flyway를 V5까지만 적용한 뒤 규모(1만·10만·120만 거래)마다 데이터를 만들고 인덱스 없이 측정 → V6 실행 → 다시 측정합니다. 결과는 표준 출력의 `===== PERF REPORT =====` 구간에 나옵니다.
 - 대량 데이터를 만들어 기본 테스트보다 오래 걸립니다. 매번 다시 실행됩니다(`upToDateWhen false`).
 
 ## 고려 중
@@ -470,11 +513,10 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 항목 | 현재 동작 | 정할 것 |
 |---|---|---|
 | V5 CHECK 검증 | `NOT VALID`라 기존 행은 검사하지 않음 | 모든 환경의 옛 값 정리 후 `ALTER TABLE … VALIDATE CONSTRAINT ck_ledger_entries_entry_type` 마이그레이션 추가 시점 |
-| prod 설정 | `application-prod.yml`에 `spring.flyway.default-schema`·`schemas`와 Hikari `connection-timeout`·`validation-timeout`이 없음(`application.yml`에만 있음) | 배포 설정에 같은 값을 둘지 |
 | 취소·되돌림 분개 | `originalTransactionId`와 원거래 존재 검사만 있음. 되돌림용 entry_type 없음 | 완료된 송금 등의 취소 분개(referenceType·entryType, 원거래 연결) |
 | referenceType별 추가 검증 | 없음(코드 TODO) | 환불의 원거래 상태·중복·금액 등 유형별 정책. 해당 도메인 담당이 추가 |
 | `MERCHANT` 계정 지정 | 요청에 쓰면 400. 가맹점은 `USER` + 가맹점 ID 지갑 계정 사용 | 가맹점 계정 지정 방식 |
-| `CHARGE_SOURCE` 잠금 | 모든 충전이 같은 계정을 잠금(핫 계정) | 성능 측정 후 개선 |
+| `CHARGE_SOURCE` 잠금 | 모든 충전이 같은 계정을 잠금(핫 계정). 충전 동시성 3(초당 약 200건)에서 원장 잠금 대기 평균 0.03으로 측정 범위에서는 병목이 아니었음(지갑 부하 측정 README 2026-11-10) | 목표 처리량이 정해지면 배포 구성에서 다시 측정 |
 | DB 장애 503 처리 위치 | `LedgerDatabaseExceptionHandler`(원장 전용) | common 처리기로 이전 |
 | 계정 상태 변경 | `SUSPENDED`·`CLOSED` 값은 있으나 바꾸는 API 없음 | 정지·해지 절차 |
 | 같은 reference 충돌 로그 | 동시 요청의 정상 UNIQUE 충돌 처리 중 Hibernate `SqlExceptionHelper`(로거 `org.hibernate.orm.jdbc.error`)가 충돌 1건당 WARN 두 줄(`SQLState: 23505`, `duplicate key value violates unique constraint "uk_ledger_transactions_reference"`)을 남김. 동시성 테스트 3개 시나리오에서 관측. 정상 처리 과정의 로그라 버그로 단정하지 않음 | 로그 노이즈를 줄일지(운영 개선 후보) |
