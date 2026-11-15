@@ -1,5 +1,5 @@
-// 성능 B: 로그인한 회원의 GET /api/v1/wallets/me. 개선 뒤에도 I01을 거치는 업무 API 경로가 나빠지지 않았는지 봅니다.
-// Wallet 코드는 바꾸지 않고, Gateway → I01 → Wallet 경로의 기준으로만 씁니다.
+// 성능 B: 로그인한 회원의 GET /api/v1/wallets/me. 개선 뒤에도 세션 확인 API를 거치는 업무 API 경로가 나빠지지 않았는지 봅니다.
+// Wallet 코드는 바꾸지 않고, Gateway → User 세션 확인 API → Wallet 경로의 기준으로만 씁니다.
 import http from 'k6/http';
 import { check } from 'k6';
 import {

@@ -1,4 +1,4 @@
-// 성능 A: 로그인한 회원의 GET /api/v1/users/me. User 보호 API의 중복 인증(I01) 개선 효과를 봅니다.
+// 성능 A: 로그인한 회원의 GET /api/v1/users/me. User 보호 API의 중복 인증(Gateway의 세션 확인 API 호출) 개선 효과를 봅니다.
 import http from 'k6/http';
 import { check } from 'k6';
 import {

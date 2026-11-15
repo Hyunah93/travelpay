@@ -41,7 +41,7 @@ final class ReadLimitCheck {
 
                 assertEquals(CommonErrorCode.SERVICE_UNAVAILABLE, failure.getErrorCode());
                 // Hibernate가 남은 시간을 초 단위로 바꿔 걸어 키로 찾는 조회는 1초, 질의는 2초에 끊길 수 있음
-                // 상한은 구현의 TIMEOUT_SECONDS와 독립적인 I01 읽기 응답 한도(3초)로 검증
+                // 상한은 구현의 TIMEOUT_SECONDS와 무관하게, Gateway가 세션 확인 API 응답을 기다리는 한도(3초)로 검증
                 assertTrue(elapsed.compareTo(Duration.ofSeconds(1)) >= 0
                         && elapsed.compareTo(Duration.ofSeconds(3)) < 0,
                         elapsed.toString());

@@ -41,7 +41,7 @@ SCENARIOS = {
     # 성능 A: 처음 기준선과 같은 조건이 되도록 업무 구성을 끈 상태에서만 측정합니다.
     "my-info": {"script": "my-info.js", "business": False, "service": "auth-user", "port": 18081,
                 "uri": "/api/v1/users/me"},
-    # 성능 B: Gateway → I01 → Wallet 경로. Wallet 코드는 바꾸지 않습니다.
+    # 성능 B: Gateway → User 세션 확인 API → Wallet 경로. Wallet 코드는 바꾸지 않습니다.
     "wallet-me": {"script": "wallet-me.js", "business": True, "service": "auth-wallet", "port": 18082,
                   "uri": "/api/v1/wallets/me"},
 }
@@ -623,7 +623,7 @@ def write_summary(directory, args, runs, services):
     med = statistics.median
     cpu_services = [service for service in ("auth-gateway", "auth-user", "auth-wallet") if service in services]
     lines = ["# User·Gateway 측정 결과", "", f"측정: {directory.name} · 시나리오 {args.scenario}", "",
-             "| VU | 반복 | 정상 RPS 중앙값 | RPS 범위 | p50(ms) | p95(ms) | p99(ms) | 오류 | I01/요청 | SELECT/요청 | "
+             "| VU | 반복 | 정상 RPS 중앙값 | RPS 범위 | p50(ms) | p95(ms) | p99(ms) | 오류 | 세션 확인 API/요청 | SELECT/요청 | "
              + " | ".join(f"{service} CPU ms/요청 · 제한 주기" for service in cpu_services) + " |",
              "|" + "---|" * (10 + len(cpu_services))]
     for vus in args.vus:
