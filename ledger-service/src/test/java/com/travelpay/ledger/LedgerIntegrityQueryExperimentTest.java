@@ -42,7 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *     <li>B·C는 결과는 같지만 플래너가 인덱스 순서 집계(Index Scan → Incremental Sort → GroupAggregate)를 골라
  *         힙을 무작위로 읽어 A(약 2.0초)보다 약 55% 느리다(약 3.1초). 병렬 집계(Partial/Finalize Aggregate)는 나오지 않는다.
  *         (거래, 통화) 묶음 수가 입력 행의 절반 가까이 돼 부분 집계로 줄어드는 양이 거의 없기 때문이다</li>
- *     <li>D(work_mem 192MB, 해시 집계 약 312MB)는 디스크를 없애도 약 6% 빨라질 뿐이다. 같은 A의 측정 간 차이(약 7%, 1,902ms ↔ 2,041ms)보다 작아 개선으로 보지 않는다</li>
+ *     <li>D(work_mem 192MB, 해시 집계 약 312MB)는 디스크를 없애 두 번 측정에서 약 6~9% 빨라졌다. 다만 운영 RDS(db.t4g.medium, 메모리 4GiB)의 약 8%를 쿼리 하나가 쓰게 되어 적용하지 않는다</li>
  *     <li>병렬 비용 힌트는 약 34% 빠르지만 SQL 형태가 아닌 설정 힌트이고, 워커 2개와 temp 약 470MB를 쓴다</li>
  * </ul>
  */
@@ -160,19 +160,27 @@ class LedgerIntegrityQueryExperimentTest {
                 + ", transactions=" + jdbcTemplate.queryForObject(
                 "SELECT last_analyze::text FROM pg_stat_user_tables WHERE relname = 'ledger_transactions'", String.class));
 
-        String workMem = chooseWorkMem();
-        List<Variant> variants = List.of(
-                new Variant("A 현재", LedgerIntegritySql.POSTED_TRANSACTION_BALANCES, List.of()),
-                new Variant("B 집계 먼저", CHECK2_B, List.of()),
-                new Variant("C 정렬 입력", CHECK2_C, List.of()),
-                new Variant("D A+work_mem " + workMem, LedgerIntegritySql.POSTED_TRANSACTION_BALANCES,
-                        List.of("SET LOCAL work_mem = '" + workMem + "'")),
-                new Variant("참고 A+병렬비용0", LedgerIntegritySql.POSTED_TRANSACTION_BALANCES,
-                        List.of("SET LOCAL parallel_setup_cost = 0", "SET LOCAL parallel_tuple_cost = 0")));
+        Variant a = new Variant("A 현재", LedgerIntegritySql.POSTED_TRANSACTION_BALANCES, List.of());
+        Variant b = new Variant("B 집계 먼저", CHECK2_B, List.of());
+        Variant c = new Variant("C 정렬 입력", CHECK2_C, List.of());
+        Variant parallel = new Variant("참고 A+병렬비용0", LedgerIntegritySql.POSTED_TRANSACTION_BALANCES,
+                List.of("SET LOCAL parallel_setup_cost = 0", "SET LOCAL parallel_tuple_cost = 0"));
 
-        compareResults(variants);
-        measureRounds(variants);
+        // 결과 검증을 먼저 한다. D는 어떤 후보가 골라질지 모르므로 후보 전부를 검증한다. 실패하면 여기서 멈춘다
+        List<Variant> verified = new ArrayList<>(List.of(a, b, c));
+        WORK_MEM_CANDIDATES.forEach(candidate -> verified.add(workMemVariant(candidate)));
+        verified.add(parallel);
+        compareResults(verified);
+
+        // 검증을 통과한 뒤에만 시간을 잰다
+        String workMem = chooseWorkMem();
+        measureRounds(List.of(a, b, c, workMemVariant(workMem), parallel));
         System.out.println("\n===== PERF REPORT =====\n" + report + "===== END PERF REPORT =====");
+    }
+
+    private static Variant workMemVariant(String workMem) {
+        return new Variant("D A+work_mem " + workMem, LedgerIntegritySql.POSTED_TRANSACTION_BALANCES,
+                List.of("SET LOCAL work_mem = '" + workMem + "'"));
     }
 
     /** 후보를 작은 값부터 한 번씩 실행해 해시 집계 디스크가 없어지는 가장 작은 값 */
@@ -292,6 +300,13 @@ class LedgerIntegrityQueryExperimentTest {
             row.append(", 롤백 뒤 SAVEPOINT 밖 work_mem=").append(results.get("_work_mem_after"));
             row.append(" | A: ").append(reference.length() > 160 ? reference.substring(0, 160) + "…" : reference);
             line(row.toString());
+
+            assertTrue(expectedOk, "조작 [" + tamper.getKey() + "] 방식 [" + variants.getFirst().name()
+                    + "] 결과가 기대(" + expect + ")와 다름: " + reference);
+            for (Variant variant : variants.subList(1, variants.size())) {
+                assertEquals(reference, results.get(variant.name()), "조작 [" + tamper.getKey() + "] 방식 ["
+                        + variant.name() + "] 결과가 " + variants.getFirst().name() + "와 다름");
+            }
         }
         assertEquals("4MB", jdbcTemplate.queryForObject("SHOW work_mem", String.class), "SET LOCAL이 남음");
     }

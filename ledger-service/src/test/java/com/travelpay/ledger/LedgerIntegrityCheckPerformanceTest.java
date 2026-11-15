@@ -160,7 +160,7 @@ class LedgerIntegrityCheckPerformanceTest {
                 + ", accounts " + size("ledger_accounts"));
 
         HttpResponse<String> first = get();
-        assertEquals(200, first.statusCode(), first.body());
+        assertEquals(200, first.statusCode(), "규모 " + scale + " 오탐 확인 API: " + first.body());
         JsonNode data = jsonMapper.readTree(first.body()).get("data");
         line("API 결과(오탐 확인): consistent=" + data.get("consistent").asBoolean() + ", 전체 위반 "
                 + data.get("totalViolationCount").asLong() + ", 검사 대상 수 1=" + checked(data, "accountBalance")
@@ -179,8 +179,8 @@ class LedgerIntegrityCheckPerformanceTest {
                 System.out.println("---- 전체 계획: " + scale + " / " + check.getKey() + "\n" + explain.plan());
             }
         }
-        Api api = apiMedian();
-        line("- API 응답(네 검사 + 잠금): " + api.median() + " / 5회 " + api.runs() + ", 상태 " + api.statuses());
+        Api api = apiMedian(scale);
+        line("- API 응답(네 검사 + 잠금): " + api.median() + " / 5회 " + api.runs() + " (예열 포함 모두 200)");
     }
 
     // =====================================================================
@@ -389,25 +389,26 @@ class LedgerIntegrityCheckPerformanceTest {
         return lines.isEmpty() ? "없음" : lines;
     }
 
-    private record Api(String median, List<String> runs, List<Integer> statuses) {
+    private record Api(String median, List<String> runs) {
     }
 
-    private Api apiMedian() throws Exception {
+    /** 예열 1회 + 측정 5회. 모든 호출이 200이어야 하며 아니면 바로 실패한다 */
+    private Api apiMedian(int scale) throws Exception {
         List<Double> times = new ArrayList<>();
         List<String> runs = new ArrayList<>();
-        List<Integer> statuses = new ArrayList<>();
         for (int i = 0; i <= RUNS; i++) {
             long start = System.nanoTime();
             HttpResponse<String> response = get();
             double ms = (System.nanoTime() - start) / 1_000_000.0;
+            assertEquals(200, response.statusCode(), "규모 " + scale + " API "
+                    + (i == 0 ? "예열" : i + "회차") + ": " + response.body());
             if (i == 0) {
                 continue;
             }
-            statuses.add(response.statusCode());
-            times.add(response.statusCode() == 200 ? ms : Double.POSITIVE_INFINITY);
+            times.add(ms);
             runs.add(String.format("%.1f", ms));
         }
-        return new Api(medianText(times), runs, statuses);
+        return new Api(medianText(times), runs);
     }
 
     private HttpResponse<String> get() throws Exception {
@@ -418,8 +419,7 @@ class LedgerIntegrityCheckPerformanceTest {
 
     private static String medianText(List<Double> values) {
         List<Double> sorted = values.stream().sorted().toList();
-        double median = sorted.get(sorted.size() / 2);
-        return Double.isInfinite(median) ? "실패" : String.format("%.1f ms", median);
+        return String.format("%.1f ms", sorted.get(sorted.size() / 2));
     }
 
     private static long elapsedMs(long startNanos) {
