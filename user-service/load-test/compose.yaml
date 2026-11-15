@@ -53,7 +53,7 @@ services:
       LEDGER_DB_PASSWORD: load-test-only
       MOCK_BANK_DB_USERNAME: mock_bank_app
       MOCK_BANK_DB_PASSWORD: load-test-only
-    # 시험 데이터는 컨테이너를 삭제하면 사라집니다. 개발 DB에는 접근하지 않습니다.
+    # tmpfs이므로 중지·재시작·삭제 시 시험 DB가 사라집니다. 개발 DB에는 접근하지 않습니다.
     tmpfs:
       - /var/lib/postgresql:rw,size=256m
     # 서비스 계정·스키마는 팀 공용 초기화 SQL을 그대로 씁니다(다른 부하 시험과 같은 방식).

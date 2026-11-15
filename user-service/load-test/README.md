@@ -143,4 +143,4 @@ python3 -m unittest discover -s user-service/load-test -p 'test_*.py'
 docker compose -p travelpay-auth-load-test -f user-service/load-test/compose.yaml down
 ```
 
-`down`은 이 시험 프로젝트만 종료합니다. 시험 DB는 메모리 파일시스템에 있어 PostgreSQL 컨테이너를 삭제하면 사라집니다. 다음 실행 때 `prepare`부터 다시 진행합니다. 기존 개발 인프라와 모니터링은 종료하지 않습니다.
+`down`은 이 시험 프로젝트만 종료합니다. 시험 PostgreSQL은 `tmpfs`를 사용하므로 `stop`·`restart`·`down` 모두 DB 데이터를 잃습니다. 시험 Redis도 영속 저장을 끈 구성이라 중지·재시작하면 세션이 사라집니다. 이 저장소들을 중지했다면 다음 시험은 `prepare`부터 다시 진행합니다. 기존 개발 인프라와 모니터링은 종료하지 않습니다.
