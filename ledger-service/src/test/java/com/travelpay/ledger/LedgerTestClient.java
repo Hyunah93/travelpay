@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -139,6 +140,23 @@ final class LedgerTestClient {
     String errorCode(String responseBody) {
         JsonNode error = jsonMapper.readTree(responseBody).get("error");
         return error == null || error.get("code") == null ? null : error.get("code").asString();
+    }
+
+    HttpResponse<String> get(String path) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .timeout(Duration.ofSeconds(20))
+                .GET()
+                .build();
+        return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /** 응답을 기다리지 않고 보낸다 (진행 중인 요청과 겹쳐 보내기용) */
+    CompletableFuture<HttpResponse<String>> getAsync(String path) {
+        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .timeout(Duration.ofSeconds(20))
+                .GET()
+                .build();
+        return httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString());
     }
 
     HttpResponse<String> post(String path, String json) throws Exception {
