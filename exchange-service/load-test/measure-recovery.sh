@@ -156,6 +156,7 @@ statuses=$(psql_q -F ' ' -c "SELECT status, count(*) FROM exchange_service.excha
 # 회복 뒤 구간만: 50·90·99% 처리 시각과 꼬리 주문 수(99%에 닿은 순간 남은 PROCESSING), 원장 호출 수(초당 최대),
 # 서킷이 닫힌 시각, 복구 주기 수와 평균 주기 시간(빈 주기 포함), 첫 확정 시각(회복을 알아채기까지 걸린 시간).
 # 장애 구간(신청이 끝난 뒤 ~ 회복 전)에 원장에 실제로 보낸 호출 수(서킷 반열림 시험·복구가 보낸 것)도 센다
+# 앱 지표를 못 읽은 초(서킷 상태가 빈 줄)는 건너뛴다. 누적값이 0으로 읽혀 초당 호출 수가 부풀지 않게
 awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
     FNR == NR {
         if ($1 >= from) {
@@ -167,11 +168,11 @@ awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
         }
         next
     }
-    $1 >= fe && $1 < from {
+    $1 >= fe && $1 < from && $2 != "" {
         if (outFirst == "") outFirst = $4
         outLast = $4
     }
-    $1 >= from {
+    $1 >= from && $2 != "" {
         if (prev != "" && $4 - prevCalls > maxCalls) maxCalls = $4 - prevCalls
         if (first == "") { first = $1; c0 = $4; rc0 = $6; rs0 = $7 }
         if (closedAt == "" && $2 != "" && $2 + 0 == 0 && $3 + 0 == 0) closedAt = $1 - from
