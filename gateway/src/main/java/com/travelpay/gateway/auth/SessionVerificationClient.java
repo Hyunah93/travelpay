@@ -9,7 +9,10 @@ import com.travelpay.common.auth.AuthenticatedUser;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.common.response.ApiResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.core.codec.CodecException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.codec.json.JacksonJsonDecoder;
 import org.springframework.http.server.reactive.ServerHttpRequest;
@@ -31,6 +34,8 @@ class SessionVerificationClient {
     // 요청에서 그대로 복사해 보내는 헤더. 이 밖의 요청 헤더(Authorization 등)는 복사하지 않음
     private static final List<String> FORWARDED_HEADERS =
             List.of(HttpHeaders.COOKIE, AuthHeaders.CSRF_TOKEN, AuthHeaders.REQUEST_ID);
+
+    private static final Logger log = LoggerFactory.getLogger(SessionVerificationClient.class);
 
     private final WebClient webClient;
     private final URI uri;
@@ -66,18 +71,27 @@ class SessionVerificationClient {
     private static Mono<SessionVerification> read(ClientResponse response) {
         var status = response.statusCode();
         if (status.is2xxSuccessful()) {
-            // 성공인데 회원 정보가 없으면 판단할 수 없으므로 503
+            // 성공인데 회원 정보가 없거나 형식이 틀리면 503. 응답 약속이 깨진 것이라 ERROR(본문은 남기지 않음, 받다 끊긴 것은 장애라 제외)
             return response.bodyToMono(VERIFIED_BODY)
                     .flatMap(body -> Mono.justOrEmpty(body.data()))
                     .<SessionVerification>map(SessionVerification.Verified::new)
-                    .switchIfEmpty(Mono.error(() -> unavailable(null)));
+                    .switchIfEmpty(Mono.error(() -> {
+                        log.error("Session verification returned {} without member data", status.value());
+                        return unavailable(null);
+                    }))
+                    .doOnError(CodecException.class, error -> log.error(
+                            "Session verification returned {} with an unreadable body: {}",
+                            status.value(), error.getClass().getName()));
         }
         if (REJECTIONS.contains(status.value())) {
             return response.bodyToMono(byte[].class)
                     .defaultIfEmpty(new byte[0])
                     .map(body -> new SessionVerification.Rejected(status, body));
         }
-        // 그 밖의 상태(5xx, 다른 4xx)는 인증 시스템 장애
+        // 그 밖의 상태는 503. User 자체 장애(5xx)는 요청마다 생기므로 로그 없이, 약속에 없는 상태(다른 4xx 등)는 연동 오류라 ERROR
+        if (!status.is5xxServerError()) {
+            log.error("Session verification returned unexpected status {}", status.value());
+        }
         return Mono.error(() -> unavailable(null));
     }
 

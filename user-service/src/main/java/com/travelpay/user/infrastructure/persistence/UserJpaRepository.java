@@ -2,9 +2,11 @@ package com.travelpay.user.infrastructure.persistence;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import com.travelpay.user.domain.model.entity.User;
+import com.travelpay.user.domain.repository.UserProfile;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
@@ -16,6 +18,17 @@ import org.springframework.data.repository.query.Param;
 public interface UserJpaRepository extends JpaRepository<User, UUID> {
 
     boolean existsByPhone(String phone);
+
+    // 비밀번호 로그인 정보가 없는 회원도 빠지지 않게 LEFT JOIN 한 번으로 이메일까지 읽음. 비밀번호 해시처럼 화면에 없는 열은 읽지 않음
+    // 로그인 정보는 회원 ID가 기본 키라 회원마다 최대 한 행
+    @Query("""
+            select new com.travelpay.user.domain.repository.UserProfile(
+                user.id, user.realName, user.phone, credentials.loginEmail, user.status, user.role, user.createdAt)
+            from User user
+            left join UserCredentials credentials on credentials.user = user
+            where user.id = :userId
+            """)
+    Optional<UserProfile> findProfile(@Param("userId") UUID userId);
 
     // 읽고 더해서 저장하지 않고 UPDATE 한 문장으로 올려서, 동시에 올린 값이 사라지지 않게 함
     // 이미 읽어 둔 엔티티의 sessionVersion은 그대로이므로, 올린 뒤 값이 필요하면 다시 조회해야 함

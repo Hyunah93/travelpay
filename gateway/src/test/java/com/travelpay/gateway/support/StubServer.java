@@ -6,10 +6,12 @@ import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Function;
 
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
@@ -27,7 +29,7 @@ public final class StubServer implements AutoCloseable {
     private final HttpServer server;
     private final ExecutorService executor;
     private final List<Received> received = new CopyOnWriteArrayList<>();
-    private final Map<String, Reply> replies = new ConcurrentHashMap<>();
+    private final Map<String, Function<Received, Reply>> replies = new ConcurrentHashMap<>();
 
     private StubServer(HttpServer server, ExecutorService executor) {
         this.server = server;
@@ -55,7 +57,13 @@ public final class StubServer implements AutoCloseable {
     }
 
     public void reply(String path, Reply reply) {
-        replies.put(path, reply);
+        Objects.requireNonNull(reply);
+        replies.put(path, request -> reply);
+    }
+
+    /** 요청별로 다른 응답을 만들어 동시 요청과 해당 로그를 구분합니다. */
+    public void replyToRequest(String path, Function<Received, Reply> responder) {
+        replies.put(path, responder);
     }
 
     public List<Received> received(String path) {
@@ -79,8 +87,10 @@ public final class StubServer implements AutoCloseable {
 
     private void handle(HttpExchange exchange) throws IOException {
         var path = exchange.getRequestURI().getPath();
-        received.add(new Received(exchange.getRequestMethod(), path, new Headers(exchange.getRequestHeaders())));
-        var reply = replies.getOrDefault(path, DEFAULT_REPLY);
+        var request = new Received(exchange.getRequestMethod(), path, new Headers(exchange.getRequestHeaders()));
+        received.add(request);
+        var responder = replies.get(path);
+        var reply = responder == null ? DEFAULT_REPLY : responder.apply(request);
         try {
             Thread.sleep(reply.delay());
         }

@@ -28,6 +28,7 @@ import org.springframework.boot.test.context.TestComponent;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpSession;
@@ -65,6 +66,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.options;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @SpringJUnitWebConfig(classes = {
@@ -257,6 +259,36 @@ class SecurityConfigurationTest {
                 .andReturn();
 
         assertError(result, 401, "COMMON_UNAUTHORIZED", "로그인이 필요합니다.");
+    }
+
+    // Gateway가 세션 확인 API 없이 넘기는 User 요청도 세션 확인 API처럼, 로그인 세션이 없으면 CSRF보다 401이 먼저입니다.
+    @ParameterizedTest
+    @CsvSource({"PATCH,/api/v1/users/me/password",
+            "PATCH,/api/v1/admin/users/550e8400-e29b-41d4-a716-446655440000/status",
+            "DELETE,/api/v1/admin/users/550e8400-e29b-41d4-a716-446655440000/sessions",
+            "POST,/api/v1/admin/terms"})
+    void aProtectedMutationWithoutALoginSessionIsUnauthorizedBeforeCsrf(String method, String path) throws Exception {
+        var result = mvc.perform(request(HttpMethod.valueOf(method), path)).andReturn();
+
+        assertError(result, 401, "COMMON_UNAUTHORIZED", "로그인이 필요합니다.");
+        assertNull(result.getRequest().getSession(false));
+    }
+
+    @Test
+    void aCsrfOnlySessionIsNotALoginSessionForProtectedMutations() throws Exception {
+        var csrf = fetchCsrf(null);
+        var result = mvc.perform(patch("/api/v1/users/me/password").session(csrf.session())).andReturn();
+
+        assertError(result, 401, "COMMON_UNAUTHORIZED", "로그인이 필요합니다.");
+    }
+
+    // 로그아웃은 기존 규칙대로 로그인 세션이 아니어도 세션이 있으면 CSRF를 확인합니다.
+    @Test
+    void logoutWithACsrfOnlySessionStillRequiresCsrf() throws Exception {
+        var csrf = fetchCsrf(null);
+        var result = mvc.perform(post("/api/v1/auth/logout").session(csrf.session())).andReturn();
+
+        assertError(result, 403, "COMMON_CSRF_INVALID", "CSRF 토큰이 올바르지 않습니다.");
     }
 
     @Test

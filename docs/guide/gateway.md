@@ -1,14 +1,14 @@
 # Gateway 실행·프런트 연결·배포 가이드
 
-Gateway는 브라우저 요청을 받아 User에 세션 검증을 요청하고, 검증된 회원 정보로 업무 서비스에 전달합니다. 브라우저는 User·Wallet 포트에 직접 접속하는 대신 Gateway 주소를 API 기준 주소로 사용합니다.
+Gateway는 브라우저 요청을 받아, 업무 API는 User에 세션 검증을 요청한 뒤 검증된 회원 정보로 업무 서비스에 전달하고, User API는 User가 직접 인증하도록 그대로 전달합니다. 브라우저는 User·Wallet 포트에 직접 접속하는 대신 Gateway 주소를 API 기준 주소로 사용합니다.
 
 ## 구성 선택과 이유
 
-- **세션 검증은 User에 요청합니다.** Gateway가 세션 Redis 구조를 공유하지 않고 User의 세션 확인 API로 현재 회원 상태와 역할을 확인합니다. User 자신의 보호 API는 실제 요청에서도 SecurityContext로 인증하므로, Gateway의 회원 헤더를 로그인 근거로 사용하지 않습니다.
+- **세션 검증은 User에 요청합니다.** Gateway가 세션 Redis 구조를 공유하지 않고 User의 세션 확인 API로 현재 회원 상태와 역할을 확인합니다. User API는 User가 실제 요청에서 세션·회원 상태·권한·CSRF를 직접 확인하므로 세션 확인 API를 다시 부르지 않고, Gateway의 회원 헤더를 로그인 근거로 사용하지 않습니다.
 - **외부 회원 헤더는 검증한 값으로 교체합니다.** User-Id·User-Role 위조를 막기 위한 경계입니다. Request-Id는 새로 생성하고 Client-Ip는 신뢰하는 연결의 값으로 판단합니다. 서비스 포트의 외부 접근 제한은 배포 망에서 적용합니다.
 - **추적 정보는 관측 시작 전부터 제한합니다.** 필터가 헤더를 지울 때는 부모 trace가 이미 추출됐을 수 있어, 외부 trace 추출 설정과 전달 헤더를 함께 제한합니다. 내부 호출은 새 traceId를 이어 씁니다.
 - **CORS와 HTTP 오류는 프레임워크 확장점에서 처리합니다.** 별도 OPTIONS 허용 필터를 만들지 않고, 정상 preflight와 실제 API의 인증·CSRF 검사를 구분합니다. 오류 응답에서는 no-store와 Allow 같은 필요한 HTTP 헤더를 유지합니다.
-- **세션 확인 대기 시간과 업무 호출 시간을 구분합니다.** 연결·읽기·전체 제한은 세션 검증 구간에만 적용해, 검증 후 업무 API가 늦어진 것을 인증 장애로 분류하지 않습니다.
+- **세션 확인 대기 시간과 업무 호출 시간을 구분합니다.** 연결·읽기·전체 제한은 세션 검증 구간에만 적용해, 검증 후 업무 API가 늦어진 것을 인증 장애로 분류하지 않습니다. 세션 확인을 거치지 않는 User 라우트에는 응답 대기 상한을 따로 둡니다.
 
 ## 파일의 책임
 
@@ -17,10 +17,11 @@ Gateway는 브라우저 요청을 받아 User에 세션 검증을 요청하고, 
 | `NormalizedPathFilter` | 우회 해석될 경로 거절 |
 | `InternalHeaderResetFilter` | 외부 내부용·추적 헤더 정리, Request-Id·Client-Ip 작성 |
 | `ClientIpResolver`·`ClientIpProperties` | 신뢰 연결 대역과 IP 형식 확인 |
-| `PublicEndpoints`·`SessionAuthenticationFilter` | 공개 요청 분류와 세션 확인 결과에 따른 전달·거절 |
-| `SessionVerificationClient` | 필요한 헤더만 전달하고 검증 응답을 엄격히 해석 |
-| `SessionVerificationConfiguration`·`SessionVerificationProperties` | 내부 HTTP 클라이언트와 관측·제한 시간 설정 |
-| `GatewayErrorHandler` | 공통 JSON·HTTP 상태·Allow·no-store 처리, 서비스 연결 실패 503 |
+| `PublicEndpoints`·`SessionAuthenticationFilter` | 업무 API의 공개 목록·User 라우트 분류와 세션 확인 결과에 따른 전달·거절 |
+| `SessionVerificationClient` | 필요한 헤더만 전달하고 검증 응답을 엄격히 해석, 약속에 없는 응답은 ERROR 로그 |
+| `SessionVerificationConfiguration`·`SessionVerificationProperties` | 내부 HTTP 클라이언트와 관측·제한 시간 설정, 서킷·동시 호출 상한 생성 |
+| `SessionVerificationProtectionProperties` | 서킷·동시 호출 상한 값과 시작 시 검증 |
+| `GatewayErrorHandler` | 공통 JSON·HTTP 상태·Allow·no-store 처리, 이름 조회·전송 전 실패 503과 처리 여부가 불명확한 단절 502 구분 |
 | `GatewayCorsConfiguration` | 허용 출처 검증과 프레임워크 CORS 거절 응답 연결 |
 
 ## 주소와 포트
@@ -31,7 +32,7 @@ Gateway는 브라우저 요청을 받아 User에 세션 검증을 요청하고, 
 | API | `http://localhost:8080` | `https://api.travelpay.store` |
 | Gateway 관리 | `0.0.0.0:18080`에서 수신, PC에서는 `localhost:18080`로 접근 | 내부망의 `18080` |
 
-프런트의 Vercel 배포 여부와 백엔드의 EC2·ECS 선택은 API 코드와 분리합니다. 현재 실제 DNS·인증서·AWS 리소스는 연결하지 않았습니다.
+프런트 배포와 AWS 리소스 구성은 API 코드와 분리합니다. 이 가이드는 연결 계약을 설명하며 실제 배포 상태는 배포 기록에서 확인합니다.
 
 Swagger UI는 없습니다(Gateway에는 자체 업무 API가 없음). API 문서는 각 서비스의 `/swagger-ui.html`에서 봅니다: User `8081`, Wallet `8082`, Payment `8083`, Exchange `8084`.
 
@@ -62,6 +63,8 @@ GATEWAY_CORS_ALLOWED_ORIGINS=http://localhost:5173 ./gradlew :gateway:bootRun
 
 ## 세션 검증과 라우팅
 
+업무 API(Wallet·Payment·Exchange)는 다음 순서로 처리합니다.
+
 ```text
 브라우저 → Gateway: SESSION 쿠키가 있는 API 요청
   → 외부 회원·요청 식별·IP·추적 헤더 정리
@@ -73,20 +76,20 @@ GATEWAY_CORS_ALLOWED_ORIGINS=http://localhost:5173 ./gradlew :gateway:bootRun
   → 업무 서비스: 소유권·권한 확인 후 응답
 ```
 
-현재 Gateway는 공개 목록을 제외한 매핑 요청을 User의 세션 확인 API로 먼저 확인합니다. User 자신의 보호 API도 Gateway를 거치면 이 확인을 받고, 실제 User API에서는 세션의 SecurityContext를 근거로 요청자를 판단합니다. User의 `header-context.enabled`는 `false`입니다.
+Gateway는 공개 목록과 User 라우트를 제외한 매핑 요청을 User의 세션 확인 API로 먼저 확인합니다. User 라우트(목적지 `lb://user-service`)는 세션 확인 API를 거치지 않고 SESSION 쿠키·Csrf-Token과 함께 User로 전달하며, User가 세션의 SecurityContext와 DB의 현재 회원 상태로 요청자를 판단합니다. 판단 기준은 경로 목록이 아니라 Gateway가 고른 라우트의 목적지이므로, 새 업무 라우트는 따로 등록하지 않아도 세션 확인을 거칩니다. User의 `header-context.enabled`는 `false`이고, 위조 회원 헤더는 모든 요청에서 먼저 지웁니다.
 
-User 보호 API의 중복 세션 확인 호출을 줄이는 구조는 후속 검토 사항이며 현재 동작에 반영되지 않았습니다. User의 관리자 API(`/api/v1/admin/users/**`·`/api/v1/admin/terms/**`)는 User 라우트로 SESSION 쿠키와 함께 전달되며, User의 `/api/v1/admin/**` 규칙이 ACTIVE MASTER만 통과시킵니다.
+User는 로그인 세션이 있을 때만 상태 변경 요청의 CSRF를 확인하므로(공개 회원가입·로그인은 항상 확인), 세션이 없거나 만료된 요청은 세션 확인 API를 거칠 때와 같은 401입니다. 지원하지 않는 메서드의 405는 User 라우트에서도 User 호출 전에 Gateway가 응답합니다. User의 관리자 API(`/api/v1/admin/users/**`·`/api/v1/admin/terms/**`)는 User 라우트로 SESSION 쿠키와 함께 전달되며, User의 `/api/v1/admin/**` 규칙이 ACTIVE MASTER만 통과시킵니다.
 
 | 라우트 | 전달 대상 | SESSION 쿠키 |
 |---|---|---|
 | `/api/v1/auth/**`, `/api/v1/terms/**`, `/api/v1/users/**`, `/api/v1/admin/users/**`, `/api/v1/admin/terms/**` | User | 전달 |
-| `/api/v1/wallets/**`, `/api/v1/charges/**` | Wallet | 제거 |
-| `/api/v1/payments/**`, `/api/v1/transfers/**` | Payment | 제거 |
-| 환율·한도·견적·환전 경로 | Exchange | 제거 |
+| `/api/v1/wallets/**`, `/api/v1/charges/**`, `/api/v1/admin/charges/**` | Wallet | 제거 |
+| `/api/v1/payments/**`, `/api/v1/transfers/**`, `/api/v1/admin/payments/**`, `/api/v1/admin/transfers/**` | Payment | 제거 |
+| 환율·한도·견적·환전 경로, `/api/v1/admin/exchanges/**` | Exchange | 제거 |
 
 환전 경로는 `/api/v1/exchange-rates/**`, `/api/v1/exchange-limits/**`, `/api/v1/exchange-quotes/**`, `/api/v1/exchanges/**`, `/api/v1/exchange-reservations/**`입니다. 정확한 매핑은 실행 시 사용하는 Gateway 설정의 `routes` 목록을 기준으로 합니다. `/internal/**`, `/actuator/**`는 외부 API 라우트에 없습니다.
 
-로그인 없이 통과하는 조합은 다음과 같습니다. 공개 API라도 회원가입·로그인·로그아웃의 CSRF 및 세션 확인은 User가 담당합니다.
+로그인 없이 사용하는 API는 다음과 같습니다. Gateway의 `PublicEndpoints`에는 업무 API인 공개 환율 GET만 있습니다. User 라우트는 공개 목록과 관계없이 세션 확인 API를 거치지 않으며, 아래 User API의 공개 여부·CSRF 및 세션 처리는 User가 담당합니다. 업무 서비스의 관리자 권한은 세션 확인 API가 확인한 역할을 받아 해당 서비스가 검사합니다.
 
 | 메서드 | 경로 | 용도 |
 |---|---|---|
@@ -148,9 +151,30 @@ const loginResponse = await fetch(`${API_BASE}/api/v1/auth/login`, {
 
 세 값은 독립적입니다. 전체 상한을 넘으면 검증 대기를 취소하고 503으로 종료합니다. 검증 뒤의 업무 처리 시간은 이 상한에 포함하지 않습니다. 5초는 초기 기준값이며 운영 지연과 호출 실패율을 측정해 조정합니다. 값 변경은 재기동·재배포 때 적용됩니다.
 
-User의 검증 거절 401·403·409는 상태와 본문을 전달하고, 연결 실패·시간 초과·해석할 수 없는 검증 응답 등은 503입니다. 두 오류 경로 모두 `Cache-Control: no-store`를 적용하고, 일시 장애만으로 SESSION 쿠키를 삭제하지 않습니다. 지원하지 않는 실제 메서드는 405와 Gateway의 `Allow` 목록으로 거절합니다. 업무 API 자체의 메서드·권한 판단은 해당 서비스가 맡습니다.
+User의 검증 거절 401·403·409는 상태와 본문을 전달하고, 연결 실패·시간 초과·해석할 수 없는 검증 응답 등은 503입니다. 약속에 없는 상태(다른 4xx 등)나 회원 정보를 읽을 수 없는 성공 응답은 연동 오류라 상태와 함께 ERROR 로그를 남기고, User 자체 장애(5xx)·시간 초과·연결 실패는 장애 동안 요청마다 생기므로 로그를 남기지 않습니다. 두 오류 경로 모두 `Cache-Control: no-store`를 적용하고, 일시 장애만으로 SESSION 쿠키를 삭제하지 않습니다. 지원하지 않는 실제 메서드는 405와 Gateway의 `Allow` 목록으로 거절합니다. 업무 API 자체의 메서드·권한 판단은 해당 서비스가 맡습니다.
 
-다른 서비스로 넘기는 요청의 연결 대기는 2초(`spring.cloud.gateway.server.webflux.httpclient.connect-timeout`, 로컬·배포 같은 값)입니다. 기본값 30초면 Eureka 목록에 남은 종료된 인스턴스로 간 요청이 30초씩 묶입니다. 연결을 맺지 못하면(연결 거부·연결 시간 초과·경로 없음) 503 `COMMON_SERVICE_UNAVAILABLE`로 응답합니다. 이 경우는 요청이 서비스에 닿기 전의 실패입니다. 다만 각 서비스도 DB 시간 초과처럼 요청을 받은 뒤의 장애에 같은 코드를 쓰므로, 응답만으로는 다시 보내도 안전한지 알 수 없습니다. 돈이 움직이는 요청은 같은 `Idempotency-Key`로만 다시 보냅니다. 연결된 뒤의 응답 대기는 서비스마다 처리 시간이 달라 제한하지 않습니다.
+다른 서비스로 넘기는 요청의 연결 대기는 2초(`spring.cloud.gateway.server.webflux.httpclient.connect-timeout`, 로컬·배포 같은 값)입니다. 기본값 30초면 Eureka 목록에 남은 종료된 인스턴스로 간 요청이 30초씩 묶입니다. 연결 거부·연결 시간 초과·경로 없음·이름 조회 실패, Netty가 명시한 전송 전 연결 종료(`AbortedException.beforeSend()`)는 503 `COMMON_SERVICE_UNAVAILABLE`로 응답합니다. 이 경우는 요청이 서비스에 닿기 전의 실패입니다. 다만 각 서비스도 DB 시간 초과처럼 요청을 받은 뒤의 장애에 같은 코드를 쓰므로, 503만으로 재시도의 안전성을 판단하지 않습니다. 돈이 움직이는 요청은 같은 `Idempotency-Key`로만 다시 보냅니다. 업무 서비스의 연결된 뒤 응답 대기는 서비스마다 처리 시간이 달라 제한하지 않습니다.
+
+라우팅과 세션 확인 API 전용 연결 풀은 30초 넘게 사용하지 않은 연결을 다시 꺼낼 때 폐기합니다. 30초마다 백그라운드에서 정리한다는 뜻은 아닙니다. 세션 확인 전용 풀의 연결 상한은 500이며, 요청의 동시 실행 상한 100은 아래의 별도 제한으로 적용합니다.
+
+User 라우트는 응답 헤더를 받기까지 10초(라우트 `metadata.response-timeout: 10000`, 밀리초, 로컬·배포 같은 값)로 제한하고, 넘으면 504 `COMMON_GATEWAY_TIMEOUT`입니다. 가장 느린 정상 처리(부하 중 비밀번호 변경 최대 약 0.7초)보다 충분히 길고, 대부분의 경우 User 안의 대기 상한(DB 연결 획득 2초, 읽기 실행 기한 2초, 잠금 한 번 2초, 비밀번호 변경·관리자 실행 기한 5초, Redis 명령마다 2초)이 먼저 끝나 User가 직접 응답하도록 정한 값입니다. DB가 응답하지 않을 때도 한 번의 DB 대기는 약 7~8초(소켓 읽기 7초 + 취소 정리)에 끝납니다([User 가이드](user-service.md#db-대기-제한)). 여러 대기가 한 요청에서 겹치면 이 상한에 먼저 닿을 수 있습니다. Gateway는 이 값이 숫자가 아니거나 비어 있으면 조용히 무시하므로 환경 변수로 바꾸지 않고 설정 파일에 숫자로 고정합니다. 504는 처리 실패 확정이 아닙니다. Gateway가 기다리기를 그만둬도 User의 처리가 계속돼 비밀번호 변경 같은 DB 변경이 완료될 수 있으므로, 클라이언트는 같은 요청을 자동으로 다시 보내지 않고 인증 상태와 처리 결과를 확인합니다. 응답을 이미 보내기 시작한 뒤 끊긴 경우는 새 오류 JSON으로 바꿀 수 없어 불완전한 응답으로 끝납니다.
+
+서비스가 응답을 끝내기 전에 연결을 닫으면(정상 종료·강제 종료), 브라우저에 응답을 보내기 시작하기 전이라면 502 `COMMON_BAD_GATEWAY`입니다. 요청이 이미 처리됐을 수 있어, 서비스에 닿기 전에 실패해 다시 보내도 되는 연결 실패 503과 구분합니다. Netty의 `BEFORE response`도 요청 전송 전이라는 뜻은 아니므로 502를 유지합니다. Gateway는 자동으로 다시 보내지 않습니다. 502·503·504로 분류한 예외는 ERROR 로그 대신 HTTP 지표와 원인별 `gateway_upstream_failures_total{status,cause}`로 봅니다. 이 원인별 지표는 `GatewayErrorHandler`를 거친 예외만 세며, 다른 서비스가 직접 반환한 모든 503을 세는 지표는 아닙니다. 분류하지 못한 예외와 Gateway 자체 5xx는 ERROR로 남깁니다.
+
+본문 전 단절 때는 이미 복사된 서비스 응답 헤더를 이름별로 제거해 쿠키·리다이렉트 헤더가 오류 JSON에 섞이지 않게 합니다. 같은 이름의 Gateway 헤더(예: `Vary`)까지 제거될 수 있다는 한계가 있습니다. 오류 응답은 `no-store`이며, 헤더 출처별 보존은 현재 구현 범위에 포함하지 않습니다.
+
+세션 확인 API 호출에는 동시 호출 상한과 서킷을 둡니다(`travelpay.gateway.session-verification.protection`, 로컬·배포 같은 값, 값이 없거나 범위를 벗어나면 시작하지 않음). 순서는 바깥부터 동시 호출 상한 → 서킷 → 전체 상한(5초) → 세션 확인 API입니다.
+
+| 항목 | 값 | 동작 |
+|---|---|---|
+| 동시 호출 상한 | 100 | 넘으면 기다리지 않고 바로 503. 허가를 기다리면 Gateway의 요청 처리 스레드가 멈추므로 대기는 0으로 고정. 부하 시험의 최대 동시 요청(동시 사용자 60명, 사용자마다 요청 1건)보다 여유 있게 둔 값 |
+| 서킷 열림 조건 | 최근 5초 호출 20건 이상, 장애 50% 이상 | 장애는 503으로 바뀐 실패(5xx·연결 실패·시간 초과·해석할 수 없는 응답)만 셈. 401·403·409 거절은 성공으로 셈 |
+| 열림 | 2초 | 세션 확인 API를 부르지 않고 바로 503. 이전 결과로 통과시키지 않고 쿠키도 지우지 않음 |
+| 반열림 | 시험 호출 5건 | 그중 장애가 50% 미만이면 닫힘. 요청이 없어도 열림 시간이 지나면 반열림으로 바뀜 |
+
+최근 5초에 20건 이상, 즉 평균 초당 4건 이상의 호출이 이어져야 열 수 있어 요청이 적은 시간에는 장애 몇 건으로 열리지 않습니다. 동시 호출 상한의 거절은 User 장애가 아니라 서킷 통계에 들지 않습니다. 브라우저가 연결을 끊어 확인이 취소되면 허가를 돌려주고 성공·실패로 세지 않습니다. User 라우트는 세션 확인 API를 거치지 않으므로 서킷이 열려도 영향을 받지 않습니다. 상태는 `resilience4j_circuitbreaker_state{name="session-verification"}`·`resilience4j_circuitbreaker_not_permitted_calls_total`, 동시 호출은 `resilience4j_bulkhead_available_concurrent_calls`와 거절 수 `session_verification_bulkhead_rejected_total`로 보고, 서킷 상태가 바뀌면 WARN 로그를 남깁니다.
+
+2026-11-14의 `*-2r` 장애 결과와 같은 시각의 Gateway 상태 전환 로그를 대조했습니다. API마다 초당 40건·20초 장애 조건에서 User 일시 정지·회원 테이블 잠금·DB 일시 정지는 장애 시작 후 3.19~3.70초에 열리고, 해제 후 1.74~2.28초에 닫혔습니다. 이 값은 해당 시험의 관측값이며 2초 열림 설정이 장애 탐지·기동 시간을 보장하는 것은 아닙니다. User 재시작 시험은 기동·주소 갱신까지 포함해 해제 후 닫힘에 약 17초가 걸렸습니다.
 
 Gateway 수신 기본 한도는 8KiB이고, User는 로컬·배포 모두 16KiB로 두어 Gateway가 붙이는 내부 헤더의 여유를 확보했습니다. 테스트용 큰 쿠키는 검증 입력이며 실제 앱이 추가 쿠키를 발급하는 구조가 아닙니다.
 
@@ -170,6 +194,8 @@ Gateway HTTP 시험은 실제 Gateway 서버와 User·업무 서비스 대역 �
 Gateway는 외부 W3C·B3 부모 trace를 추출하지 않고 새 traceId를 시작합니다. 외부 baggage·추적 헤더도 제거하며, 내부 User 검증과 업무 호출에는 새 traceId를 W3C로 이어 보내고 각 호출의 spanId를 구분합니다. 헤더만 지우면 관측 코드가 이미 외부 부모를 읽었을 수 있어, 추출 설정과 전달 헤더를 함께 제한했습니다.
 
 이 정책에서는 프런트가 보낸 traceId와 내부 traceId가 연결되지 않습니다. traceId는 인증·멱등성 키로 사용하지 않습니다. 다른 서비스의 내부 W3C 추출은 유지하므로 내부 호출의 연결은 계속됩니다.
+
+`spring.reactor.context-propagation: auto`는 유지합니다. 이를 `limited`로 바꾸면 서비스 간 W3C 연결이 유지되더라도 요청 오류 로그의 traceId가 빠질 수 있습니다. CPU 비용만 보고 변경하지 않으며, `GatewayTraceLogHttpTest`에서 세션 검증 오류·빈 본문·잘못된 JSON·동시 요청·요청이 유발한 서킷 상태 변경의 로그가 해당 요청과 연결되는지 확인합니다.
 
 ## Cloudflare → ALB → Gateway 배포 시 연결할 것
 

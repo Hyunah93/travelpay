@@ -13,7 +13,9 @@ import org.springframework.boot.web.server.autoconfigure.ServerProperties;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.env.MockEnvironment;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** 로컬·배포 설정 파일의 보안 관련 기본값과 실행 환경의 조정 가능 여부를 확인합니다. */
 class UserConfigurationFilesTest {
@@ -71,6 +73,51 @@ class UserConfigurationFilesTest {
 
         assertEquals(2000, hikari.getConnectionTimeout());
         assertEquals(1000, hikari.getValidationTimeout());
+    }
+
+    // DB 서버가 멈추면 SQL 취소가 처리되지 않으므로 앱 연결 풀의 소켓 읽기에 상한을 둠. 정상 DB 작업 제한(5초)보다 길어야 함
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void theAppPoolStopsWaitingForAFrozenDatabaseAfterTheSocketReadLimit(String filename) throws IOException {
+        var hikari = Binder.get(environment(filename)).bindOrCreate("spring.datasource.hikari", HikariConfig.class);
+
+        assertEquals("7", hikari.getDataSourceProperties().getProperty("socketTimeout"));
+        assertEquals("1", hikari.getDataSourceProperties().getProperty("cancelSignalTimeout"));
+    }
+
+    // 읽기 트랜잭션의 마지막 질의가 제한 없이 실행되는 경우에도 잠금 대기는 DB가 읽기 실행 상한과 같은 2초에 끝냄
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void theAppPoolGivesUpLockWaitsAtTheReadLimit(String filename) throws IOException {
+        var hikari = Binder.get(environment(filename)).bindOrCreate("spring.datasource.hikari", HikariConfig.class);
+
+        assertEquals("-c lock_timeout=2s", hikari.getDataSourceProperties().getProperty("options"));
+    }
+
+    // 시작 검사가 읽는 키가 설정 파일의 소켓 읽기 상한 키와 달라지면 검사가 조용히 건너뛰므로 실제 파일로 확인
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void theConfiguredDatabaseLimitsPassTheStartupCheckAgainstTheSocketReadLimit(String filename) throws IOException {
+        var environment = environment(filename).withProperty("USER_DB_URL",
+                "jdbc:postgresql://localhost/test?currentSchema=user_service");
+        var binder = Binder.get(environment);
+
+        assertEquals(7, environment.getProperty(DatabaseTimeoutCheck.SOCKET_TIMEOUT, Integer.class));
+        assertDoesNotThrow(() -> new DatabaseTimeoutCheck(environment,
+                binder.bind("travelpay.user.password-change", PasswordChangeProperties.class).get(),
+                binder.bind("travelpay.user.admin", AdminProperties.class).get()));
+    }
+
+    // 계정을 지정해야 Flyway가 앱 연결 풀이 아닌 별도 연결을 써서 마이그레이션이 소켓 읽기 상한에 끊기지 않음
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void flywayUsesTheSameAccountOnItsOwnConnection(String filename) throws IOException {
+        var environment = environment(filename)
+                .withProperty("USER_DB_USERNAME", "user_app").withProperty("USER_DB_PASSWORD", "secret-for-test");
+
+        assertEquals("user_app", environment.getProperty("spring.flyway.user"));
+        assertEquals("secret-for-test", environment.getProperty("spring.flyway.password"));
+        assertNull(environment.getProperty("spring.flyway.url"));
     }
 
     private static ServerProperties serverProperties(String filename) throws IOException {

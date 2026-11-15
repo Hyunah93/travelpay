@@ -11,6 +11,10 @@ spring:
             # 다른 서비스로 넘기는 요청의 연결 대기입니다. 기본 30초면 Eureka에 남은 죽은 인스턴스로 간 요청이 30초씩 붙잡히므로
             # 세션 확인 연결(2초)과 같게 둡니다. 응답 대기는 서비스별 처리 시간이 달라 제한하지 않습니다.
             connect-timeout: 2000
+            pool:
+              # 다른 서비스(Tomcat 기본)는 60초 쉰 연결을 닫음. 30초 넘게 쉰 연결은 다시 꺼낼 때 폐기해 닫히는 연결의 재사용을 줄임
+              # 세션 확인 API 호출 연결도 같은 이유로 이 값을 씀(SessionVerificationConfiguration)
+              max-idle-time: 30s
           metrics:
             enabled: true
           observability:
@@ -31,6 +35,10 @@ spring:
               uri: lb://user-service
               predicates:
                 - Path=/api/v1/auth/**,/api/v1/terms/**,/api/v1/users/**,/api/v1/admin/users/**,/api/v1/admin/terms/**
+              metadata:
+                # 세션 확인 API를 거치지 않는 User 라우트의 응답 헤더 대기 상한(밀리초, 넘으면 504). 숫자가 아니거나 비면 Gateway가 무시하므로 숫자로 고정
+                # 정상 최대(부하 중 비밀번호 변경 약 0.7초)보다 길고, 대부분 User 안의 상한(DB 연결 획득·읽기·잠금 2초, 쓰기 5초, Redis 명령 2초)이 먼저 끝나게 10초
+                response-timeout: 10000
             - id: wallet-service
               uri: lb://wallet-service
               predicates:
@@ -62,6 +70,18 @@ travelpay:
       response-timeout: ${GATEWAY_SESSION_VERIFICATION_RESPONSE_TIMEOUT:3s}
       # 연결 전 대기부터 응답 본문 해석까지 포함한 전체 상한입니다. 초과하면 503을 반환합니다.
       total-timeout: ${GATEWAY_SESSION_VERIFICATION_TOTAL_TIMEOUT:5s}
+      protection:
+        # 동시에 진행하는 세션 확인 호출 상한. 넘으면 기다리지 않고 바로 503(부하 시험의 최대 동시 요청 60건보다 여유 있게)
+        max-concurrent-calls: 100
+        # 최근 5초 호출이 20건 이상이고 그중 장애(503)가 50% 이상이면 서킷을 열어 2초 동안 세션 확인 없이 바로 503
+        # 요청이 적을 때 장애 몇 건으로 열리지 않도록 최소 호출 수를 둠. 401·403·409 거절은 성공으로 셈
+        # 장애 시험에서 10초 창은 직전 정상 호출에 묻혀 약 9초 뒤에 열렸고, 5초 열림은 회복을 5~6초 늦춰 둘 다 줄임
+        failure-window: 5s
+        minimum-calls: 20
+        failure-rate-threshold: 50
+        open-duration: 2s
+        # 열린 뒤 회복을 판단하는 시험 호출 수. 이 중 장애가 50% 미만이면 닫힘
+        half-open-calls: 5
     client-ip:
       # 이 대역에서 온 연결만 CF-Connecting-IP(Cloudflare가 넣는 실제 IP)를 믿음. 출처: https://www.cloudflare.com/ips/ (2026-11-02 확인)
       cloudflare-addresses:

@@ -41,8 +41,7 @@ public class LoginService {
         this.credentialsRepository = credentialsRepository;
         this.passwordEncoder = passwordEncoder;
         this.attemptLimiter = attemptLimiter;
-        this.readTransactions = new TransactionTemplate(transactionManager);
-        this.readTransactions.setReadOnly(true);
+        this.readTransactions = ReadTransactions.create(transactionManager);
         // 없는 이메일도 해시 비교를 수행해 자격 증명 실패 경로의 시간 차이를 줄입니다.
         this.missingMemberPasswordHash = passwordEncoder.encode(UUID.randomUUID().toString());
     }

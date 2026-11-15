@@ -437,10 +437,12 @@ class LoginControllerIntegrationTest {
         assertFalse(Boolean.TRUE.equals(sessions.getSessionRedisOperations().hasKey(key)));
     }
 
+    // Gateway가 세션 확인 API 없이 넘기는 요청도 세션 확인 API처럼, 로그인 세션이 없으면 CSRF보다 401이 먼저입니다. 공개 로그인만 예외
     @Test
-    void logoutWithoutASessionIs401WhileOtherChangesWithoutASessionStillNeedCsrf() throws Exception {
+    void changesWithoutALoginSessionAre401WhilePublicLoginStillNeedsCsrf() throws Exception {
         assertError(mvc.perform(post("/api/v1/auth/logout")).andReturn(), 401, "COMMON_UNAUTHORIZED");
-        assertError(mvc.perform(post("/test/login-change")).andReturn(), 403, "COMMON_CSRF_INVALID");
+        assertError(mvc.perform(post("/test/login-change")).andReturn(), 401, "COMMON_UNAUTHORIZED");
+        assertError(mvc.perform(post("/api/v1/auth/login")).andReturn(), 403, "COMMON_CSRF_INVALID");
     }
 
     @Test

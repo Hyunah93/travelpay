@@ -955,7 +955,7 @@
     {
       "id": 15,
       "title": "User 세션 호출 시간",
-      "description": "검증은 User 서비스가 Redis 세션과 회원 DB를 확인해 수행합니다. 이 패널은 Gateway의 WebClient가 기록한 세션 확인 API(I01)의 평균 HTTP 호출 시간입니다. 네트워크·User 응답 대기를 포함하며 User 내부 검증 시간이나 Redis 명령 시간만을 측정한 값은 아닙니다. Service에 gateway를 포함해야 표시됩니다.",
+      "description": "검증은 User 서비스가 Redis 세션과 회원 DB를 확인해 수행합니다. 이 패널은 Gateway의 WebClient가 기록한 세션 확인 API의 평균 HTTP 호출 시간입니다. 네트워크·User 응답 대기를 포함하며 User 내부 검증 시간이나 Redis 명령 시간만을 측정한 값은 아닙니다. Service에 gateway를 포함해야 표시됩니다.",
       "type": "timeseries",
       "gridPos": {
         "x": 0,
@@ -971,7 +971,7 @@
         {
           "refId": "A",
           "expr": "sum by (environment, service) (rate(http_client_requests_seconds_sum{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\",client_name=\"user-service\"}[$__rate_interval])) / (sum by (environment, service) (rate(http_client_requests_seconds_count{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\",client_name=\"user-service\"}[$__rate_interval])) > 0)",
-          "legendFormat": "{{service}} → User I01"
+          "legendFormat": "{{service}} → User 세션 확인 API"
         }
       ],
       "fieldConfig": {
