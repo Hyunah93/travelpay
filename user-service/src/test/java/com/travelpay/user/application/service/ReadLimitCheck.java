@@ -41,8 +41,9 @@ final class ReadLimitCheck {
 
                 assertEquals(CommonErrorCode.SERVICE_UNAVAILABLE, failure.getErrorCode());
                 // Hibernate가 남은 시간을 초 단위로 바꿔 걸어 키로 찾는 조회는 1초, 질의는 2초에 끊길 수 있음
+                // 상한은 구현의 TIMEOUT_SECONDS와 독립적인 I01 읽기 응답 한도(3초)로 검증
                 assertTrue(elapsed.compareTo(Duration.ofSeconds(1)) >= 0
-                        && elapsed.compareTo(Duration.ofSeconds(ReadTransactions.TIMEOUT_SECONDS + 1)) < 0,
+                        && elapsed.compareTo(Duration.ofSeconds(3)) < 0,
                         elapsed.toString());
                 // 잠금을 잡은 채로 확인: 잠금 주인 말고는 실행 중이거나 트랜잭션을 연 세션이 없어야 SQL·트랜잭션이 끝난 것
                 assertEquals(0L, otherBusySessions(dataSource, lockHolder));
