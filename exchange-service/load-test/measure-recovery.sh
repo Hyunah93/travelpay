@@ -3,19 +3,19 @@
 #
 # 한 회차:
 #   1. 가짜 원장을 응답 없음(지연 6초, 앱은 5초에 포기)으로 두고 환전 신청을 정확히 ORDERS건 보냄 → 서킷이 열려 모두 PROCESSING
-#   2. 장애를 OUTAGE_AFTER_FILL초(기본 120초) 더 유지. 실제 장애는 신청이 끝난 순간 바로 풀리지 않고, 막 들어온 주문은
-#      재시도 간격(최소 1분)이 지나야 복구 대상이 되므로, "방금 들어와서 아직 대상이 아님"이 결과에 섞이지 않게 한다
+#   2. 장애를 OUTAGE_AFTER_FILL초(기본 60초) 더 유지. 막 들어온 주문은 재시도 간격(최소 1분)이 지나야 복구 대상이 되므로,
+#      "방금 들어와서 아직 대상이 아님"이 결과에 섞이지 않게 한다. 꼬리를 보는 긴 장애는 300초로 따로 잰다(README)
 #   3. 가짜 원장의 지연을 RECOVERED_DELAY_MS(기본 3ms)로 바꿈 = 원장 회복 (3ms는 원장 속도 측정의 동시 1건 p50 2.87ms)
 #   4. PROCESSING이 0이 될 때까지 1초마다 주문 상태별 수·서킷 상태·원장 호출 수·복구 주기 수를 기록
 #
-# 사용법: [OUTAGE_AFTER_FILL=120] [RECOVERED_DELAY_MS=3] APP_JAR=<jar> ./measure-recovery.sh <LABEL> <ORDERS>
+# 사용법: [OUTAGE_AFTER_FILL=60] [RECOVERED_DELAY_MS=3] APP_JAR=<jar> ./measure-recovery.sh <LABEL> <ORDERS>
 #   예: APP_JAR=../../../travelpay-recovery-v0/$J ./measure-recovery.sh recovery-v0-1000-r1 1000
 #   결과: results/<LABEL>-fill.json(신청 결과) + -server.tsv(1초 기록) + -server.json(요약·측정 조건)
 set -euo pipefail
 
 LABEL=${1:?LABEL을 주세요 (예: recovery-v0-1000-r1)}
 ORDERS=${2:?쌓을 주문 수를 주세요 (예: 1000)}
-OUTAGE_AFTER_FILL=${OUTAGE_AFTER_FILL:-120}
+OUTAGE_AFTER_FILL=${OUTAGE_AFTER_FILL:-60}
 RECOVERED_DELAY_MS=${RECOVERED_DELAY_MS:-3}
 OUTAGE_DELAY_MS=6000
 HOURS=${HOURS:-24}
@@ -156,7 +156,9 @@ statuses=$(psql_q -F ' ' -c "SELECT status, count(*) FROM exchange_service.excha
 # 회복 뒤 구간만: 50·90·99% 처리 시각과 꼬리 주문 수(99%에 닿은 순간 남은 PROCESSING), 원장 호출 수(초당 최대),
 # 서킷이 닫힌 시각, 복구 주기 수와 평균 주기 시간(빈 주기 포함), 첫 확정 시각(회복을 알아채기까지 걸린 시간).
 # 장애 구간(신청이 끝난 뒤 ~ 회복 전)에 원장에 실제로 보낸 호출 수(서킷 반열림 시험·복구가 보낸 것)도 센다
-# 앱 지표를 못 읽은 초(서킷 상태가 빈 줄)는 건너뛴다. 누적값이 0으로 읽혀 초당 호출 수가 부풀지 않게
+# 앱 지표를 못 읽은 초(서킷 상태가 빈 줄)는 건너뛴다. 누적값이 0으로 읽혀 초당 호출 수가 부풀지 않게.
+# 그래서 표본 사이가 1초보다 길 수 있어, 초당 호출 수는 늘어난 호출을 실제 지난 초로 나눈다.
+# 회복 뒤 호출 수·복구 주기 수는 회복 직전 마지막 표본을 기준으로 센다(회복과 첫 표본 사이의 호출이 빠지지 않게)
 awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
     FNR == NR {
         if ($1 >= from) {
@@ -172,9 +174,14 @@ awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
         if (outFirst == "") outFirst = $4
         outLast = $4
     }
+    $1 < from && $2 != "" { pre = $1; preCalls = $4; preRc = $6; preRs = $7 }
     $1 >= from && $2 != "" {
-        if (prev != "" && $4 - prevCalls > maxCalls) maxCalls = $4 - prevCalls
-        if (first == "") { first = $1; c0 = $4; rc0 = $6; rs0 = $7 }
+        if (first == "") {
+            first = $1
+            if (pre != "") { c0 = preCalls; rc0 = preRc; rs0 = preRs; prev = pre; prevCalls = preCalls }
+            else { c0 = $4; rc0 = $6; rs0 = $7 }
+        }
+        if (prev != "" && $1 > prev && ($4 - prevCalls) / ($1 - prev) > maxCalls) maxCalls = ($4 - prevCalls) / ($1 - prev)
         if (closedAt == "" && $2 != "" && $2 + 0 == 0 && $3 + 0 == 0) closedAt = $1 - from
         prev = $1; prevCalls = $4; lastCalls = $4; rc1 = $6; rs1 = $7
     }
@@ -182,7 +189,7 @@ awk -F'\t' -v from="$recovered_at" -v n="$ORDERS" -v fe="$fill_ended" '
         cycles = rc1 - rc0
         printf "  \"secondsTo50Percent\": %s,\n  \"secondsTo90Percent\": %s,\n  \"secondsTo99Percent\": %s,\n  \"tailOrdersAt99Percent\": %s,\n", \
             (t50 == "" ? "null" : t50), (t90 == "" ? "null" : t90), (t99 == "" ? "null" : t99), (tail == "" ? "null" : tail)
-        printf "  \"ledgerCallsAfterRecovery\": %d,\n  \"ledgerCallsPerSecMax\": %d,\n", lastCalls - c0, maxCalls
+        printf "  \"ledgerCallsAfterRecovery\": %d,\n  \"ledgerCallsPerSecMax\": %.1f,\n", lastCalls - c0, maxCalls
         printf "  \"circuitClosedSecondsAfterRecovery\": %s,\n", (closedAt == "" ? "null" : closedAt)
         printf "  \"secondsToFirstConfirm\": %s,\n", (tFirst == "" ? "null" : tFirst)
         printf "  \"ledgerCallsDuringOutage\": %s,\n", (outFirst == "" ? "null" : outLast - outFirst)
@@ -219,5 +226,13 @@ rm -f "$summary.tmp"
 if [ "$drained_at" = null ]; then
     echo "      ${MAX_WAIT}초 안에 PROCESSING이 0이 되지 않았습니다. 결과의 finalStatus를 보세요." >&2
 fi
-echo "      결과: $(grep -o '"drainSeconds": [0-9a-z]*\|"secondsToFirstConfirm": [0-9a-z]*\|"ledgerCallsDuringOutage": [0-9a-z]*\|"secondsTo50Percent": [0-9a-z]*\|"secondsTo99Percent": [0-9a-z]*\|"tailOrdersAt99Percent": [0-9a-z]*\|"confirmedPerMinute": [0-9.a-z]*\|"recoveryCycles": [0-9]*\|"ledgerCallsPerSecMax": [0-9]*\|"circuitClosedSecondsAfterRecovery": [0-9a-z]*' "$summary" | tr '\n' ' ')"
+# 다 처리는 PROCESSING이 0건(서비스와 같이 COMPLETED·FAILED·MANUAL_REVIEW 모두 확정)으로 잰다. 다만 이 측정은 지갑을 충분히
+# 충전하고 회복한 가짜 원장이 늘 성공하므로 전부 COMPLETED여야 정상이다. 다른 상태가 있으면 원장 호출 없이 끝난 주문이 처리
+# 속도에 섞였을 수 있어 무효로 둔다
+not_completed=$(psql_q -c "SELECT count(*) FROM exchange_service.exchange_orders WHERE status NOT IN ('COMPLETED', 'PROCESSING')")
+if [ "$not_completed" != 0 ]; then
+    echo "무효 측정: COMPLETED가 아닌 확정 주문이 ${not_completed}건 있습니다. 최종 상태: {${statuses}}" >&2
+    exit 1
+fi
+echo "      결과: $(grep -o '"drainSeconds": [0-9a-z]*\|"secondsToFirstConfirm": [0-9a-z]*\|"ledgerCallsDuringOutage": [0-9a-z]*\|"secondsTo50Percent": [0-9a-z]*\|"secondsTo99Percent": [0-9a-z]*\|"tailOrdersAt99Percent": [0-9a-z]*\|"confirmedPerMinute": [0-9.a-z]*\|"recoveryCycles": [0-9]*\|"ledgerCallsPerSecMax": [0-9.]*\|"circuitClosedSecondsAfterRecovery": [0-9a-z]*' "$summary" | tr '\n' ' ')"
 echo "      최종 상태: {${statuses}}"

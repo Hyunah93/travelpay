@@ -61,7 +61,9 @@ export default function () {
     // 기록 없이 바로 200을 돌려줘 응답 시간이 비정상적으로 빨라진다(k6 1.3의 constant-vus에서 iterationInTest로 만들었을 때 실제로 겪음)
     const n = exec.vu.idInTest * 10_000_000 + exec.vu.iterationInScenario + 1;
     const walletId = uuid('00000000', (n % WALLETS) + 1);
-    const measuring = exec.instance.currentTestRunDuration >= WARMUP_MS;
+    // 예열은 시나리오 시작부터 센다. 테스트 시작부터 세면 setup(지갑 열고 충전)에 쓴 시간만큼 예열이 짧아지고,
+    // 측정 구간이 MEASURE_SECONDS보다 길어져 초당 처리량이 그만큼 높게 나온다(PR #341 리뷰)
+    const measuring = Date.now() - exec.scenario.startTime >= WARMUP_MS;
     // 원화 100,000원을 엔화로: 보내는 금액 + 수수료 1,000원 + 받는 엔화 (환전 서비스가 보내는 6항목과 같은 모양)
     const body = JSON.stringify({
         referenceType: 'EXCHANGE',

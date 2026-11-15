@@ -113,18 +113,22 @@ run_one() {
         exit 1
     fi
 
-    # 측정 구간: k6가 끝난 시각에서 거꾸로(예열 뒤 ~ 끝). 표본은 그 구간만 요약한다
-    local run_ms measure_from measure_to
-    run_ms=$(grep -o '"testRunDurationMs": [0-9]*' "$k6_result" | grep -o '[0-9]*$')
+    # 측정 구간: k6가 끝난 시각에서 거꾸로 MEASURE_SECONDS(예열 뒤 ~ 끝). 표본은 그 구간만 요약한다.
+    # 테스트 전체 시간에서 예열을 빼면 setup 시간까지 측정 구간에 들어가 k6 쪽 측정 구간과 어긋난다
+    local measure_from measure_to
     measure_to=$k6_ended
-    measure_from=$((k6_ended - (run_ms + 999) / 1000 + WARMUP_SECONDS))
+    measure_from=$((k6_ended - MEASURE_SECONDS))
+    # 값을 못 읽은 표본(조회 시간 초과 등으로 칸이 빈 줄)은 0으로 세지 않고 뺀다. 남은 표본이 없으면 null(측정 불가)
     awk -F'\t' -v from="$measure_from" -v to="$measure_to" '
-        FNR == NR { if ($1 >= from && $1 < to) { n++; lw += $2; if ($2 > lwm) lwm = $2; ac += $3 } next }
-        $1 >= from && $1 < to { m++; ha += $2; if ($3 > hpm) hpm = $3; hp += $3; cpu += $4 }
+        FNR == NR { if ($1 >= from && $1 < to && $2 != "" && $3 != "") { n++; lw += $2; if ($2 > lwm) lwm = $2; ac += $3 } next }
+        $1 >= from && $1 < to && $2 != "" && $3 != "" && $4 != "" { m++; ha += $2; if ($3 > hpm) hpm = $3; hp += $3; cpu += $4 }
         END {
-            printf "  \"db\": {\"samples\": %d, \"lockWaitAvg\": %.2f, \"lockWaitMax\": %d, \"activeSessionsAvg\": %.2f},\n", n, (n ? lw / n : 0), lwm, (n ? ac / n : 0)
-            printf "  \"hikari\": {\"samples\": %d, \"activeAvg\": %.2f, \"pendingAvg\": %.2f, \"pendingMax\": %d},\n", m, (m ? ha / m : 0), (m ? hp / m : 0), hpm
-            printf "  \"appCpuPercent\": %.1f,\n", (m ? cpu / m * 100 : 0)
+            if (n) printf "  \"db\": {\"samples\": %d, \"lockWaitAvg\": %.2f, \"lockWaitMax\": %d, \"activeSessionsAvg\": %.2f},\n", n, lw / n, lwm, ac / n
+            else printf "  \"db\": null,\n"
+            if (m) {
+                printf "  \"hikari\": {\"samples\": %d, \"activeAvg\": %.2f, \"pendingAvg\": %.2f, \"pendingMax\": %d},\n", m, ha / m, hp / m, hpm
+                printf "  \"appCpuPercent\": %.1f,\n", cpu / m * 100
+            } else printf "  \"hikari\": null,\n  \"appCpuPercent\": null,\n"
         }' "$samples.db" "$samples" >"$summary.tmp"
     {
         echo "{"
