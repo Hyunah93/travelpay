@@ -2,7 +2,7 @@ package com.travelpay.payment.transfer.application;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Optional;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -40,9 +40,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * 송금 요청·취소와 조회를 처리합니다.
- * 원장 거래 등록 구현({@link TransferLedgerClient})이 없으면 잔액을 변경하지 않고 REQUESTED 상태로 접수만 기록합니다.
- * 구현이 있으면 PROCESSING으로 저장한 뒤 원장에 거래 등록(송금인 차감·수취인 증가)을 요청하고 결과에 따라 COMPLETED·FAILED로 바꾸며,
+ * 송금 요청과 조회를 처리합니다.
+ * PROCESSING으로 저장한 뒤 원장에 거래 등록(송금인 차감·수취인 증가)을 요청하고 결과에 따라 COMPLETED·FAILED로 바꾸며,
  * 결과를 모르면 PROCESSING으로 남겨 복구 스케줄러({@link TransferRecoveryScheduler})가 대기 시간을 늘려 가며 같은 reference(송금 ID)로
  * 다시 요청합니다. 원장이 요청을 받아들이지 않거나(409·400 등) 결과 모름이 한도에 이르면 자동 처리를 멈추고 MANUAL_REVIEW로 둡니다.
  * 같은 Idempotency-Key 재요청은 원장을 다시 호출하지 않고 현재 상태로 응답합니다.
@@ -71,13 +70,13 @@ public class TransferService {
     private final TransferRepository transferRepository;
     private final TransferWalletReader walletReader;
     private final TransferUserReader userReader;
-    private final Optional<TransferLedgerClient> ledgerClient;
+    private final TransferLedgerClient ledgerClient;
 
     public TransferService(
             TransferRepository transferRepository,
             TransferWalletReader walletReader,
             TransferUserReader userReader,
-            Optional<TransferLedgerClient> ledgerClient
+            TransferLedgerClient ledgerClient
     ) {
         this.transferRepository = transferRepository;
         this.walletReader = walletReader;
@@ -96,12 +95,10 @@ public class TransferService {
             throw new BusinessException(TransferErrorCode.INVALID_IDEMPOTENCY_KEY);
         }
         String memo = normalizeMemo(request.memo());
-        String requestHash = TransferRequestHasher.hash(
-                request.receiverId(), request.amount(), request.currency(), memo);
 
         var existing = transferRepository.findBySenderIdAndIdempotencyKey(senderId, idempotencyKey);
         if (existing.isPresent()) {
-            return replay(existing.get(), requestHash, senderId);
+            return replay(existing.get(), request, memo, senderId);
         }
 
         if (senderId.equals(request.receiverId())) {
@@ -121,11 +118,8 @@ public class TransferService {
                 .orElseThrow(() -> new BusinessException(TransferErrorCode.RECEIVER_UNAVAILABLE));
 
         // 원장을 호출하기 전에 PROCESSING으로 커밋해, 결과를 모르는 송금도 기록에 남깁니다.
-        Transfer transfer = ledgerClient.isPresent()
-                ? Transfer.process(senderId, request.receiverId(), sourceWalletId, targetWalletId,
-                        request.amount(), request.currency(), memo, idempotencyKey, requestHash)
-                : Transfer.request(senderId, request.receiverId(), sourceWalletId, targetWalletId,
-                        request.amount(), request.currency(), memo, idempotencyKey, requestHash);
+        Transfer transfer = Transfer.process(senderId, request.receiverId(), sourceWalletId, targetWalletId,
+                request.amount(), request.currency(), memo, idempotencyKey);
         Transfer saved;
         try {
             saved = transferRepository.saveAndFlush(transfer);
@@ -133,37 +127,22 @@ public class TransferService {
             // 같은 키의 동시 요청이 먼저 저장되면 UNIQUE(sender_id, idempotency_key)에 걸립니다.
             Transfer concurrent = transferRepository.findBySenderIdAndIdempotencyKey(senderId, idempotencyKey)
                     .orElseThrow(() -> exception);
-            return replay(concurrent, requestHash, senderId);
+            return replay(concurrent, request, memo, senderId);
         }
         Transfer current = saved.getStatus() == TransferStatus.PROCESSING ? attempt(saved).transfer() : saved;
         return respond(current, senderId);
     }
 
-    /** 송금 당사자가 아니면 송금의 존재를 알리지 않도록 없는 송금과 같은 404를 반환합니다. */
+    /**
+     * 송금인은 모든 상태를, 수취인은 완료(COMPLETED) 송금만 조회합니다({@link Transfer#isVisibleTo}).
+     * 볼 수 없는 송금은 존재를 알리지 않도록 없는 송금과 같은 404를 반환합니다.
+     */
     @Transactional(readOnly = true)
     public TransferResponse get(UUID userId, UUID transferId) {
         return transferRepository.findById(transferId)
-                .filter(transfer -> transfer.isParticipant(userId))
+                .filter(transfer -> transfer.isVisibleTo(userId))
                 .map(transfer -> TransferResponse.of(transfer, userId))
                 .orElseThrow(() -> new BusinessException(TransferErrorCode.NOT_FOUND));
-    }
-
-    /**
-     * 접수(REQUESTED) 상태의 송금을 취소합니다. REQUESTED는 원장 처리 없이 접수만 된 송금이라 자금 이동이 없어 복구할 금액이 없습니다.
-     * 송금인만 취소할 수 있고 수취인·제3자에게는 없는 송금과 같은 404를 반환하며, 이미 취소된 송금은 현재 상태를 그대로 반환합니다.
-     * 동시 요청은 조건부 UPDATE로 한 번만 상태가 바뀝니다.
-     */
-    @Transactional
-    public TransferResponse cancel(UUID senderId, UUID transferId) {
-        transferRepository.cancelRequested(transferId, senderId, Instant.now().truncatedTo(ChronoUnit.MICROS));
-        Transfer transfer = transferRepository.findById(transferId)
-                .filter(found -> found.getSenderId().equals(senderId))
-                .orElseThrow(() -> new BusinessException(TransferErrorCode.NOT_FOUND));
-        // 처리 중·완료·실패 송금은 UPDATE 대상이 아니므로 여기서 거절됩니다.
-        if (transfer.getStatus() != TransferStatus.CANCELLED) {
-            throw new BusinessException(CommonErrorCode.CONFLICT);
-        }
-        return TransferResponse.of(transfer, senderId);
     }
 
     /**
@@ -186,7 +165,8 @@ public class TransferService {
     }
 
     /**
-     * 생성 시각 내림차순으로 본인 관련 송금을 조회합니다. direction이 null이면 보낸·받은 내역을 모두 포함합니다.
+     * 생성 시각 내림차순으로 본인 관련 송금을 조회합니다. direction이 null이면 보낸·받은 내역을 모두 포함하며,
+     * 받은 내역은 완료(COMPLETED) 송금만 포함합니다.
      * page는 0부터 시작하고 size는 1 이상이어야 하며, 최대 크기를 넘으면 최대 크기로 조회합니다.
      */
     @Transactional(readOnly = true)
@@ -207,21 +187,27 @@ public class TransferService {
 
     /**
      * 재시도 대기 시간이 지난 처리 중 송금을 오래된 순으로 최대 limit건 선점해 원장에 다시 요청하고, 결과가 확정된 건수를 반환합니다.
-     * 저장된 값으로 같은 reference를 재전송하고 결과는 조건부 UPDATE로 반영하므로, 다른 인스턴스와 겹쳐도 잔액과 상태는 한 번만 바뀝니다.
+     * 선점은 SKIP LOCKED로 한 번에 하므로 서버가 여러 대면 서로 다른 송금을 나눠 가져갑니다({@link TransferRepository#claimRecoveryTargets}).
+     * 원장 호출 직전에는 건마다 선점이 그대로인지 조건부 UPDATE로 확인하고 갱신해({@link TransferRepository#renewRecoveryClaim}),
+     * 다른 서버가 다시 선점한 송금은 보내지 않습니다.
+     * 저장된 값으로 같은 reference를 재전송하고 결과는 조건부 UPDATE로 반영하므로, 선점한 서버가 중간에 멈춰 다른 서버가 다시 가져가도
+     * 잔액과 상태는 한 번만 바뀝니다.
      * 결과를 모르면 시도 횟수를 늘려 다음 대기 시간 뒤로 미루고, 한도에 이르거나 원장이 요청을 받아들이지 않으면 MANUAL_REVIEW로 둡니다.
-     * 원장이 연달아 응답하지 못하면 원장 장애로 보고 남은 송금은 다음 주기로 넘깁니다.
+     * 원장이 연달아 응답하지 못하면 원장 장애로 보고 남은 송금은 미룹니다. 선점으로 대기 시간이 다시 시작돼 시도 횟수는 그대로 두고
+     * 대기 시간 뒤에 다시 시도합니다.
      */
     public int recoverDue(Instant now, int limit) {
-        if (ledgerClient.isEmpty()) {
-            return 0;
-        }
         int settled = 0;
         int consecutiveUnknown = 0;
-        for (Transfer target : transferRepository.findRecoveryTargets(now, limit)) {
+        // 일괄 선점 때 수정 시각에 기록하는 값입니다. 엔티티의 수정 시각은 호출하는 쪽 영속성 컨텍스트에 따라 선점 전 값일 수 있어
+        // 직접 기록한 이 값으로 비교합니다(DB와 같은 마이크로초 정밀도).
+        Instant claimedAt = now();
+        for (Transfer target : transferRepository.claimRecoveryTargets(now, claimedAt, limit)) {
             Outcome outcome;
             try {
-                if (transferRepository.claimForRecovery(target.getId(), target.getUpdatedAt(), now()) == 0) {
-                    // 다른 인스턴스가 먼저 선점했거나 그 사이 결과가 반영됐습니다.
+                // 앞 송금의 원장 호출이 길어져 대기 시간이 지나면 다른 서버가 다시 선점할 수 있어, 호출 직전에 선점이 그대로인지 확인합니다.
+                if (transferRepository.renewRecoveryClaim(target.getId(), claimedAt, now()) == 0) {
+                    // 다른 서버가 다시 선점했거나 그 사이 결과가 반영됐습니다.
                     continue;
                 }
                 outcome = attempt(target).outcome();
@@ -237,6 +223,11 @@ public class TransferService {
                 }
                 case NOT_ACCEPTED -> consecutiveUnknown = 0;
                 case UNKNOWN -> consecutiveUnknown++;
+                case NOT_SENT -> {
+                    // 서킷이 열려 있으면 남은 송금도 보내지 못하므로 이번 주기를 멈춥니다. 시도 횟수는 그대로입니다.
+                    log.warn("원장 서킷이 열려 있어 남은 송금 복구를 다음 주기로 미룹니다.");
+                    return settled;
+                }
             }
             if (consecutiveUnknown >= MAX_CONSECUTIVE_UNKNOWN) {
                 log.warn("원장 거래 등록 결과를 연달아 확인하지 못해 남은 송금 복구를 다음 주기로 미룹니다.");
@@ -267,15 +258,26 @@ public class TransferService {
         /** 원장이 요청을 받아들이지 않았습니다(409·400 등). 재요청해도 같은 결과라 자동 처리를 멈춥니다. */
         NOT_ACCEPTED,
         /** 결과를 확인하지 못했습니다(타임아웃·연결 실패·5xx·해석 불가·반영 실패). */
-        UNKNOWN
+        UNKNOWN,
+        /** 원장 서킷이 열려 있어 보내지 않았습니다. 원장에 닿지 않았으므로 시도 횟수를 늘리지 않고 PROCESSING으로 둡니다. */
+        NOT_SENT
     }
 
     /** 원장 거래 등록 뒤 다시 읽은 송금과 그 결과입니다. */
     private record AttemptResult(Transfer transfer, Outcome outcome) {
     }
 
-    private TransferResponse replay(Transfer transfer, String requestHash, UUID senderId) {
-        if (!transfer.getRequestHash().equals(requestHash)) {
+    /**
+     * 같은 키의 송금이 이미 있으면, 요청 내용이 그 송금에 저장된 값과 같을 때만 현재 결과로 응답합니다.
+     * 요청 필드(수취인·금액·통화·메모)는 모두 송금 행에 저장되므로 저장된 값과 직접 비교합니다.
+     * memo는 저장할 때와 같이 정규화한 값을 전달해야 합니다.
+     */
+    private TransferResponse replay(Transfer transfer, TransferCreateRequest request, String memo, UUID senderId) {
+        boolean sameRequest = transfer.getReceiverId().equals(request.receiverId())
+                && transfer.getAmount() == request.amount()
+                && transfer.getCurrency().equals(request.currency())
+                && Objects.equals(transfer.getMemo(), memo);
+        if (!sameRequest) {
             throw new BusinessException(TransferErrorCode.IDEMPOTENCY_KEY_REUSED);
         }
         return respond(transfer, senderId);
@@ -292,6 +294,7 @@ public class TransferService {
     /**
      * PROCESSING 송금의 원장 거래 등록을 한 번 요청하고, 결과를 반영한 뒤 다시 읽은 송금을 반환합니다.
      * 결과를 모르면 시도 횟수를 기록하고(한도에 이르면 MANUAL_REVIEW), 원장이 요청을 받아들이지 않으면 MANUAL_REVIEW로 둡니다.
+     * 서킷이 열려 보내지 않았으면 아무것도 기록하지 않습니다(PROCESSING·시도 횟수 그대로, 복구가 대기 시간 뒤 다시 보냄).
      * 기록 중 오류가 나면 받은 송금을 그대로 반환하며, 복구 스케줄러가 대기 시간 뒤 다시 요청합니다.
      */
     private AttemptResult attempt(Transfer transfer) {
@@ -306,7 +309,7 @@ public class TransferService {
                     }
                 }
                 case UNKNOWN -> recordUnknown(transfer);
-                case SETTLED -> {
+                case SETTLED, NOT_SENT -> {
                 }
             }
             return new AttemptResult(transferRepository.findById(transfer.getId()).orElseThrow(), outcome);
@@ -336,13 +339,18 @@ public class TransferService {
     private Outcome registerOnLedger(Transfer transfer) {
         LedgerTransactionResponse result;
         try {
-            result = ledgerClient.get().register(LedgerTransactionRequest.of(transfer));
+            result = ledgerClient.register(LedgerTransactionRequest.of(transfer));
         } catch (TransferLedgerException exception) {
             if (exception.getKind() == TransferLedgerException.Kind.REQUEST_NOT_ACCEPTED) {
                 // 원장이 받아들이지 않은 요청(409·400 등)은 송금 요청을 잘못 만든 버그나 계약 불일치라 확인이 필요합니다.
                 // 409는 같은 reference의 원장 거래가 이미 있다는 뜻일 수 있어 FAILED로 끝내지 않습니다.
                 log.error("원장이 거래 등록 요청을 받아들이지 않았습니다. transferId={}", transfer.getId(), exception);
                 return Outcome.NOT_ACCEPTED;
+            }
+            if (exception.getKind() == TransferLedgerException.Kind.NOT_SENT) {
+                // 서킷이 열려 원장에 보내지 않았습니다. 스택 없이 한 줄만 남깁니다(장애 중 요청마다 발생).
+                log.warn("원장 서킷이 열려 있어 거래 등록을 보내지 않았습니다. transferId={}", transfer.getId());
+                return Outcome.NOT_SENT;
             }
             log.warn("원장 거래 등록 결과를 확인할 수 없습니다. transferId={}", transfer.getId(), exception);
             return Outcome.UNKNOWN;

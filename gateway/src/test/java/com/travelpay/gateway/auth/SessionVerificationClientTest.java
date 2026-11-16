@@ -7,6 +7,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.auth.AuthenticatedUser;
 import com.travelpay.common.error.BusinessException;
@@ -14,10 +18,12 @@ import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.gateway.support.StubServer;
 import com.travelpay.gateway.support.StubServer.Reply;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.mock.http.server.reactive.MockServerHttpRequest;
@@ -37,9 +43,18 @@ class SessionVerificationClientTest {
     private static final UUID USER_ID = UUID.fromString("550e8400-e29b-41d4-a716-446655440000");
     private static final StubServer USER_SERVICE = StubServer.start();
 
+    private final ListAppender<ILoggingEvent> log = new ListAppender<>();
+
     @BeforeEach
     void reset() {
         USER_SERVICE.reset();
+        log.start();
+        ((Logger) LoggerFactory.getLogger(SessionVerificationClient.class)).addAppender(log);
+    }
+
+    @AfterEach
+    void releaseLog() {
+        ((Logger) LoggerFactory.getLogger(SessionVerificationClient.class)).detachAppender(log);
     }
 
     @AfterAll
@@ -105,12 +120,25 @@ class SessionVerificationClientTest {
         assertArrayEquals(body.getBytes(UTF_8), rejected.body());
     }
 
+    // user-service 자체 장애는 장애 동안 요청마다 생기므로 ERROR로 남기지 않습니다.
     @ParameterizedTest
-    @ValueSource(ints = {400, 404, 429, 500, 502, 503})
-    void anyOtherStatusIsAnAuthenticationOutage(int status) {
+    @ValueSource(ints = {500, 502, 503})
+    void aUserServiceFailureIsAnAuthenticationOutageWithoutAnErrorLog(int status) {
         USER_SERVICE.reply(PATH, Reply.json(status, ""));
 
         assertUnavailable(client(Duration.ofSeconds(2)));
+        assertTrue(errors().isEmpty(), errors().toString());
+    }
+
+    // 약속하지 않은 상태는 연동 오류라 상태와 함께 ERROR로 남깁니다.
+    @ParameterizedTest
+    @ValueSource(ints = {400, 404, 429})
+    void anUnexpectedStatusIsAnAuthenticationOutageLoggedAsABrokenContract(int status) {
+        USER_SERVICE.reply(PATH, Reply.json(status, ""));
+
+        assertUnavailable(client(Duration.ofSeconds(2)));
+        assertEquals(1, errors().size());
+        assertTrue(errors().getFirst().getFormattedMessage().contains(String.valueOf(status)));
     }
 
     @ParameterizedTest
@@ -125,6 +153,7 @@ class SessionVerificationClientTest {
         USER_SERVICE.reply(PATH, Reply.json(200, body));
 
         assertUnavailable(client(Duration.ofSeconds(2)));
+        assertBrokenContractLogged();
     }
 
     @ParameterizedTest
@@ -135,6 +164,7 @@ class SessionVerificationClientTest {
                 """.formatted(USER_ID, role)));
 
         assertUnavailable(client(Duration.ofSeconds(2)));
+        assertBrokenContractLogged();
     }
 
     @ParameterizedTest
@@ -145,6 +175,7 @@ class SessionVerificationClientTest {
                 """.formatted(success, USER_ID)));
 
         assertUnavailable(client(Duration.ofSeconds(2)));
+        assertBrokenContractLogged();
     }
 
     @Test
@@ -154,6 +185,7 @@ class SessionVerificationClientTest {
                 """));
 
         assertUnavailable(client(Duration.ofSeconds(2)));
+        assertBrokenContractLogged();
     }
 
     @Test
@@ -173,6 +205,33 @@ class SessionVerificationClientTest {
         USER_SERVICE.reply(PATH, verified().delayedBy(Duration.ofMillis(1500)));
 
         assertUnavailable(client(Duration.ofMillis(300)));
+        assertTrue(errors().isEmpty(), errors().toString());
+    }
+
+    // 성공 상태를 받은 뒤 본문이 멈추거나 끊기는 것은 응답 형식 문제가 아니라 장애이므로 ERROR로 남기지 않습니다.
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aSuccessBodyThatStallsOrIsCutOffIsAnOutageWithoutAnErrorLog(boolean stall) throws Exception {
+        try (var server = new ServerSocket(0)) {
+            Thread.ofVirtual().start(() -> {
+                try (var socket = server.accept()) {
+                    socket.getInputStream().read(new byte[8192]);
+                    socket.getOutputStream().write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                            + "Content-Length: 200\r\n\r\n{\"success\":true,").getBytes(UTF_8));
+                    socket.getOutputStream().flush();
+                    if (stall) {
+                        socket.getInputStream().read();
+                    }
+                } catch (IOException closed) {
+                    // 클라이언트가 시간 초과로 연결을 닫으면 끝냅니다.
+                }
+            });
+            var client = new SessionVerificationClient(webClient(Duration.ofMillis(300)),
+                    URI.create("http://127.0.0.1:" + server.getLocalPort() + PATH));
+
+            assertUnavailable(client);
+        }
+        assertTrue(errors().isEmpty(), errors().toString());
     }
 
     @Test
@@ -186,6 +245,17 @@ class SessionVerificationClientTest {
 
         var exception = assertThrows(BusinessException.class, () -> client.verify(walletRequest()).block());
         assertEquals(CommonErrorCode.SERVICE_UNAVAILABLE, exception.getErrorCode());
+        assertTrue(errors().isEmpty(), errors().toString());
+    }
+
+    private void assertBrokenContractLogged() {
+        assertEquals(1, errors().size());
+        assertTrue(errors().getFirst().getFormattedMessage().startsWith("Session verification returned 200"),
+                errors().getFirst().getFormattedMessage());
+    }
+
+    private List<ILoggingEvent> errors() {
+        return log.list.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
     }
 
     private static void assertUnavailable(SessionVerificationClient client) {

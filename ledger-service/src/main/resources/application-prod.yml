@@ -9,6 +9,8 @@ spring:
       # 트랜잭션 타임아웃은 커넥션을 얻은 뒤부터 적용되므로 획득 대기도 따로 제한
       connection-timeout: 2000
       validation-timeout: 1000
+      # 격리 수준은 @Transactional에 적지 않고 여기서 정한다 (적으면 트랜잭션마다 격리 수준 조회가 나감)
+      transaction-isolation: TRANSACTION_READ_COMMITTED
   flyway:
     default-schema: ledger_service
     schemas: ledger_service
@@ -19,11 +21,25 @@ spring:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+    properties:
+      hibernate:
+        # 계정 잠금 뒤 항목 INSERT·계정 UPDATE를 문장마다 보내지 않고 묶어서 보내 잠금 보유 시간을 줄임 (#294, 원장 담당 합의)
+        # 거래 한 건 항목은 최대 20건이라 20 이상이면 같음
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
 
 travelpay:
   auth:
     header-context:
       enabled: true
+  ledger:
+    integrity:
+      # 정합성 검사(GET /internal/v1/ledger/integrity) 검사별로 돌려주는 위반 최대 건수
+      violation-limit: 100
+      # 검사 트랜잭션 timeout(초). 거래 처리 timeout(3초)과 별도
+      timeout-seconds: 30
 
 server:
   port: 8080

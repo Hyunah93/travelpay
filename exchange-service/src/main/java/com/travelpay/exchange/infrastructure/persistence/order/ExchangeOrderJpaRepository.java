@@ -155,6 +155,20 @@ interface ExchangeOrderJpaRepository extends JpaRepository<ExchangeOrder, UUID> 
     List<ExchangeOrder> findRecoveryTargets(@Param("now") Instant now, @Param("limit") int limit);
 
     /**
+     * 재시도 대기와 관계없이 cycleStartedAt 이후로 확인하지 않은 PROCESSING 주문(#317). 원장이 살아 있음을 확인한 복구 주기에서만 쓴다.
+     * 정렬은 findRecoveryTargets와 같아 부분 인덱스 ix_exchange_orders_processing을 탈 수 있다.
+     */
+    @Query(nativeQuery = true, value = """
+            select *
+              from exchange_orders
+             where status = 'PROCESSING'
+               and (last_ledger_checked_at is null or last_ledger_checked_at < :cycleStartedAt)
+             order by ledger_check_count, last_ledger_checked_at nulls first, requested_at
+             limit :limit
+            """)
+    List<ExchangeOrder> findNotCheckedSince(@Param("cycleStartedAt") Instant cycleStartedAt, @Param("limit") int limit);
+
+    /**
      * 신청 시각이 cutoff 이전인 PROCESSING 주문 수(정체 지표). status = 'PROCESSING' 조건을 그대로 적어
      * 부분 인덱스 ix_exchange_orders_processing(PROCESSING 주문만 담음)을 쓸 수 있게 한다.
      */

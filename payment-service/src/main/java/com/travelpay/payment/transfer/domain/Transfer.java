@@ -74,10 +74,6 @@ public class Transfer {
     @Column(name = "idempotency_key", length = 100, nullable = false, updatable = false)
     private String idempotencyKey;
 
-    @JdbcTypeCode(SqlTypes.CHAR)
-    @Column(name = "request_hash", length = 64, nullable = false, updatable = false)
-    private String requestHash;
-
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -96,7 +92,6 @@ public class Transfer {
             String currency,
             String memo,
             String idempotencyKey,
-            String requestHash,
             TransferStatus status
     ) {
         this.senderId = Objects.requireNonNull(senderId, "senderId");
@@ -107,34 +102,7 @@ public class Transfer {
         this.currency = Objects.requireNonNull(currency, "currency");
         this.memo = memo;
         this.idempotencyKey = Objects.requireNonNull(idempotencyKey, "idempotencyKey");
-        this.requestHash = Objects.requireNonNull(requestHash, "requestHash");
         this.status = status;
-    }
-
-    /** 검증을 마친 송금 요청을 접수 상태로 생성합니다. 원장 거래 등록 구현이 없을 때 사용합니다. */
-    public static Transfer request(
-            UUID senderId,
-            UUID receiverId,
-            UUID sourceWalletId,
-            UUID targetWalletId,
-            long amount,
-            String currency,
-            String memo,
-            String idempotencyKey,
-            String requestHash
-    ) {
-        return new Transfer(
-                senderId,
-                receiverId,
-                sourceWalletId,
-                targetWalletId,
-                amount,
-                currency,
-                memo,
-                idempotencyKey,
-                requestHash,
-                TransferStatus.REQUESTED
-        );
     }
 
     /** 검증을 마친 송금 요청을 처리 중 상태로 생성합니다. 원장 거래 등록을 호출하기 전에 저장합니다. */
@@ -146,8 +114,7 @@ public class Transfer {
             long amount,
             String currency,
             String memo,
-            String idempotencyKey,
-            String requestHash
+            String idempotencyKey
     ) {
         return new Transfer(
                 senderId,
@@ -158,14 +125,16 @@ public class Transfer {
                 currency,
                 memo,
                 idempotencyKey,
-                requestHash,
                 TransferStatus.PROCESSING
         );
     }
 
-    /** 송금인 또는 수취인인지 확인합니다. */
-    public boolean isParticipant(UUID userId) {
-        return senderId.equals(userId) || receiverId.equals(userId);
+    /**
+     * 사용자 송금 API로 이 송금을 볼 수 있는지 확인합니다. 송금인은 모든 상태를, 수취인은 자금이 들어온 완료(COMPLETED) 송금만 봅니다.
+     * 수취인에게 처리 중·실패 송금을 보이면 송금인의 실패 사유(잔액 부족 등)와 메모가 드러나기 때문입니다.
+     */
+    public boolean isVisibleTo(UUID userId) {
+        return senderId.equals(userId) || (receiverId.equals(userId) && status == TransferStatus.COMPLETED);
     }
 
     // TIMESTAMPTZ가 마이크로초까지 저장하므로, 저장 직후 응답 시각과 이후 조회 시각이 같도록 맞춥니다.
@@ -231,10 +200,6 @@ public class Transfer {
 
     public String getIdempotencyKey() {
         return idempotencyKey;
-    }
-
-    public String getRequestHash() {
-        return requestHash;
     }
 
     public Instant getCreatedAt() {

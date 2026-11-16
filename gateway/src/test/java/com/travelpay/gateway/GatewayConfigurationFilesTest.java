@@ -8,7 +8,9 @@ import java.util.Map;
 import java.util.TreeMap;
 
 import com.travelpay.gateway.auth.SessionVerificationProperties;
+import com.travelpay.gateway.auth.SessionVerificationProtectionProperties;
 import org.springframework.cloud.gateway.config.GlobalCorsProperties;
+import org.springframework.cloud.gateway.config.HttpClientProperties;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -33,6 +35,8 @@ class GatewayConfigurationFilesTest {
     private static final String[] SHARED_PREFIXES = {
             "spring.cloud.gateway.server.webflux.routes", "travelpay.gateway."};
     private static final String SESSION_CONFIG = "travelpay.gateway.session-verification";
+    private static final String ROUTES = "spring.cloud.gateway.server.webflux.routes";
+    private static final String USER_RESPONSE_TIMEOUT = ROUTES + "[0].metadata.response-timeout";
 
     @Test
     void localAndProdHaveTheSameRoutesAndGatewaySettings() throws IOException {
@@ -51,6 +55,13 @@ class GatewayConfigurationFilesTest {
         assertNull(properties.getPropagation().getType());
         assertEquals(List.of(TracingProperties.Propagation.PropagationType.W3C), properties.getPropagation().getProduce());
         assertFalse(properties.getBaggage().isEnabled());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void requestLogsKeepAutomaticContextPropagation(String filename) throws IOException {
+        // AUTO hook는 JVM 전역이라 다른 테스트 컨텍스트가 켠 상태를 빌리지 않고 YAML 자체도 확인합니다.
+        assertEquals("auto", environmentFor(filename).getProperty("spring.reactor.context-propagation"));
     }
 
     @Test
@@ -110,6 +121,42 @@ class GatewayConfigurationFilesTest {
         assertEquals(Duration.ofMillis(400), properties.connectTimeout());
         assertEquals(Duration.ofSeconds(2), properties.responseTimeout());
         assertEquals(Duration.ofSeconds(7), properties.totalTimeout());
+    }
+
+    // Gateway는 라우트 응답 제한을 밀리초 숫자로만 읽고, 숫자가 아니거나 비어 있으면 조용히 무시해 제한이 없어집니다.
+    // 업무 라우트와 전체 HTTP 클라이언트에는 응답 제한을 두지 않습니다(이번 범위 밖).
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void onlyTheUserRouteHasAResponseLimitInMilliseconds(String filename) throws IOException {
+        var environment = environmentFor(filename);
+
+        assertEquals("user-service", environment.getProperty(ROUTES + "[0].id"));
+        assertEquals(10_000L, Long.parseLong(environment.getRequiredProperty(USER_RESPONSE_TIMEOUT)));
+        for (var route = 1; environment.containsProperty(ROUTES + "[" + route + "].id"); route++) {
+            assertNull(environment.getProperty(ROUTES + "[" + route + "].metadata.response-timeout"));
+        }
+        assertNull(environment.getProperty("spring.cloud.gateway.server.webflux.httpclient.response-timeout"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void sessionVerificationProtectionUsesTheMeasuredLimits(String filename) throws IOException {
+        var properties = Binder.get(environmentFor(filename)).bindOrCreate(
+                "travelpay.gateway.session-verification.protection", SessionVerificationProtectionProperties.class);
+
+        assertEquals(new SessionVerificationProtectionProperties(100, Duration.ofSeconds(5), 20, 50f,
+                Duration.ofSeconds(2), 5), properties);
+    }
+
+    // 다른 서비스가 쉰 연결을 닫는 60초(Tomcat 기본)보다 짧은 30초 넘게 쉰 연결은 꺼낼 때 버려, 닫히는 연결의 재사용을 줄임
+    @ParameterizedTest
+    @ValueSource(strings = {"application.yml", "application-prod.yml"})
+    void routingConnectionsAreDroppedBeforeServicesCloseIdleConnections(String filename) throws IOException {
+        var properties = Binder.get(environmentFor(filename)).bindOrCreate(
+                "spring.cloud.gateway.server.webflux.httpclient", HttpClientProperties.class);
+
+        assertEquals(Duration.ofSeconds(30), properties.getPool().getMaxIdleTime());
+        assertTrue(properties.getPool().getMaxIdleTime().compareTo(Duration.ofSeconds(60)) < 0);
     }
 
     @Test

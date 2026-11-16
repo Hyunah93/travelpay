@@ -10,6 +10,7 @@ import java.util.UUID;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.user.common.error.UserErrorCode;
 import com.travelpay.user.domain.model.entity.User;
+import com.travelpay.user.domain.repository.UserProfile;
 import com.travelpay.user.domain.repository.UserRepository;
 import com.travelpay.user.domain.repository.UserSearchCondition;
 import com.travelpay.user.domain.repository.UserSearchItem;
@@ -46,6 +47,11 @@ public class UserRepositoryImpl implements UserRepository {
     @Override
     public Optional<User> findById(UUID userId) {
         return userJpaRepository.findById(userId);
+    }
+
+    @Override
+    public Optional<UserProfile> findProfile(UUID userId) {
+        return userJpaRepository.findProfile(userId);
     }
 
     @Override

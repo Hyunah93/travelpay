@@ -9,12 +9,20 @@ spring:
       # 트랜잭션 타임아웃은 커넥션을 얻은 뒤부터 적용되므로 획득 대기도 따로 제한
       connection-timeout: 2000
       validation-timeout: 1000
+      # 트랜잭션마다 격리 수준을 지정하지 않고 커넥션을 만들 때 한 번 정한다 (@Transactional(isolation)은 트랜잭션마다 SHOW 조회가 생김).
+      # 재조회에서 다른 트랜잭션이 커밋한 행을 봐야 하는 단계들이 이 값을 전제로 한다
+      transaction-isolation: TRANSACTION_READ_COMMITTED
   flyway:
     default-schema: wallet_service
   jpa:
     open-in-view: false
     hibernate:
       ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          # 변경 감지 UPDATE·INSERT를 묶어 보낸다 (Outbox 발행 최대 500건의 상태 변경이 커밋 직전에 행마다 왕복하지 않게)
+          batch_size: 50
   cloud:
     openfeign:
       client:
@@ -72,14 +80,14 @@ travelpay:
         enabled: true
         # 이전 주기가 끝난 뒤부터 다음 주기까지의 간격
         fixed-delay: 1s
-        batch-size: 50
+        batch-size: 500
     charge:
       saga:
         consumer:
           # 끄면 충전 SAGA 컨슈머가 시작하지 않는다 (테스트용)
           enabled: true
           # 컨슈머 스레드 수 (1 이상). 토픽 파티션 수(3)보다 크면 남는 컨슈머는 유휴
-          concurrency: 1
+          concurrency: 3
       recovery:
         # 처리 중 상태로 멈춘 충전을 다시 실행. 끄면 복구 스케줄러가 등록되지 않는다 (테스트용)
         enabled: true

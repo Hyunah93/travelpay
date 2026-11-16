@@ -167,6 +167,32 @@ run "data_host_monitoring_is_pinned_private_and_least_privileged" {
   }
 
   assert {
+    condition = (
+      yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.env_file == ["/run/travelpay/grafana-env/slack.env"] &&
+      contains(yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.depends_on, "alloy") &&
+      !contains(keys(yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.environment), "SLACK_WEBHOOK_URL") &&
+      # Webhook 주소는 S3 설정 묶음에 들어가지 않고 Data 호스트가 Parameter Store에서 받습니다(스크립트의 형식 검사 문구는 주소가 아님).
+      length(regexall("hooks\\.slack\\.com/services/[A-Za-z0-9]", local.data_bundle_json)) == 0
+    )
+    error_message = "Slack Webhook 주소는 설정 묶음이 아니라 Data 호스트가 만든 env_file로만 Grafana에 넘겨야 합니다."
+  }
+
+  assert {
+    condition = (
+      [for point in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-notifications.yml"]).contactPoints : [
+        for receiver in point.receivers : [point.name, receiver.type, receiver.settings.url, receiver.disableResolveMessage]
+      ]] == [[["slack-monitoring", "slack", "$SLACK_WEBHOOK_URL", false]]] &&
+      [for policy in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-notifications.yml"]).policies : [
+        policy.receiver, policy.group_by, policy.repeat_interval
+      ]] == [["slack-monitoring", ["grafana_folder", "alertname"], "4h"]] &&
+      # 규칙이 받을 곳을 직접 고르면 기본 정책을 거치지 않으므로, 모든 규칙은 기본 정책(Slack)을 따라야 합니다.
+      length(regexall("notification_settings|receiver", jsondecode(local.data_bundle_json)["grafana-alert-transfer.yml"])) == 0 &&
+      length(regexall("notification_settings|receiver", jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"])) == 0
+    )
+    error_message = "알림 규칙은 받을 곳을 직접 정하지 않고, 기본 알림 정책이 해결 알림까지 Slack 연락처로 보내야 합니다."
+  }
+
+  assert {
     condition = alltrue([
       for name in ["prometheus", "loki", "grafana", "alloy"] :
       yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services[name].environment.TRAVELPAY_CONFIG_SHA256 == local.monitoring_config_sha256[name]
@@ -266,7 +292,7 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
       ] :
       token => length(split(token, file("${path.module}/../monitoring/grafana/dashboards/travelpay-local.json"))) - 1
       } == {
-      "prometheus-local"                                                                   = 23, "loki-local" = 1, "travelpay-local-perf" = 1,
+      "prometheus-local"                                                                   = 27, "loki-local" = 1, "travelpay-local-perf" = 1,
       "TRAVELPAY | Local Performance"                                                      = 1, "local|load-test" = 2, "docker-local|spring-local" = 1, "\"local\"" = 3,
       "local=로컬 개발 앱, load-test=전용 부하 시험 앱. 한 환경씩 선택합니다. 이 필터는 메트릭에만 적용되며 로그에는 적용하지 않습니다." = 1,
       "수집된 로컬 앱·개발 인프라 로그입니다."                                                             = 1, "Trace ID는 로그 원문을 검색하며 메트릭 환경 필터는 로그에 적용되지 않습니다." = 1,
@@ -306,8 +332,14 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
 
   assert {
     condition = (
-      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.uid] == ["service-metrics-missing", "payment-recovery-scheduler-stalled"] &&
-      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : [rule.noDataState, rule.for]] == [["Alerting", "2m"], ["OK", "2m"]] &&
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.uid] == ["service-metrics-missing", "payment-recovery-scheduler-stalled", "circuit-breaker-rejecting"] &&
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : [rule.noDataState, rule.for]] == [["Alerting", "2m"], ["OK", "2m"], ["OK", "2m"]] &&
+      # 임계값이 뒤집히면(예: 0건일 때 알림) 모든 서킷·서비스가 울리므로 세 규칙의 판정 조건을 고정합니다.
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.data[1].model.conditions[0].evaluator] == [
+        { type = "lt", params = [1] }, { type = "lt", params = [1] }, { type = "gt", params = [0] },
+      ] &&
+      # 서킷 차단 규칙의 1분 창·2분 지속·임계값은 tests/test_dashboard_queries.py가 이 템플릿에서 읽어 promtool로 시점별로 확인합니다.
+      yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[2].data[0].model.expr == "sum by (service, name) (increase(resilience4j_circuitbreaker_not_permitted_calls_total{job=\"spring-jvm\",environment=\"production\"}[1m]))" &&
       # 식의 뜻(0으로 채우기·실행 기록 없음 보완)은 실제 Prometheus·Grafana로 확인했으므로 식 전체를 고정합니다.
       yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[0].data[0].model.expr == join(" or ", concat(
         ["sum by (service) (up{job=\"spring-jvm\",environment=\"production\"} == 1)"],
@@ -318,7 +350,7 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
         [for scheduler in local.payment_recovery_schedulers : "label_replace(count(up{job=\"spring-jvm\",environment=\"production\",service=\"payment-service\"} == 1) * 0, \"code_namespace\", \"${scheduler}\", \"\", \"\")"]
       ))
     )
-    error_message = "수집 중단 규칙은 8개 서비스 모두를 0으로 채워 감시하고, 복구 스케줄러 규칙은 두 스케줄러의 실행 횟수와 실행 기록 없음을 봐야 합니다."
+    error_message = "수집 중단 규칙은 8개 서비스 모두를 0으로 채워 감시하고, 복구 스케줄러 규칙은 두 스케줄러의 실행 횟수와 실행 기록 없음을, 서킷 규칙은 서비스·서킷별 거절 횟수를 봐야 합니다."
   }
 
   # 복구 스케줄러 클래스 목록이 payment-service 코드와 같은지 봅니다(담당 서비스 코드는 읽기만 합니다).

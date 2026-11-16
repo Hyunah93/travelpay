@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Data EC2의 모니터링 폴더와 Grafana 관리자 암호 파일을 준비합니다. 비밀값은 출력하지 않습니다.
+"""Data EC2의 모니터링 폴더와 Grafana 관리자 암호·Slack Webhook 파일을 준비합니다. 비밀값은 출력하지 않습니다.
 
 Redis·Kafka 준비(prepare-data.py)와 유닛을 나눠, 이 준비가 실패해도 Redis·Kafka의 시작·반영은 막지 않습니다.
 """
@@ -45,6 +45,31 @@ def grafana_password(password):
     if not re.fullmatch(GRAFANA_PASSWORD_PATTERN, password):
         raise PreparationError("Grafana 관리자 암호는 앞뒤 공백 없이 영문·숫자·기호·공백 10~128자여야 합니다.")
     return password
+
+
+# 현재 구성은 연락처의 $SLACK_WEBHOOK_URL 환경 변수 치환을 사용하므로, 주소는 Compose의 env_file로 넘깁니다.
+# 줄바꿈이 들어가면 env_file에 다른 변수가 생기고 $가 들어가면 Grafana가 다시 치환하므로, Slack 발급 형식만 받습니다.
+# 비밀값 준비 도구(prepare-parameters.py)와 같은 규칙입니다.
+SLACK_WEBHOOK_PATTERN = r"https://hooks\.slack\.com/services/[A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9]+"
+# Slack 연락처 설정입니다. 설정 묶음은 이 파일을 데이터 폴더에만 두고, Webhook 주소를 받은 뒤 여기서 Grafana 폴더에 넣습니다.
+# 주소 없이 이 파일만 먼저 들어가면 실행 중인 Grafana가 다음에 다시 시작될 때 연락처를 만들지 못해 시작에 실패합니다.
+NOTIFICATIONS_TARGET = Path("/opt/travelpay/monitoring/grafana/provisioning/alerting/notifications.yml")
+
+
+def slack_webhook_environment(url):
+    if not re.fullmatch(SLACK_WEBHOOK_PATTERN, url):
+        raise PreparationError("Slack Webhook 주소가 https://hooks.slack.com/services/ 발급 형식이 아닙니다.")
+    return f"SLACK_WEBHOOK_URL={url}\n"
+
+
+def install_notifications(source, target):
+    """Grafana 사용자가 읽도록 0644로 바꿔치기합니다. 폴더는 설정 묶음 적용(apply-data-bundle.py)이 0755로 만듭니다."""
+    if not target.parent.is_dir():
+        raise PreparationError("Grafana 알림 설정 폴더가 없습니다. 설정 묶음 적용을 먼저 확인하세요.")
+    temporary = target.with_name(target.name + ".new")
+    temporary.write_bytes(source.read_bytes())
+    temporary.chmod(0o644)
+    os.replace(temporary, target)
 
 
 def read_parameter(config, name, run=subprocess.run, sleep=time.sleep):
@@ -95,6 +120,10 @@ def main():
     prepare_monitoring(monitoring_root)
     write_secret(Path("/run/travelpay/grafana"), "admin-password",
                  grafana_password(read_parameter(config, "GRAFANA_ADMIN_PASSWORD")), GRAFANA_UID, 0)
+    # Compose(root)가 읽어 Grafana 환경 변수로 넘기는 파일이라 root만 읽게 둡니다. 관리자 암호 폴더와 소유자가 달라 나눕니다.
+    write_secret(Path("/run/travelpay/grafana-env"), "slack.env",
+                 slack_webhook_environment(read_parameter(config, "SLACK_WEBHOOK_URL")), 0, 0)
+    install_notifications(root / "grafana-alert-notifications.yml", NOTIFICATIONS_TARGET)
 
 
 if __name__ == "__main__":

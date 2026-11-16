@@ -2,7 +2,7 @@
 
 충전 접수(`POST /api/v1/charges`)부터 SAGA 종결(은행 출금 → 원장 적립)까지를 같은 조건에서 재고, 끝난 뒤 은행 출금 정합성과 운영 대사 API 결과를 확인합니다.
 
-- 충전은 접수 후 202로 응답하고 Outbox(1초·50건) → Kafka(`wallet.charge.requested`, 파티션 3) → SAGA로 처리됩니다. 그래서 **접수 응답 시간**과 **종결까지의 완료 처리량·지연**을 따로 봅니다.
+- 충전은 접수 후 202로 응답하고 Outbox(1초·500건) → Kafka(`wallet.charge.requested`, 파티션 3) → SAGA로 처리됩니다. 그래서 **접수 응답 시간**과 **종결까지의 완료 처리량·지연**을 따로 봅니다.
 - 목적은 **병목 위치와 정합성 확인**입니다. 노트북 한 대의 Docker 안에서 재므로 절대 처리량이 아니라 **같은 날 같은 조건의 비교**(예: SAGA 컨슈머 동시성 1 vs 3)와 대사 결과를 봅니다.
 - **앱까지 Docker 네트워크 안에서 실행합니다.** user·wallet·ledger·mock-bank, 측정 전용 Postgres·Kafka·Redis, k6를 같은 compose 프로젝트(`travelpay-charge-load-test`)에 띄웁니다. 앱을 PC에 띄우면 앱↔DB·Kafka 왕복이 Docker Desktop 포트 전달을 지나 느려지고(환전 측정: 0.05ms → 2.7ms, [환전 README "측정 환경을 Docker 안에 두는 이유"](../../exchange-service/load-test/README.md#측정-환경을-docker-안에-두는-이유)), 충전 한 건은 이 왕복을 약 25번 합니다.
 - **Gateway 제외 측정입니다.** k6가 같은 네트워크의 `wallet:8082`를 `User-Id`·`User-Role` 헤더로 직접 호출합니다. Eureka는 쓰지 않고 지갑이 다른 서비스를 직접 주소로 부릅니다.
@@ -88,8 +88,8 @@
 --travelpay.wallet.charge.reconciliation.enabled=false
 --travelpay.wallet.charge.reconciliation.grace=10s
 --management.metrics.distribution.percentiles-histogram.http.server.requests=true
---travelpay.wallet.charge.saga.consumer.concurrency=${CHARGE_CONCURRENCY:-1}
---travelpay.wallet.outbox.publisher.batch-size=${OUTBOX_BATCH_SIZE:-50}
+--travelpay.wallet.charge.saga.consumer.concurrency=${CHARGE_CONCURRENCY:-3}
+--travelpay.wallet.outbox.publisher.batch-size=${OUTBOX_BATCH_SIZE:-500}
 ```
 
 - `reconciliation.enabled=false`: 10분 주기 대사 스케줄러가 측정 중에 돌지 않게 합니다(수동 실행은 그대로 됨).
@@ -100,7 +100,7 @@
   CHARGE_CONCURRENCY=3 OUTBOX_BATCH_SIZE=200 docker compose --profile app up -d --wait --force-recreate wallet
   ```
 
-  값을 바꾸지 않은 다른 서비스는 그대로 둡니다. 같은 셸에서 이어 잴 때는 `export`로 값을 유지합니다(값 없이 `up`하면 기본값 1·50으로 다시 만들어짐).
+  값을 바꾸지 않은 다른 서비스는 그대로 둡니다. 같은 셸에서 이어 잴 때는 `export`로 값을 유지합니다(값 없이 `up`하면 기본값 3·500으로 다시 만들어짐).
 
 ### Mock 은행 실행 조건
 
@@ -235,7 +235,7 @@ Mock 은행이 출금 2xx 응답을 비율만큼 처리·커밋한 뒤 500으로
 - 볼 값은 `fault.recoveredCharges`와 `fault.recoveredLatencyMs`입니다.
 - 꺼짐에서는 Mock 은행이 재시작되며 카운터가 0이 되므로 은행 호출 수(`fault.bankWithdrawalCalls`, `services.mock-bank`)는 쓰지 않습니다.
 
-**결과 (2026-11-11, 각 1회).** 기준선은 개선 전 지갑 jar, 개선 후는 복구 스케줄러가 쌓인 만큼 처리하고 장애 단계만 멈추는 지갑 jar입니다. 두 경우 모두 지갑은 기본값(동시성 1, Outbox batch-size 50), 초당 20건 2,400건, 접수 시작 30초 뒤 60초 장애입니다. 기준선의 꺼짐은 정리에 약 24분 걸려 `--drain-timeout 3600`이 필요합니다.
+**결과 (2026-11-11, 각 1회).** 기준선은 개선 전 지갑 jar, 개선 후는 복구 스케줄러가 쌓인 만큼 처리하고 장애 단계만 멈추는 지갑 jar입니다. 두 경우 모두 지갑은 동시성 1·Outbox batch-size 50(당시 기본값)이고, 초당 20건 2,400건, 접수 시작 30초 뒤 60초 장애입니다. 기준선의 꺼짐은 정리에 약 24분 걸려 `--drain-timeout 3600`이 필요합니다.
 
 | 장애 | 기준선 | 개선 후 |
 | --- | --- | --- |
@@ -403,6 +403,143 @@ k6 결과 파일이 없거나 JSON이 아니거나 필수 필드가 빠지면 �
 - Postgres 컨테이너 이름·관리자 계정은 `PG_CONTAINER`(기본 `travelpay-local-postgres-1`, 측정 환경은 `travelpay-charge-load-test-measure-postgres-1`), `POSTGRES_USER`(기본 `travelpay_admin`), `POSTGRES_DB`(기본 `travelpay`) 환경 변수로 바꿉니다. 사전 확인·지표·정합성은 psql이 필요하고, 1초 DB 표본만 실패하면 `db.error`로 남기고 계속합니다.
 - 업무 주소는 `USER_URL`, `WALLET_URL`, `LEDGER_URL`, `MOCK_BANK_URL`(k6는 `BASE_URL`, 기본 `http://wallet:8082`), health·지표 주소는 `USER_METRICS_URL`, `WALLET_METRICS_URL`, `LEDGER_METRICS_URL`, `MOCK_BANK_METRICS_URL`(지정하지 않으면 업무 주소와 같음)로 바꿉니다.
 
+## 측정 결과 (2026-11-13, 기본 설정 변경: Outbox batch·컨슈머 동시성)
+
+#328에서 컨슈머 동시성 기본값을 1 → 3, Outbox batch-size 기본값을 200 → 500으로 바꾸고, 지갑에 JDBC batch(`hibernate.jdbc.batch_size: 50`)를 켠 근거입니다. 앞서 Outbox batch 기본값을 50 → 200으로 바꾼 근거도 함께 적습니다.
+
+### 공통 조건
+
+- 이 문서 1절 구성(앱까지 Docker), 격리 수준 조회 제거(#306) 후 코드
+- 절차: 앱 4개를 `--force-recreate`로 새로 띄움 → 예열 100건 → 같은 조건 5회 → **3~5회차 중앙값**
+- 앱을 새로 띄운 뒤 1~2회차는 예열이 덜 돼 느렸습니다. 1회차는 대부분 `recoveredCharges`가 0이 아니어서(큐에서 30초 넘게 기다린 충전을 복구 스케줄러가 처리) 처리량 비교에서 뺐습니다.
+
+### Outbox batch 50 vs 200 (동시성 1, 초당 150건, 3,000건)
+
+| 지표 | batch 50 | batch 200 |
+| --- | --- | --- |
+| 완료 처리량 (3회 범위) | 53.74건/초 (51.78~53.87) | 84.17건/초 (83.25~85.11) |
+| 완료 지연 P50 / P95 | 20.9 / 35.1초 | 8.35 / 16.67초 |
+| Outbox 대기 평균 / 최대 | 1,055 / 1,979건 | 40 / 147건 |
+| 복구 스케줄러가 처리한 충전 | 351~664건 (모든 회차) | 0 |
+
+- batch 50의 최대 대기 약 2,000건은 (150 − 50)건/초 × 접수 20초와 맞습니다. 기본 설정의 첫 병목은 Outbox 발행 상한이었습니다.
+- batch 50에서는 Outbox에서 30초 넘게 기다린 정상 충전을 복구 스케줄러가 Kafka를 거치지 않고 처리했습니다. 처리량이 이론 상한(초당 50건)을 조금 넘은 것도 이 우회 처리 때문입니다. 이 회차들은 그 현상 자체가 확인 대상이라 빼지 않았습니다.
+
+### 동시성 3 (초당 300건, 6,000건)
+
+| 조건 | 완료 처리량 (3회 범위) | 완료 지연 P50 / P95 | Outbox 대기 평균 |
+| --- | --- | --- | --- |
+| 동시성 1 · batch 200 (위 표) | 84.17건/초 | 8.35 / 16.67초 | 40건 |
+| 동시성 3 · batch 200 | 188.26건/초 (187.84~188.81) | 6.26 / 11.20초 | 1,086건 |
+| 동시성 3 · batch 500 | 221.56건/초 (220.66~225.36) | 3.97 / 6.51초 | 116건 |
+
+- 동시성 3에서 batch 200은 Outbox가 다시 병목이었습니다. 200이 아니라 약 188인 건 발행 주기가 "이전 주기 종료 후 1초"라 발행 시간만큼 한 주기가 길어지기 때문으로 봅니다(추정).
+- 동시성 1 · batch 200과 동시성 3 · batch 500은 둘 다 Outbox 대기가 작아 컨슈머 한도끼리의 비교입니다. 약 2.63배, 선형(3배)의 약 88%입니다.
+
+### 운영과 같은 커넥션 풀 5
+
+운영 task definition은 `SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE = "5"`입니다. 측정 환경은 풀 크기를 정하지 않아 Hikari 기본값으로 쟀으므로, 풀 5로 다시 쟀습니다.
+
+```bash
+export APP_JAVA_OPTS="-Xmx1g -Dspring.datasource.hikari.maximum-pool-size=5"
+docker compose --profile app up -d --wait --force-recreate user ledger mock-bank wallet
+curl -s 127.0.0.1:19082/actuator/prometheus | grep hikaricp_connections_max   # 5.0 확인
+```
+
+`APP_JAVA_OPTS`는 앱 4개 모두에 들어가 원장 등도 풀 5가 됩니다. 측정 뒤 `unset APP_JAVA_OPTS`로 되돌립니다.
+
+| 조건 (동시성 3 · batch 500) | 완료 처리량 (3회 범위) | 완료 지연 P50 / P95 | 지갑 커넥션 대기 / 사용 최대 |
+| --- | --- | --- | --- |
+| 풀 기본값 | 221.56건/초 (220.66~225.36) | 3.97 / 6.51초 | 0 / 3~4 |
+| 풀 5 | 216.51건/초 (215.64~218.68) | 4.03 / 7.04초 | 0 / 3~4 |
+| 풀 5 + JDBC batch 50 | 220.87건/초 (217.95~221.01) | 4.07 / 6.64초 | 0 / - |
+
+- 풀 5에서도 커넥션 대기는 0이었습니다. 컨슈머 3 + 스케줄러 3이면 이론상 6개까지 겹칠 수 있지만, 실행기가 은행·원장 호출을 트랜잭션 밖에서 하고 상태 변경만 짧게 잡아 측정 최대는 4였습니다.
+- JDBC batch 전후 차이(+2.0%)는 범위가 겹쳐 처리량 변화로 보지 않습니다. JDBC batch의 목적은 처리량이 아니라 아래 Kafka 정지·DB 지연 때의 여유입니다.
+
+### 은행 붙잡기 (동시성 3, 서킷 켬)
+
+[은행별 붙잡기 측정](#은행별-붙잡기-측정-한-은행만-멈춤)과 같은 조건(004·088 반반, 초당 20건 2,400건, 접수 30초 뒤 004만 60초 붙잡기, 지연 10초)입니다. 조건마다 1회입니다.
+
+| 지표 | 동시성 1 (11/11) | 동시성 3 | 동시성 3 · 풀 5 |
+| --- | --- | --- | --- |
+| 서킷 열린 시각 | 붙잡기 25.3초 뒤 | 10.6초 뒤 | 10.6초 뒤 |
+| 088 완료 지연 P50 / P95 | 0.92 / 22.0초 | 0.65 / 5.56초 | 0.66 / 5.47초 |
+| 004 완료 지연 P50 / P95 | 34.1 / 64.8초 | 32.1 / 61.7초 | 33.1 / 63.8초 |
+| 붙잡힌 은행에 보낸 출금(`heldCount`) | 7 | 9 | 9 |
+| 복구로 끝난 충전 | 658 | 657 | 658 |
+| 지갑 커넥션 대기 | - | - | 0 (사용 최대 2) |
+
+- 감지 시간은 계산과 맞습니다. 결과 모름 5번이 쌓여야 열리고 붙잡힌 호출은 한 번에 약 5초(읽기 제한)라, 동시성 1이면 5 × 5초 ≈ 25초, 동시성 3이면 3개씩 2바퀴 × 5초 ≈ 10초입니다.
+- 동시성 3에서도 반열림 때마다 시험 호출은 1건만 나갔습니다(OPEN → 10초 → HALF_OPEN → 약 5.2초 → OPEN이 3번 반복, 지갑 로그).
+- 동시성 1과의 비교는 동시성 외에 Outbox batch(50 → 500)와 그 사이 머지된 코드도 다릅니다. 초당 20건이라 batch 영향은 작다고 봅니다(추정).
+
+### Kafka 정지 시 Outbox 한 주기
+
+한 주기 소요 시간을 남기는 로그가 없어, Kafka를 멈춘 동안 미발행 이벤트의 `retry_count` 합계가 batch 크기만큼 오르는 간격으로 쟀습니다(발행 주기는 "이전 주기 종료 후 1초").
+
+```bash
+docker compose pause measure-kafka
+python measure.py kafka-pause-b500 --count 1000 --rate 100 --concurrency 3 --drain-timeout 900
+# 다른 셸에서 1초마다
+docker exec $PG_CONTAINER psql -U travelpay_admin -d travelpay -At -c \
+  "select now()::time(3), count(*), coalesce(sum(retry_count),0) from wallet_service.outbox_events where status='PENDING';"
+docker compose unpause measure-kafka
+```
+
+| batch | 평균 주기 | 발행 작업 (1초 대기 제외) |
+| --- | --- | --- |
+| 200 (PENDING 400건, 8주기) | 약 4.0초 | 약 3.0초 |
+| 500 (PENDING 1,000건, 6주기) | 약 4.1초 | 약 3.1초 |
+
+- 조회 간격(약 1.3초) 때문에 평균 주기에는 약 ±0.3~0.4초 오차가 있습니다.
+- batch 크기와 관계없이 첫 전송이 `max.block.ms`(3초)를 기다린 뒤 나머지는 전송 예산(3초)이 지나 바로 실패하는 구조라, 10초 트랜잭션 제한 대비 약 7초 여유가 남습니다.
+- Kafka를 다시 켜자 이미 복구 스케줄러가 끝낸 충전 1,400건(batch 200 400건, batch 500 1,000건)에 이벤트가 늦게 도착했지만 충전 상태와 은행 출금은 바뀌지 않았습니다. 측정 DB 전체에서 은행 출금 성공 141,540건이 끝난 충전 141,540건과 출금 요청 ID로 하나씩 맞았고, 충전에 연결되지 않은 출금은 0건이었습니다.
+
+### 한계
+
+- 운영 브로커의 실제 토픽 파티션 수는 직접 조회하지 않았습니다(브로커 자동 생성이 꺼져 있고 지갑이 NewTopic으로 3을 선언).
+- DB 지연 상황은 재현할 방법이 없어 재지 않았습니다. 응답 대기가 상한(8초)까지 걸리는 최악의 경우, JDBC batch 없이 UPDATE가 행마다 나가면 한 건 약 4ms(batch 500 기준)가 10초 제한의 문턱이었습니다. JDBC batch 50이면 500건이 10번으로 묶이므로 batch 한 번 왕복이 약 200ms를 넘어야 같은 상황이 됩니다(batch당 왕복 1회 전제, 추정).
+- DB 서버 자체가 느려 10초를 넘기면 롤백되고, `retry_count` 증가도 롤백되어 같은 행이 다음 주기에 다시 선택될 수 있습니다. JDBC batch로는 없어지지 않는 위험이라 후속 과제로 남깁니다.
+- 노트북 한 대의 Docker 안에서 잰 값이라 절대 수치는 배포 환경과 다릅니다.
+
+## 측정 결과 (2026-11-13, 격리 수준 조회 제거)
+
+### 무엇을 바꿨나
+
+트랜잭션마다 `isolation = READ_COMMITTED`를 명시해, 트랜잭션을 시작할 때마다 Spring이 격리 수준을 조회하고 드라이버가 `SHOW TRANSACTION ISOLATION LEVEL`을 보냈습니다. 명시를 빼고 격리 수준은 Hikari 커넥션 설정(`spring.datasource.hikari.transaction-isolation: TRANSACTION_READ_COMMITTED`)으로 옮겼습니다. 격리 수준은 그대로 READ COMMITTED입니다(#306).
+
+### 조건
+
+- 이 문서 1절 구성(앱까지 Docker), 동시성 1, 초당 150건, 3,000건, Outbox batch-size 200 (A' 조건)
+- 원장 JDBC batch(#294) 적용 후 같은 날 개선 전·후를 모두 다시 잼
+- 절차: 앱 4개를 `--force-recreate`로 새로 띄움 → 예열 100건 → 5회 → **3~5회차 중앙값**
+- SQL 횟수: `pg_stat_statements_reset()` 뒤 초당 50건 1,000건을 따로 재고 `wallet_app` 문장 수 ÷ 1,000
+
+앱을 새로 띄운 뒤 1회차는 완료 지연 P95가 30초를 넘어 복구 스케줄러가 큐에서 기다린 충전을 처리했고(`recoveredCharges` 15~117건), 2회차도 예열이 덜 돼 느렸습니다. 개선 전·후 모두 같은 패턴이라 두 회차를 빼고 비교합니다.
+
+### 결과
+
+| 지표 | 개선 전 | 개선 후 |
+| --- | --- | --- |
+| 건당 `SHOW TRANSACTION ISOLATION LEVEL` | 9.19 | 0 |
+| 격리 수준 SET 문장 | - | 0 (트랜잭션마다 나가지 않음) |
+| `BEGIN READ ONLY` / `BEGIN` | 6.05 / 4.15 | 6.04 / 4.12 |
+| 완료 처리량 (3회 범위) | 82.45건/초 (80.62~83.78) | 84.17건/초 (83.25~85.11) |
+| 완료 지연 P50 / P95 | 8.55 / 16.76초 | 8.35 / 16.67초 |
+| 정합성 | 모두 COMPLETED, 대사 어긋남 0 | 모두 COMPLETED, 대사 어긋남 0 |
+
+### 해석
+
+- 건당 격리 수준 조회 9번이 사라졌습니다(코드 기준 컨슈머 왕복 25 → 18).
+- 처리량 차이(+2.1%)는 개선 전 회차 편차(약 3.9%) 안이고 두 범위가 겹쳐, **처리량 개선으로 보지 않습니다.**
+- 같은 Docker 네트워크 안에서는 왕복 한 번이 짧아, 9번을 줄여도 한 건 시간(약 12ms)에 드러나지 않은 것으로 봅니다(추정).
+
+### 한계
+
+- 서비스와 DB가 다른 서버에 있는 배포 환경에서는 왕복이 더 길어 효과가 클 수 있지만 재지 않았습니다.
+- 각 조건 5회 중 3회만 비교에 썼습니다.
+
 ## 측정 결과 (2026-11-10, 앱까지 Docker)
 
 ### 조건
@@ -463,6 +600,8 @@ A'의 서비스 수치는 `a2-r2` 한 회차 값이고, 지갑 자체 시간은 
 | `SHOW TRANSACTION ISOLATION LEVEL` | 9.16 | 9 (접수 2 + 컨슈머 7) |
 | 트랜잭션 시작 (`BEGIN READ ONLY` 6 + `BEGIN` 4) | 10.16 | 10 |
 
+> 2026-11-13에 격리 수준 명시를 Hikari 커넥션 설정으로 옮겨 `SHOW TRANSACTION ISOLATION LEVEL`은 건당 0번이 됐습니다(#306, [측정 결과 (2026-11-13)](#측정-결과-2026-11-13-격리-수준-조회-제거)).
+
 소수점 아래는 측정 중 1초마다 도는 Outbox 발행기의 배경 쿼리입니다. 표에 없는 두 가지는 왕복 계산에서 뺐습니다: 외래 키 확인으로 Postgres 안에서 실행된 `SELECT … FOR KEY SHARE`(건당 5, `track=all`이라 내부 쿼리까지 잡힘)는 네트워크 왕복이 아니고, `BEGIN`은 드라이버가 첫 쿼리와 한 번에 보냅니다. `COMMIT`은 이 통계에 거의 잡히지 않아(원인 미확인) 트랜잭션 수로 대신 셌습니다.
 
 **남은 8.2ms**: 앱↔DB 왕복, 트랜잭션 처리, Feign 호출, 직렬화 같은 비용이 섞여 있습니다. 이 중 앱↔DB 왕복이 차지하는 몫은 지갑 환경에서 재지 않았습니다. CPU 7%라 자원 부족이 아니라 한 스레드가 단계를 차례로 기다리는 구조의 한계는 그대로입니다.
@@ -483,7 +622,7 @@ A'의 서비스 수치는 `a2-r2` 한 회차 값이고, 지갑 자체 시간은 
 
 | 후보 | 건당 왕복 | 근거 | 판단 |
 | --- | --- | --- | --- |
-| 격리 수준 명시로 생기는 `SHOW TRANSACTION ISOLATION LEVEL` | 7번 | Postgres 로그로 발생 확인. 기본값이 이미 READ COMMITTED라 명시를 빼면 사라짐 | 변경은 작지만 모든 트랜잭션 설정에 걸쳐 있어 별도 작업 |
+| 격리 수준 명시로 생기는 `SHOW TRANSACTION ISOLATION LEVEL` | 7번 | Postgres 로그로 발생 확인. 기본값이 이미 READ COMMITTED라 명시를 빼면 사라짐 | **구현함(#306)**. 건당 9.19 → 0번. 처리량 차이는 회차 편차 안 ([2026-11-13 결과](#측정-결과-2026-11-13-격리-수준-조회-제거)) |
 | 단계마다 다시 읽는 조회 전용 트랜잭션 | 약 8번 | 코드 경로 분석 | 실행기 구조 변경 |
 | 레코드마다 동기 오프셋 커밋 | 1번 | `AckMode.RECORD`, 동기 커밋 기본값 | 배치 커밋이면 줄지만 재전달 범위가 넓어짐(실행기가 멱등이라 정합성은 안전) |
 | Outbox batch-size 기본값 | | 이 환경에서는 동시성 1로도 기본 상한(초당 50건)을 넘음 | 동시성을 올리지 않아도 검토 대상 |
@@ -572,7 +711,7 @@ A·B·C는 3회 중앙값이고, 기준선의 서비스 수치는 `c1-r1`, ①�
 
 | 후보 | 근거 | 판단 |
 | --- | --- | --- |
-| 운영 컨슈머 동시성을 1보다 크게 | 동시성 3까지 거의 선형 확장, 정합성 유지 | 트래픽 규모가 정해지면 결정. 이 측정이 판단 근거 |
-| Outbox batch-size·주기 조정 | 기본값(1초 50건)이 처리량 상한이었음 | 동시성을 올릴 때 함께 올려야 함 |
+| 운영 컨슈머 동시성을 1보다 크게 | 동시성 3까지 거의 선형 확장, 정합성 유지 | **처리(#328)**: 기본 동시성 3 |
+| Outbox batch-size·주기 조정 | 기본값(1초 50건)이 처리량 상한이었음 | **batch-size만 처리(#328)**: 기본 500. 주기(1초)는 그대로 |
 | 지갑 SAGA 내부 시간 분해 | 한 건 시간의 약 70% | 단계별 타이머 지표를 추가해 상태 전이 커밋과 오프셋 커밋 중 큰 쪽을 확인한 뒤 판단 |
 | 원장 시스템 계정 경합 대응(계정 분할 등) | 동시성 10에서 경합 시작 | 원장 설계 변경이고 아직 병목이 아니라 보류 |

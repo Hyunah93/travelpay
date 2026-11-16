@@ -31,6 +31,8 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -265,6 +267,25 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
         Map<String, Object> row = settlementRow(settlement.getId());
         assertEquals("PAID", row.get("status"));
         assertEquals(ledgerTransactionId, row.get("ledger_transaction_id"));
+        assertNotNull(row.get("paid_at"));
+    }
+
+    // 한 트랜잭션에서 제약 위반이 나면 이후 문장이 실행되지 않아 경우마다 테스트를 나눔
+    @Test
+    void paidWithoutPaidAtIsRejected() {
+        Settlement requested = saveSettlement("key-" + UUID.randomUUID());
+
+        assertThrows(DataIntegrityViolationException.class, () -> jdbcTemplate.update(
+                "update settlements set status = 'PAID', ledger_transaction_id = ? where id = ?",
+                UUID.randomUUID(), requested.getId()));
+    }
+
+    @Test
+    void paidAtWithoutPaidIsRejected() {
+        Settlement requested = saveSettlement("key-" + UUID.randomUUID());
+
+        assertThrows(DataIntegrityViolationException.class, () -> jdbcTemplate.update(
+                "update settlements set paid_at = now() where id = ?", requested.getId()));
     }
 
     @Test
@@ -275,11 +296,58 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
         setTimestamps(newer.getId(), "2026-11-02T00:00:00Z", 0);
         entityManager.clear();
 
-        List<UUID> ids = settlementRepository.findPageByMerchantId(merchantId,
+        List<UUID> ids = settlementRepository.findPageByMerchantId(merchantId, null,
                         PageRequest.of(0, 20, Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id"))))
                 .map(Settlement::getId).getContent();
 
         assertEquals(List.of(newer.getId(), older.getId()), ids);
+    }
+
+    @Test
+    void merchantSettlementsCanBeFilteredByStatus() {
+        Settlement paid = saveSettlement("key-" + UUID.randomUUID());
+        Settlement requested = saveSettlement("key-" + UUID.randomUUID());
+        paid.paid(UUID.randomUUID());
+        settlementRepository.save(paid);
+        entityManager.flush();
+        entityManager.clear();
+
+        List<UUID> paidIds = settlementRepository.findPageByMerchantId(merchantId, SettlementStatus.PAID,
+                        PageRequest.of(0, 20))
+                .map(Settlement::getId).getContent();
+        List<UUID> requestedIds = settlementRepository.findPageByMerchantId(merchantId, SettlementStatus.REQUESTED,
+                        PageRequest.of(0, 20))
+                .map(Settlement::getId).getContent();
+
+        assertEquals(List.of(paid.getId()), paidIds);
+        assertEquals(List.of(requested.getId()), requestedIds);
+    }
+
+    @Test
+    void ownerSettlementsSpanMerchantsNewestFirstAndCanBeFilteredByStatus() {
+        UUID ownerUserId = UUID.randomUUID();
+        UUID otherMerchantId = merchantRepository.save(
+                Merchant.create("정산 가맹점 2", CurrencyCode.KRW, ownerUserId)).getId();
+        Settlement older = saveSettlement(merchantId, ownerUserId, "key-" + UUID.randomUUID());
+        Settlement newer = saveSettlement(otherMerchantId, ownerUserId, "key-" + UUID.randomUUID());
+        saveSettlement(merchantId, UUID.randomUUID(), "key-" + UUID.randomUUID());   // 다른 주인 → 빠짐
+        newer.paid(UUID.randomUUID());
+        settlementRepository.save(newer);
+        entityManager.flush();
+        setTimestamps(older.getId(), "2026-11-01T00:00:00Z", 0);
+        setTimestamps(newer.getId(), "2026-11-02T00:00:00Z", 0);
+        entityManager.clear();
+        PageRequest newestFirst = PageRequest.of(0, 20,
+                Sort.by(Sort.Order.desc("createdAt"), Sort.Order.desc("id")));
+
+        List<UUID> all = settlementRepository.findPageByOwnerUserId(ownerUserId, null, newestFirst)
+                .map(Settlement::getId).getContent();
+        List<UUID> paidOnly = settlementRepository.findPageByOwnerUserId(ownerUserId, SettlementStatus.PAID,
+                        newestFirst)
+                .map(Settlement::getId).getContent();
+
+        assertEquals(List.of(newer.getId(), older.getId()), all);
+        assertEquals(List.of(newer.getId()), paidOnly);
     }
 
     // 복구
@@ -295,16 +363,26 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
         setTimestamps(waiting.getId(), "2026-11-07T00:09:00Z", 3);
         setTimestamps(backedOff.getId(), "2026-11-07T00:07:00Z", 3);
         setTimestamps(paid.getId(), "2026-11-07T00:00:00Z", 0);
-        jdbcTemplate.update("update settlements set status = 'PAID', ledger_transaction_id = ? where id = ?",
-                UUID.randomUUID(), paid.getId());
+        jdbcTemplate.update("update settlements set status = 'PAID', ledger_transaction_id = ?, paid_at = now() "
+                + "where id = ?", UUID.randomUUID(), paid.getId());
 
-        List<UUID> ids = settlementRepository.findRecoveryTargets(now, 100).stream()
-                .map(Settlement::getId).toList();
+        // 운영의 복구는 트랜잭션 밖에서 새로 읽음. 테스트 트랜잭션에 남은 엔티티 대신 선점 결과를 받도록 비움
+        entityManager.flush();
+        entityManager.clear();
+        Instant claimedAt = Instant.parse("2026-11-07T00:10:01Z");
+        List<Settlement> claimed = settlementRepository.claimRecoveryTargets(now, claimedAt, 100);
+        List<UUID> ids = claimed.stream().map(Settlement::getId).toList();
 
         assertTrue(ids.contains(firstRetry.getId()));
         assertTrue(ids.contains(backedOff.getId()));
         assertFalse(ids.contains(waiting.getId()));
         assertFalse(ids.contains(paid.getId()));
+        // 선점한 건은 수정 시각이 선점 시각으로 바뀌어 반환되고, 같은 시각 기준으로 다시 선점해도 나오지 않음
+        assertTrue(claimed.stream().allMatch(s -> s.getUpdatedAt().equals(claimedAt)));
+        assertEquals(Timestamp.from(claimedAt), jdbcTemplate.queryForObject(
+                "select updated_at from settlements where id = ?", Timestamp.class, firstRetry.getId()));
+        assertFalse(settlementRepository.claimRecoveryTargets(now, claimedAt, 100).stream()
+                .anyMatch(s -> ids.contains(s.getId())));
     }
 
     @Test
@@ -342,7 +420,7 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
         assertEquals("MANUAL_REVIEW", row.get("status"));
         assertEquals("RETRY_EXHAUSTED", row.get("review_reason"));
         assertEquals(5, row.get("attempt_count"));
-        assertFalse(settlementRepository.findRecoveryTargets(now.plus(Duration.ofDays(1)), 1000).stream()
+        assertFalse(settlementRepository.claimRecoveryTargets(now.plus(Duration.ofDays(1)), now, 1000).stream()
                 .anyMatch(target -> target.getId().equals(settlement.getId())));
     }
 
@@ -350,8 +428,8 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
     void markManualReviewOnlyChangesRequestedSettlement() {
         Settlement requested = saveSettlement("key-" + UUID.randomUUID());
         Settlement paid = saveSettlement("key-" + UUID.randomUUID());
-        jdbcTemplate.update("update settlements set status = 'PAID', ledger_transaction_id = ? where id = ?",
-                UUID.randomUUID(), paid.getId());
+        jdbcTemplate.update("update settlements set status = 'PAID', ledger_transaction_id = ?, paid_at = now() "
+                + "where id = ?", UUID.randomUUID(), paid.getId());
         Instant now = Instant.parse("2026-11-07T00:00:00Z");
 
         assertEquals(1, settlementRepository.markManualReview(requested.getId(),
@@ -437,6 +515,53 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
                 UUID.randomUUID(), settlement.getId(), UUID.randomUUID()));
     }
 
+    // 자동 처리 기록은 처리한 회원 없이 SYSTEM으로 남음
+    @Test
+    void systemResolutionIsStoredWithoutActor() {
+        Settlement settlement = saveSettlement("key-" + UUID.randomUUID());
+        SettlementReviewResolution resolution = SettlementReviewResolution.ofSystem(
+                settlement.getId(), SettlementReviewReason.RETRY_EXHAUSTED, ReviewLedgerStatus.POSTED,
+                UUID.randomUUID(), SettlementStatus.PAID, "자동 처리: 재시도 한도 초과, 원장 반영 확인 → 정산 지급");
+        resolutionRepository.save(resolution);
+        entityManager.flush();
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "select actor_type, actor_id, memo from settlement_review_resolutions where id = ?", resolution.getId());
+        assertEquals("SYSTEM", row.get("actor_type"));
+        assertNull(row.get("actor_id"));
+        assertNull(row.get("memo"));
+    }
+
+    @Test
+    void operatorResolutionRequiresActor() {
+        Settlement settlement = saveSettlement("key-" + UUID.randomUUID());
+
+        assertThrows(DataIntegrityViolationException.class, () -> jdbcTemplate.update(
+                "insert into settlement_review_resolutions (id, settlement_id, review_reason, ledger_status, "
+                        + "ledger_transaction_id, to_status, actor_type, actor_id, description, created_at) "
+                        + "values (?, ?, 'RETRY_EXHAUSTED', 'NOT_FOUND', null, 'FAILED', 'OPERATOR', null, '설명', now())",
+                UUID.randomUUID(), settlement.getId()));
+    }
+
+    // 자동 처리 대상: MANUAL_REVIEW로 바뀐 지 기준 시각이 지난 정산만, (생성 시각, ID) 커서로 이어서
+    @Test
+    void manualReviewsAfterCursorSkipsRecentAndContinuesFromCursor() {
+        Instant now = Instant.now();
+        Settlement first = manualReviewSettlementAt("2001-01-01T00:00:01Z", "2001-01-01T00:00:01Z");
+        Settlement recent = manualReviewSettlementAt("2001-01-01T00:00:01.5Z", now.toString());
+        Settlement second = manualReviewSettlementAt("2001-01-01T00:00:02Z", "2001-01-01T00:00:02Z");
+        Instant updatedBefore = now.minusSeconds(60);
+
+        List<Settlement> page1 = settlementRepository.findManualReviewsAfter(updatedBefore, Instant.EPOCH,
+                new UUID(0L, 0L), 1);
+        assertEquals(List.of(first.getId()), page1.stream().map(Settlement::getId).toList());
+
+        List<Settlement> page2 = settlementRepository.findManualReviewsAfter(updatedBefore,
+                page1.get(0).getCreatedAt(), page1.get(0).getId(), 1);
+        assertEquals(List.of(second.getId()), page2.stream().map(Settlement::getId).toList());
+        assertFalse(page2.stream().map(Settlement::getId).toList().contains(recent.getId()));
+    }
+
     @Test
     void requestedSettlementsCreatedBeforeAreCounted() {
         Settlement old = saveSettlement("key-" + UUID.randomUUID());
@@ -491,10 +616,23 @@ class SettlementRepositoryIntegrationTest extends PostgresContainerSupport {
     }
 
     private Settlement saveSettlement(String idempotencyKey) {
+        return saveSettlement(merchantId, UUID.randomUUID(), idempotencyKey);
+    }
+
+    private Settlement saveSettlement(UUID merchantId, UUID ownerUserId, String idempotencyKey) {
         Settlement settlement = settlementRepository.save(Settlement.request(merchantId, UUID.randomUUID(),
-                idempotencyKey, UUID.randomUUID(), UUID.randomUUID(), CurrencyCode.KRW, 10_000L, CUTOFF));
+                idempotencyKey, ownerUserId, UUID.randomUUID(), CurrencyCode.KRW, 10_000L, CUTOFF));
         entityManager.flush();
         return settlement;
+    }
+
+    private Settlement manualReviewSettlementAt(String createdAt, String updatedAt) {
+        Settlement settlement = saveSettlement("key-" + UUID.randomUUID());
+        jdbcTemplate.update("update settlements set status = 'MANUAL_REVIEW', review_reason = 'RETRY_EXHAUSTED', "
+                        + "created_at = cast(? as timestamptz), updated_at = cast(? as timestamptz) where id = ?",
+                createdAt, updatedAt, settlement.getId());
+        entityManager.clear();
+        return settlementRepository.findById(settlement.getId()).orElseThrow();
     }
 
     private void setTimestamps(UUID settlementId, String at, int attemptCount) {

@@ -30,6 +30,33 @@ loki.source.docker "development" {
 	forward_to    = [loki.write.local.receiver]
 }
 
+// 명시적으로 표시한 부하 시험 컨테이너만 수집합니다. 다른 Compose 프로젝트는 포함하지 않습니다.
+discovery.docker "load_test" {
+	host             = "unix:///var/run/docker.sock"
+	refresh_interval = "15s"
+	filter {
+		name   = "label"
+		values = ["io.travelpay.logs=load-test"]
+	}
+}
+
+discovery.relabel "load_test_service" {
+	targets = []
+	rule {
+		source_labels = ["__meta_docker_container_label_io_travelpay_service"]
+		target_label  = "service_name"
+	}
+}
+
+loki.source.docker "load_test_local" {
+	host          = "unix:///var/run/docker.sock"
+	targets       = discovery.docker.load_test.targets
+	// 기존 로컬 Docker 로그 분류를 재사용하므로 공용·운영 대시보드 원본은 바꾸지 않습니다.
+	labels        = {job = "docker-local", environment = "load-test"}
+	relabel_rules = discovery.relabel.load_test_service.rules
+	forward_to    = [loki.write.local.receiver]
+}
+
 // Spring Boot 로그 파일 탐색
 local.file_match "spring_jvm" {
 	path_targets = [{

@@ -955,7 +955,7 @@
     {
       "id": 15,
       "title": "User 세션 호출 시간",
-      "description": "검증은 User 서비스가 Redis 세션과 회원 DB를 확인해 수행합니다. 이 패널은 Gateway의 WebClient가 기록한 세션 확인 API(I01)의 평균 HTTP 호출 시간입니다. 네트워크·User 응답 대기를 포함하며 User 내부 검증 시간이나 Redis 명령 시간만을 측정한 값은 아닙니다. Service에 gateway를 포함해야 표시됩니다.",
+      "description": "검증은 User 서비스가 Redis 세션과 회원 DB를 확인해 수행합니다. 이 패널은 Gateway의 WebClient가 기록한 세션 확인 API의 평균 HTTP 호출 시간입니다. 네트워크·User 응답 대기를 포함하며 User 내부 검증 시간이나 Redis 명령 시간만을 측정한 값은 아닙니다. Service에 gateway를 포함해야 표시됩니다.",
       "type": "timeseries",
       "gridPos": {
         "x": 0,
@@ -971,7 +971,7 @@
         {
           "refId": "A",
           "expr": "sum by (environment, service) (rate(http_client_requests_seconds_sum{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\",client_name=\"user-service\"}[$__rate_interval])) / (sum by (environment, service) (rate(http_client_requests_seconds_count{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\",client_name=\"user-service\"}[$__rate_interval])) > 0)",
-          "legendFormat": "{{service}} → User I01"
+          "legendFormat": "{{service}} → User 세션 확인 API"
         }
       ],
       "fieldConfig": {
@@ -1041,13 +1041,253 @@
       }
     },
     {
+      "id": 109,
+      "type": "row",
+      "title": "서킷 브레이커·장애 차단",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 20,
+      "title": "서킷 상태",
+      "description": "서비스별 Resilience4j 서킷 상태입니다. 닫힘은 호출 허용, 열림은 호출 차단, 반열림은 회복 시험 호출 중입니다. 비활성·계측만은 호출을 차단하지 않는 모드입니다. 여러 Task가 공존하면 보호 해제(계측만·비활성), 열림, 반열림, 닫힘 순으로 우선 표시하며 서로 다른 Task의 상태 값을 더하지 않습니다. Gateway는 세션 확인 API, Wallet은 은행별, Payment·Exchange는 원장 호출 서킷입니다. 강제 열림도 열림으로 표시합니다. 짧은 열림은 15초 수집 주기 사이에 지나갈 수 있어 거절 횟수 패널을 함께 봅니다. User에는 서킷이 없고 User로 가는 세션 확인 서킷은 gateway에 있으므로, 서킷이 있는 서비스(gateway·wallet-service·payment-service·exchange-service)를 골라야 표시됩니다. Wallet의 은행 서킷은 그 은행을 처음 호출할 때 생기므로 배포 직후에는 없을 수 있습니다. 표시할 서킷이 없으면 빈 결과가 'Data does not have a time field'로 보입니다.",
+      "type": "state-timeline",
+      "gridPos": {
+        "x": 0,
+        "y": 54,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-local"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (environment, service, name) ((0 * (resilience4j_circuitbreaker_state{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",state=\"closed\"} == 1)) or (1 * (resilience4j_circuitbreaker_state{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",state=\"half_open\"} == 1)) or (2 * (resilience4j_circuitbreaker_state{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",state=~\"open|forced_open\"} == 1)) or (3 * (resilience4j_circuitbreaker_state{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",state=\"disabled\"} == 1)) or (4 * (resilience4j_circuitbreaker_state{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",state=\"metrics_only\"} == 1)))",
+          "legendFormat": "{{service}} / {{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "닫힘",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "반열림",
+                  "color": "yellow",
+                  "index": 1
+                },
+                "2": {
+                  "text": "열림",
+                  "color": "red",
+                  "index": 2
+                },
+                "3": {
+                  "text": "비활성",
+                  "color": "red",
+                  "index": 3
+                },
+                "4": {
+                  "text": "계측만",
+                  "color": "red",
+                  "index": 4
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "서킷이 거절한 호출 (회/초)",
+      "description": "서킷이 열려 상대 서비스를 부르지 않고 바로 실패시킨 호출의 초당 증가율입니다. 0이 아니면 해당 상대 서비스가 장애 중이거나 막 회복하는 중입니다. 메트릭 환경·서비스 필터를 적용하며 API·HTTP 상태 필터는 적용하지 않습니다.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 54,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-local"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (environment, service, name) (rate(resilience4j_circuitbreaker_not_permitted_calls_total{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} / {{name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "세션 확인 동시 호출 상한 거절 (회/초)",
+      "description": "Gateway의 세션 확인 동시 호출 상한(100건)을 넘어 기다리지 않고 503을 준 요청의 초당 증가율입니다. 요청 급증이나 User 응답 지연 등으로 동시 호출이 상한에 닿았음을 뜻하며, 원인은 지연·CPU·DB 패널과 함께 확인합니다. Service에 gateway를 포함해야 표시됩니다.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 61,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-local"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (environment, service) (rate(session_verification_bulkhead_rejected_total{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\"}[$__rate_interval]))",
+          "legendFormat": "{{service}} → 세션 확인 API"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "title": "Gateway 업스트림 실패 원인 (회/초)",
+      "description": "Gateway가 업무 서비스·User 호출에 실패해 돌려준 502·503·504의 초당 증가율을 상태와 원인 예외별로 나눕니다. 503은 업무 요청을 보내기 전 실패(연결 불가·세션 확인 실패·서킷 열림 등)라 다시 시도해도 되고, 502·504는 보낸 뒤 실패라 이미 처리됐을 수 있습니다. 원인별 지표는 그 원인의 첫 실패 때 생기므로, 처음 실패가 생기기 전에는 No data이고 첫 실패 묶음은 증가율로 보이지 않을 수 있습니다.",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 61,
+        "w": 12,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-local"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (environment, service, status, cause) (rate(gateway_upstream_failures_total{job=\"spring-jvm\",environment=~\"${environment:regex}\",service=~\"${service:regex}\",service=\"gateway\"}[$__rate_interval]))",
+          "legendFormat": "{{status}} {{cause}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 106,
       "type": "row",
       "title": "비동기 처리",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 68,
         "w": 24,
         "h": 1
       },
@@ -1060,7 +1300,7 @@
       "type": "timeseries",
       "gridPos": {
         "x": 0,
-        "y": 54,
+        "y": 69,
         "w": 12,
         "h": 10
       },
@@ -1104,7 +1344,7 @@
       "type": "table",
       "gridPos": {
         "x": 12,
-        "y": 54,
+        "y": 69,
         "w": 12,
         "h": 10
       },
@@ -1174,7 +1414,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 64,
+        "y": 79,
         "w": 24,
         "h": 1
       },
@@ -1186,7 +1426,7 @@
       "type": "logs",
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 80,
         "w": 24,
         "h": 12
       },

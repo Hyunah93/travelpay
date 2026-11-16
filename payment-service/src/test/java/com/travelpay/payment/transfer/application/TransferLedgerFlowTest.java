@@ -204,6 +204,49 @@ class TransferLedgerFlowTest {
         assertEquals(3_000L, ledger.balance(TARGET_WALLET_ID));
     }
 
+    /**
+     * 원장 서킷이 열려 보내지 않은 송금은 PROCESSING(202)으로 두고 시도 횟수를 늘리지 않습니다. 원장에 닿지 않았으므로
+     * 재시도 한도(MANUAL_REVIEW)에 넣지 않고, 서킷이 닫힌 뒤 복구가 같은 reference로 완료합니다.
+     */
+    @Test
+    void keepsProcessingWithoutCountingAttemptWhenLedgerRequestIsNotSent() {
+        ledger.onRegister = request -> {
+            throw TransferLedgerException.notSent("원장 서킷 열림");
+        };
+        TransferResponse first = transferService.request(SENDER_ID, KEY, REQUEST);
+        assertEquals(TransferStatus.PROCESSING, first.status());
+        assertEquals(0, onlyTransfer().getAttemptCount());
+        verify(transferRepository, never()).recordUnknownAttempt(any(), anyInt(), any(), any(), any());
+        ledger.onRegister = ledger::apply;
+
+        int settled = transferService.recoverDue(farFuture(), 10);
+
+        assertEquals(1, settled);
+        assertEquals(TransferStatus.COMPLETED, onlyTransfer().getStatus());
+        assertEquals(7_000L, ledger.balance(SOURCE_WALLET_ID));
+    }
+
+    /** 복구 중 서킷이 열려 있으면 첫 건에서 주기를 멈춥니다. 남은 송금은 부르지 않고, 시도 횟수와 상태는 그대로입니다. */
+    @Test
+    void recoveryStopsCycleWithoutCountingAttemptsWhenCircuitIsOpen() {
+        Instant base = Instant.parse("2026-11-02T00:00:00Z");
+        Transfer first = staleProcessingTransfer("first-key", base);
+        Transfer second = staleProcessingTransfer("second-key", base.plusSeconds(10));
+        ledger.onRegister = request -> {
+            throw TransferLedgerException.notSent("원장 서킷 열림");
+        };
+
+        int settled = transferService.recoverDue(farFuture(), 10);
+
+        assertEquals(0, settled);
+        assertEquals(List.of(first.getId()), ledger.requests.stream().map(LedgerTransactionRequest::referenceId).toList());
+        assertEquals(TransferStatus.PROCESSING, first.getStatus());
+        assertEquals(TransferStatus.PROCESSING, second.getStatus());
+        assertEquals(first.getAttemptCount(), second.getAttemptCount());
+        verify(transferRepository, never()).recordUnknownAttempt(any(), anyInt(), any(), any(), any());
+        verify(transferRepository, never()).markManualReview(any(), any(), any());
+    }
+
     /** 원장이 요청을 받아들이지 않으면(409·400 등) FAILED로 단정하지 않고, 재시도 없이 MANUAL_REVIEW로 둡니다. */
     @Test
     void movesToManualReviewWithoutFailingWhenLedgerDoesNotAcceptRequest() {
@@ -576,11 +619,12 @@ class TransferLedgerFlowTest {
         assertEquals(2, ledger.requests.size());
     }
 
-    /** 다른 인스턴스가 먼저 선점한 송금(선점 UPDATE 0행)은 원장에 보내지 않습니다. */
+    /** 일괄 선점 뒤 다른 서버가 다시 선점한 송금(호출 직전 선점 확인 0행)은 원장에 보내지 않고, 시도 횟수도 그대로입니다. */
     @Test
-    void recoverySkipsTransferClaimedElsewhere() {
+    void recoverySkipsTransferReclaimedElsewhere() {
         Transfer transfer = savedProcessingTransfer(KEY);
-        when(transferRepository.claimForRecovery(eq(transfer.getId()), any(Instant.class), any(Instant.class)))
+        int attempts = transfer.getAttemptCount();
+        when(transferRepository.renewRecoveryClaim(eq(transfer.getId()), any(Instant.class), any(Instant.class)))
                 .thenReturn(0);
 
         int settled = transferService.recoverDue(farFuture(), 10);
@@ -588,23 +632,29 @@ class TransferLedgerFlowTest {
         assertEquals(0, settled);
         assertTrue(ledger.requests.isEmpty());
         assertEquals(TransferStatus.PROCESSING, transfer.getStatus());
+        assertEquals(attempts, transfer.getAttemptCount());
     }
 
-    /** 한 건을 복구하다 예외가 나도(예: 선점 UPDATE 실패) 로그만 남기고 다음 송금을 계속 복구합니다. */
+    /** 한 건을 복구하다 예상하지 못한 예외가 나도 결과 모름으로 두고 다음 송금을 계속 복구합니다. */
     @Test
     void recoveryContinuesWithNextTransferWhenOneTransferFails() {
         Instant base = Instant.parse("2026-11-02T00:00:00Z");
         Transfer broken = staleProcessingTransfer("broken-key", base);
         Transfer next = staleProcessingTransfer("next-key", base.plusSeconds(10));
-        when(transferRepository.claimForRecovery(eq(broken.getId()), any(Instant.class), any(Instant.class)))
-                .thenThrow(new DataIntegrityViolationException("connection lost"));
+        ledger.onRegister = request -> {
+            if (request.referenceId().equals(broken.getId())) {
+                throw new IllegalStateException("unexpected");
+            }
+            return ledger.apply(request);
+        };
 
         int settled = transferService.recoverDue(farFuture(), 10);
 
         assertEquals(1, settled);
         assertEquals(TransferStatus.PROCESSING, broken.getStatus());
         assertEquals(TransferStatus.COMPLETED, next.getStatus());
-        assertEquals(List.of(next.getId()), ledger.requests.stream().map(LedgerTransactionRequest::referenceId).toList());
+        assertEquals(List.of(broken.getId(), next.getId()),
+                ledger.requests.stream().map(LedgerTransactionRequest::referenceId).toList());
     }
 
     /** 원장 결과에 상태가 없으면 해석할 수 없으므로 결과 모름으로 두고 기록하지 않습니다. */
@@ -701,18 +751,6 @@ class TransferLedgerFlowTest {
         assertEquals(List.of(LedgerTransactionRequest.of(recent)), ledger.requests);
     }
 
-    @Test
-    void recoveryDoesNothingWithoutLedgerClient() {
-        savedProcessingTransfer(KEY);
-        TransferService withoutLedger = new TransferService(transferRepository, mock(TransferWalletReader.class),
-                mock(TransferUserReader.class), Optional.empty());
-
-        int recovered = withoutLedger.recoverDue(farFuture(), 10);
-
-        assertEquals(0, recovered);
-        verify(transferRepository, never()).findRecoveryTargets(any(), anyInt());
-    }
-
     /** 모든 재시도 대기 시간(최대 4분)이 지난 시각입니다. */
     private static Instant farFuture() {
         return Instant.now().plusSeconds(3600);
@@ -731,7 +769,7 @@ class TransferLedgerFlowTest {
         TransferUserReader userReader = mock(TransferUserReader.class);
         when(userReader.findRecipient(RECEIVER_ID))
                 .thenReturn(Optional.of(new UserRecipientResponse(RECEIVER_ID, "홍길동")));
-        return new TransferService(transferRepository, walletReader, userReader, Optional.of(fakeLedger));
+        return new TransferService(transferRepository, walletReader, userReader, fakeLedger);
     }
 
     private Transfer onlyTransfer() {
@@ -745,8 +783,7 @@ class TransferLedgerFlowTest {
 
     private Transfer savedProcessingTransfer(String idempotencyKey) {
         Transfer transfer = Transfer.process(SENDER_ID, RECEIVER_ID, SOURCE_WALLET_ID, TARGET_WALLET_ID,
-                REQUEST.amount(), REQUEST.currency(), REQUEST.memo(), idempotencyKey,
-                TransferRequestHasher.hash(RECEIVER_ID, REQUEST.amount(), REQUEST.currency(), REQUEST.memo()));
+                REQUEST.amount(), REQUEST.currency(), REQUEST.memo(), idempotencyKey);
         ReflectionTestUtils.setField(transfer, "id", UUID.randomUUID());
         ReflectionTestUtils.invokeMethod(transfer, "onCreate");
         store.put(transfer.getId(), transfer);
@@ -780,11 +817,13 @@ class TransferLedgerFlowTest {
                     return 1;
                 });
         // 대기 시간: 30초 × 2^max(attempt_count - 1, 0)
-        when(transferRepository.findRecoveryTargets(any(Instant.class), anyInt()))
+        // 선점: 대기 시간이 지난 송금을 오래된 순으로 고르고 수정 시각을 선점 시각으로 바꿉니다.
+        when(transferRepository.claimRecoveryTargets(any(Instant.class), any(Instant.class), anyInt()))
                 .thenAnswer(invocation -> {
                     Instant now = invocation.getArgument(0);
-                    int limit = invocation.getArgument(1);
-                    return store.values().stream()
+                    Instant claimedAt = invocation.getArgument(1);
+                    int limit = invocation.getArgument(2);
+                    List<Transfer> claimed = store.values().stream()
                             .filter(transfer -> transfer.getStatus() == TransferStatus.PROCESSING
                                     && transfer.getUpdatedAt().isBefore(now.minusSeconds(
                                             30L << Math.max(transfer.getAttemptCount() - 1, 0))))
@@ -792,8 +831,10 @@ class TransferLedgerFlowTest {
                                     .thenComparing(transfer -> transfer.getId().toString()))
                             .limit(limit)
                             .toList();
+                    claimed.forEach(transfer -> ReflectionTestUtils.setField(transfer, "updatedAt", claimedAt));
+                    return claimed;
                 });
-        when(transferRepository.claimForRecovery(any(UUID.class), any(Instant.class), any(Instant.class)))
+        when(transferRepository.renewRecoveryClaim(any(UUID.class), any(Instant.class), any(Instant.class)))
                 .thenAnswer(invocation -> {
                     Transfer transfer = processingOrNull(invocation.getArgument(0));
                     if (transfer == null || !transfer.getUpdatedAt().equals(invocation.getArgument(1))) {

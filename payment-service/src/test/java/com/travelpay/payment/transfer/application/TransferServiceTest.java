@@ -1,13 +1,16 @@
 package com.travelpay.payment.transfer.application;
 
-import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
+import com.travelpay.payment.transfer.client.TransferLedgerClient;
+import com.travelpay.payment.transfer.client.TransferLedgerException;
 import com.travelpay.payment.transfer.client.TransferUserReader;
 import com.travelpay.payment.transfer.client.TransferWalletReader;
 import com.travelpay.payment.transfer.client.UserRecipientResponse;
@@ -22,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -41,6 +45,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -57,41 +62,49 @@ class TransferServiceTest {
     private TransferRepository transferRepository;
     private TransferWalletReader walletReader;
     private TransferUserReader userReader;
+    private TransferLedgerClient ledgerClient;
     private TransferService transferService;
+    private final Map<UUID, Transfer> stored = new HashMap<>();
 
     @BeforeEach
     void setUp() {
         transferRepository = mock(TransferRepository.class);
         walletReader = mock(TransferWalletReader.class);
         userReader = mock(TransferUserReader.class);
-        // 원장 거래 등록 구현이 없는 현재 운영 구성입니다. 구현이 있을 때의 흐름은 TransferLedgerFlowTest에서 검증합니다.
-        transferService = new TransferService(transferRepository, walletReader, userReader, Optional.empty());
+        // 원장 결과에 따른 흐름은 TransferLedgerFlowTest에서 검증합니다. 여기서는 서킷이 열려 보내지 못한 것으로 두어
+        // 저장한 PROCESSING 송금이 그대로 응답되게 합니다.
+        ledgerClient = mock(TransferLedgerClient.class);
+        when(ledgerClient.register(any())).thenThrow(TransferLedgerException.notSent("test"));
+        when(transferRepository.findById(any()))
+                .thenAnswer(invocation -> Optional.ofNullable(stored.get(invocation.getArgument(0))));
+        transferService = new TransferService(transferRepository, walletReader, userReader, ledgerClient);
     }
 
     @Test
-    void acceptsValidTransferAsRequestedWithBothActiveWallets() {
+    void savesValidTransferAsProcessingAndSendsItToLedger() {
         givenActiveWallets();
         when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY)).thenReturn(Optional.empty());
-        when(transferRepository.saveAndFlush(any(Transfer.class))).thenAnswer(invocation -> persisted(invocation.getArgument(0)));
+        givenSaveIsReadBack();
 
         var response = transferService.request(SENDER_ID, KEY, request(10_000L, "KRW", "  저녁값  "));
 
-        assertEquals(TransferStatus.REQUESTED, response.status());
+        assertEquals(TransferStatus.PROCESSING, response.status());
         assertEquals(TransferDirection.SENT, response.direction());
         assertEquals(10_000L, response.amount());
         assertEquals("저녁값", response.memo());
         verify(transferRepository).saveAndFlush(any(Transfer.class));
+        verify(ledgerClient, times(1)).register(any());
         verify(transferRepository, never()).finishProcessing(any(), any(), any(), any());
     }
 
     @Test
-    void storesBothWalletIdsAndNormalizedRequestHash() {
+    void storesBothWalletIdsAndNormalizedMemo() {
         givenActiveWallets();
         when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY)).thenReturn(Optional.empty());
         List<Transfer> saved = new ArrayList<>();
         when(transferRepository.saveAndFlush(any(Transfer.class))).thenAnswer(invocation -> {
             saved.add(invocation.getArgument(0));
-            return persisted(invocation.getArgument(0));
+            return save(invocation.getArgument(0));
         });
 
         transferService.request(SENDER_ID, KEY, request(10_000L, "KRW", "   "));
@@ -100,7 +113,6 @@ class TransferServiceTest {
         assertEquals(SOURCE_WALLET_ID, transfer.getSourceWalletId());
         assertEquals(TARGET_WALLET_ID, transfer.getTargetWalletId());
         assertNull(transfer.getMemo());
-        assertEquals(TransferRequestHasher.hash(RECEIVER_ID, 10_000L, "KRW", null), transfer.getRequestHash());
     }
 
     @Test
@@ -111,20 +123,69 @@ class TransferServiceTest {
         var response = transferService.request(SENDER_ID, KEY, request(10_000L, "KRW", null));
 
         assertEquals(existing.getId(), response.transferId());
-        verifyNoInteractions(walletReader, userReader);
+        verifyNoInteractions(walletReader, userReader, ledgerClient);
         verify(transferRepository, never()).saveAndFlush(any());
     }
 
-    @Test
-    void rejectsSameKeyWithDifferentRequest() {
+    @ParameterizedTest
+    @ValueSource(strings = {"receiverId", "amount", "currency", "memo", "memoRemoved"})
+    void rejectsSameKeyWhenAnyStoredRequestFieldDiffers(String field) {
+        Transfer existing = persisted(transfer(10_000L, "KRW", "저녁값"));
+        when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY)).thenReturn(Optional.of(existing));
+        TransferCreateRequest changed = switch (field) {
+            case "receiverId" -> new TransferCreateRequest(UUID.randomUUID(), 10_000L, "KRW", "저녁값");
+            case "amount" -> request(10_001L, "KRW", "저녁값");
+            case "currency" -> request(10_000L, "JPY", "저녁값");
+            case "memo" -> request(10_000L, "KRW", "점심값");
+            case "memoRemoved" -> request(10_000L, "KRW", null);
+            default -> throw new IllegalArgumentException(field);
+        };
+
+        var exception = assertThrows(BusinessException.class,
+                () -> transferService.request(SENDER_ID, KEY, changed));
+
+        assertSame(TransferErrorCode.IDEMPOTENCY_KEY_REUSED, exception.getErrorCode());
+        verify(transferRepository, never()).saveAndFlush(any());
+        verifyNoInteractions(walletReader, userReader);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"저녁값", "  저녁값  ", "\t저녁값\n"})
+    void treatsMemoWithOnlySurroundingWhitespaceAsSameRequest(String memo) {
+        Transfer existing = persisted(transfer(10_000L, "KRW", "저녁값"));
+        when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY)).thenReturn(Optional.of(existing));
+
+        var response = transferService.request(SENDER_ID, KEY, request(10_000L, "KRW", memo));
+
+        assertEquals(existing.getId(), response.transferId());
+        verify(transferRepository, never()).saveAndFlush(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "   "})
+    void treatsBlankMemoAsSameRequestAsMissingMemo(String memo) {
         Transfer existing = persisted(transfer(10_000L, "KRW", null));
         when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY)).thenReturn(Optional.of(existing));
+
+        var response = transferService.request(SENDER_ID, KEY, request(10_000L, "KRW", memo));
+
+        assertEquals(existing.getId(), response.transferId());
+    }
+
+    @Test
+    void rejectsConcurrentlySavedTransferWithSameKeyButDifferentRequest() {
+        givenActiveWallets();
+        Transfer concurrent = persisted(transfer(10_000L, "KRW", null));
+        when(transferRepository.findBySenderIdAndIdempotencyKey(SENDER_ID, KEY))
+                .thenReturn(Optional.empty())
+                .thenReturn(Optional.of(concurrent));
+        when(transferRepository.saveAndFlush(any(Transfer.class)))
+                .thenThrow(new DataIntegrityViolationException("uk_transfer_sender_id_idempotency_key"));
 
         var exception = assertThrows(BusinessException.class,
                 () -> transferService.request(SENDER_ID, KEY, request(20_000L, "KRW", null)));
 
         assertSame(TransferErrorCode.IDEMPOTENCY_KEY_REUSED, exception.getErrorCode());
-        verify(transferRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -333,12 +394,27 @@ class TransferServiceTest {
     }
 
     @Test
-    void showsTransferToSenderAndReceiverWithTheirDirection() {
+    void showsCompletedTransferToSenderAndReceiverWithTheirDirection() {
         Transfer existing = persisted(transfer(10_000L, "KRW", null));
+        ReflectionTestUtils.setField(existing, "status", TransferStatus.COMPLETED);
         when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
 
         assertEquals(TransferDirection.SENT, transferService.get(SENDER_ID, existing.getId()).direction());
         assertEquals(TransferDirection.RECEIVED, transferService.get(RECEIVER_ID, existing.getId()).direction());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = TransferStatus.class, names = "COMPLETED", mode = EnumSource.Mode.EXCLUDE)
+    void showsUnfinishedTransferOnlyToSenderAndHidesItFromReceiverAsNotFound(TransferStatus status) {
+        Transfer existing = persisted(transfer(10_000L, "KRW", null));
+        ReflectionTestUtils.setField(existing, "status", status);
+        when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
+
+        var receiver = assertThrows(BusinessException.class,
+                () -> transferService.get(RECEIVER_ID, existing.getId()));
+
+        assertEquals(status, transferService.get(SENDER_ID, existing.getId()).status());
+        assertSame(TransferErrorCode.NOT_FOUND, receiver.getErrorCode());
     }
 
     @Test
@@ -355,81 +431,6 @@ class TransferServiceTest {
 
         assertSame(TransferErrorCode.NOT_FOUND, otherUser.getErrorCode());
         assertSame(TransferErrorCode.NOT_FOUND, missing.getErrorCode());
-    }
-
-    @Test
-    void cancelsRequestedTransferBySender() {
-        Transfer existing = persisted(transfer(10_000L, "KRW", null));
-        when(transferRepository.cancelRequested(eq(existing.getId()), eq(SENDER_ID), any(Instant.class)))
-                .thenAnswer(invocation -> {
-                    // 조건부 UPDATE로 DB 상태가 바뀐 결과를 흉내 냅니다.
-                    ReflectionTestUtils.setField(existing, "status", TransferStatus.CANCELLED);
-                    return 1;
-                });
-        when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
-
-        var response = transferService.cancel(SENDER_ID, existing.getId());
-
-        assertEquals(existing.getId(), response.transferId());
-        assertEquals(TransferStatus.CANCELLED, response.status());
-        assertEquals(TransferDirection.SENT, response.direction());
-    }
-
-    @Test
-    void returnsCurrentStateWhenTransferIsAlreadyCancelled() {
-        Transfer existing = persisted(transfer(10_000L, "KRW", null));
-        ReflectionTestUtils.setField(existing, "status", TransferStatus.CANCELLED);
-        when(transferRepository.cancelRequested(eq(existing.getId()), eq(SENDER_ID), any(Instant.class)))
-                .thenReturn(0);
-        when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
-
-        var response = transferService.cancel(SENDER_ID, existing.getId());
-
-        assertEquals(TransferStatus.CANCELLED, response.status());
-    }
-
-    @Test
-    void hidesTransferFromReceiverAndNonParticipantOnCancel() {
-        Transfer existing = persisted(transfer(10_000L, "KRW", null));
-        when(transferRepository.cancelRequested(eq(existing.getId()), any(UUID.class), any(Instant.class)))
-                .thenReturn(0);
-        when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
-
-        var receiver = assertThrows(BusinessException.class,
-                () -> transferService.cancel(RECEIVER_ID, existing.getId()));
-        var otherUser = assertThrows(BusinessException.class,
-                () -> transferService.cancel(OTHER_USER_ID, existing.getId()));
-
-        assertSame(TransferErrorCode.NOT_FOUND, receiver.getErrorCode());
-        assertSame(TransferErrorCode.NOT_FOUND, otherUser.getErrorCode());
-        assertEquals(TransferStatus.REQUESTED, existing.getStatus());
-    }
-
-    @Test
-    void returnsNotFoundWhenCancellingMissingTransfer() {
-        UUID missingId = UUID.randomUUID();
-        when(transferRepository.cancelRequested(eq(missingId), eq(SENDER_ID), any(Instant.class))).thenReturn(0);
-        when(transferRepository.findById(missingId)).thenReturn(Optional.empty());
-
-        var exception = assertThrows(BusinessException.class,
-                () -> transferService.cancel(SENDER_ID, missingId));
-
-        assertSame(TransferErrorCode.NOT_FOUND, exception.getErrorCode());
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"PROCESSING", "COMPLETED", "FAILED", "MANUAL_REVIEW"})
-    void rejectsCancellingTransferThatIsNoLongerRequested(TransferStatus status) {
-        Transfer existing = persisted(transfer(10_000L, "KRW", null));
-        ReflectionTestUtils.setField(existing, "status", status);
-        when(transferRepository.cancelRequested(eq(existing.getId()), eq(SENDER_ID), any(Instant.class)))
-                .thenReturn(0);
-        when(transferRepository.findById(existing.getId())).thenReturn(Optional.of(existing));
-
-        var exception = assertThrows(BusinessException.class,
-                () -> transferService.cancel(SENDER_ID, existing.getId()));
-
-        assertSame(CommonErrorCode.CONFLICT, exception.getErrorCode());
     }
 
     @Test
@@ -488,6 +489,18 @@ class TransferServiceTest {
         return captor.getValue();
     }
 
+    /** 저장한 송금을 원장 호출 뒤 다시 읽을 때 같은 송금이 나오게 합니다. */
+    private void givenSaveIsReadBack() {
+        when(transferRepository.saveAndFlush(any(Transfer.class)))
+                .thenAnswer(invocation -> save(invocation.getArgument(0)));
+    }
+
+    private Transfer save(Transfer transfer) {
+        Transfer persisted = persisted(transfer);
+        stored.put(persisted.getId(), persisted);
+        return persisted;
+    }
+
     private void givenActiveWallets() {
         when(walletReader.findActiveWalletId(SENDER_ID)).thenReturn(Optional.of(SOURCE_WALLET_ID));
         when(walletReader.findActiveWalletId(RECEIVER_ID)).thenReturn(Optional.of(TARGET_WALLET_ID));
@@ -504,8 +517,8 @@ class TransferServiceTest {
     }
 
     private static Transfer transfer(long amount, String currency, String memo) {
-        return Transfer.request(SENDER_ID, RECEIVER_ID, SOURCE_WALLET_ID, TARGET_WALLET_ID,
-                amount, currency, memo, KEY, TransferRequestHasher.hash(RECEIVER_ID, amount, currency, memo));
+        return Transfer.process(SENDER_ID, RECEIVER_ID, SOURCE_WALLET_ID, TARGET_WALLET_ID,
+                amount, currency, memo, KEY);
     }
 
     /** JPA 저장 시 채워지는 ID와 생성 시각을 흉내 냅니다. */

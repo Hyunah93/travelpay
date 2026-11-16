@@ -71,7 +71,9 @@ locals {
       services            = sort([for service in local.application_services : service.name])
       recovery_schedulers = local.payment_recovery_schedulers
     })
-    "dashboard-production.json" = local.production_dashboard
+    # Slack 연락처와 알림 정책입니다. Webhook 주소는 넣지 않고 Data 호스트가 Parameter Store에서 받아 환경 변수로 넘깁니다.
+    "grafana-alert-notifications.yml" = file("${path.module}/templates/monitoring/grafana-alert-notifications.yml")
+    "dashboard-production.json"       = local.production_dashboard
   } : {}
   # Compose가 감지하지 못하는 bind 설정 파일의 변화를 컨테이너별 해시로 드러냅니다(monitoring-compose.yaml.tftpl).
   monitoring_config_sha256 = var.enable_data_foundation ? {
@@ -79,7 +81,7 @@ locals {
     loki       = sha256(local.monitoring_files["loki.yml"])
     alloy      = sha256(local.monitoring_files["data.alloy"])
     grafana = sha256(jsonencode({
-      for name in ["grafana-datasources.yml", "grafana-dashboards.yml", "grafana-alert-transfer.yml", "grafana-alert-operations.yml", "dashboard-production.json"] :
+      for name in ["grafana-datasources.yml", "grafana-dashboards.yml", "grafana-alert-transfer.yml", "grafana-alert-operations.yml", "grafana-alert-notifications.yml", "dashboard-production.json"] :
       name => local.monitoring_files[name]
     }))
   } : null

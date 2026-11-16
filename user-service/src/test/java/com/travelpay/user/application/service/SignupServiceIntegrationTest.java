@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
@@ -32,6 +34,7 @@ import com.travelpay.user.domain.model.vo.TermsDocumentId;
 import com.travelpay.user.domain.model.vo.UserStatus;
 import com.travelpay.user.domain.repository.UserConsentRepository;
 import com.travelpay.user.domain.repository.UserCredentialsRepository;
+import com.travelpay.user.domain.repository.UserProfile;
 import com.travelpay.user.domain.repository.UserRepository;
 import com.travelpay.user.domain.repository.UserSearchCondition;
 import com.travelpay.user.domain.repository.UserSearchItem;
@@ -86,6 +89,8 @@ class SignupServiceIntegrationTest {
     @Autowired
     private SignupService signupService;
     @Autowired
+    private DataSource dataSource;
+    @Autowired
     private EntityManagerFactory entityManagerFactory;
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -113,6 +118,14 @@ class SignupServiceIntegrationTest {
             publish(new TermsDocumentId("SERVICE_TERMS", "v0"), true, AT.minusSeconds(120));
             publish(new TermsDocumentId("SERVICE_TERMS", "v2"), true, AT.plusSeconds(300));
         });
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        var command = command("member@example.com", "010-1500-0001", List.of(SERVICE, PRIVACY));
+
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.user_credentials",
+                () -> signupService.signup(command));
     }
 
     @Test
@@ -475,6 +488,7 @@ class SignupServiceIntegrationTest {
             return new UserRepository() {
                 @Override public User save(User user) { return delegate.save(user); }
                 @Override public Optional<User> findById(UUID id) { return delegate.findById(id); }
+                @Override public Optional<UserProfile> findProfile(UUID id) { return delegate.findProfile(id); }
                 @Override public boolean existsByPhone(String phone) {
                     var exists = delegate.existsByPhone(phone);
                     state.synchronizeWrite(Race.PHONE);

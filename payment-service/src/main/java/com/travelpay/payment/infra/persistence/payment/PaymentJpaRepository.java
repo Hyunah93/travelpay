@@ -35,16 +35,43 @@ public interface PaymentJpaRepository extends JpaRepository<Payment, UUID> {
     Page<Payment> findByStatusAndReviewReason(PaymentStatus status, SettlementReviewReason reviewReason,
                                               Pageable pageable);
 
+    // 복구 대상 일괄 선점: 다른 서버가 잠근 행은 건너뛰고(SKIP LOCKED), 고른 행의 수정 시각을 선점 시각으로 바꿔 반환
+    @Transactional
+    @Query(nativeQuery = true, value = """
+            with picked as (
+                select id, updated_at from payments
+                where status = 'PENDING'
+                  and updated_at < cast(:now as timestamptz) - interval '30 seconds'
+                  and updated_at < cast(:now as timestamptz)
+                      - interval '30 seconds' * power(2, greatest(attempt_count - 1, 0))
+                order by updated_at, id
+                limit :limit
+                for update skip locked
+            ), claimed as (
+                update payments t set updated_at = cast(:claimedAt as timestamptz)
+                from picked p
+                where t.id = p.id
+                returning t.*
+            )
+            select c.* from claimed c join picked p on p.id = c.id
+            order by p.updated_at, p.id
+            """)
+    List<Payment> claimRecoveryTargets(@Param("now") Instant now, @Param("claimedAt") Instant claimedAt,
+                                       @Param("limit") int limit);
+
+    // 자동 처리 대상. 생성 시각은 바뀌지 않아 커서가 흔들리지 않음(ix_payments_manual_review_created_at_id)
     @Query(nativeQuery = true, value = """
             select * from payments
-            where status = 'PENDING'
-              and updated_at < cast(:now as timestamptz) - interval '30 seconds'
-              and updated_at < cast(:now as timestamptz)
-                  - interval '30 seconds' * power(2, greatest(attempt_count - 1, 0))
-            order by updated_at, id
+            where status = 'MANUAL_REVIEW'
+              and updated_at < cast(:updatedBefore as timestamptz)
+              and (created_at, id) > (cast(:afterCreatedAt as timestamptz), cast(:afterId as uuid))
+            order by created_at, id
             limit :limit
             """)
-    List<Payment> findRecoveryTargets(@Param("now") Instant now, @Param("limit") int limit);
+    List<Payment> findManualReviewsAfter(@Param("updatedBefore") Instant updatedBefore,
+                                         @Param("afterCreatedAt") Instant afterCreatedAt,
+                                         @Param("afterId") UUID afterId,
+                                         @Param("limit") int limit);
 
     // 정산 대상. 승인 시각은 환불 기간 계산(findApprovedAt)과 같은 기준: PENDING·MANUAL_REVIEW → APPROVED 이력.
     // 부분 환불·환불 거절·신청 취소·거절 뒤의 → APPROVED는 승인 시각이 아닙니다.
@@ -112,7 +139,7 @@ public interface PaymentJpaRepository extends JpaRepository<Payment, UUID> {
                              @Param("reviewReason") SettlementReviewReason reviewReason,
                              @Param("now") Instant now);
 
-    // 자동 처리 중단. 그 사이 결과가 반영된 결제는 바꾸지 않음
+    // 자동 재시도 중단. 그 사이 결과가 반영된 결제는 바꾸지 않음
     @Transactional
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("""

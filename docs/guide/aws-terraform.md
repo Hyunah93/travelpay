@@ -2,7 +2,7 @@
 
 Terraform 코드는 `infra/aws/`에서 관리합니다. Spring Boot Run과 별개이며 실제 리소스 생성은 Terraform의 `apply`로 실행합니다.
 
-**State S3와 네트워크·SG(PR1), IAM·SSM·OIDC·ECS 실행 기반·RDS·Data EC2·Redis·Kafka(PR2), 앱 이미지·ECR·Task 정의·ALB·ACM·CloudWatch 경보·AWS 모니터링·운영 실행 설정(PR3), DB 암호 교체·main 이미지·ECS Service 첫 기동·공개 진입점(PR4의 4-1~4-3)의 실제 적용과 검증을 완료**했습니다. PR4의 4-4에서 CI를 dev에 반영하고 CD의 AWS·GitHub 연결을 적용했습니다. 첫 자동 배포와 운영 검증(4-5)은 후속 단계입니다.
+**State S3와 네트워크·SG(PR1), IAM·SSM·OIDC·ECS 실행 기반·RDS·Data EC2·Redis·Kafka(PR2), 앱 이미지·ECR·Task 정의·ALB·ACM·CloudWatch 경보·AWS 모니터링·운영 실행 설정(PR3), DB 암호 교체·main 이미지·ECS Service 첫 기동·공개 진입점(PR4의 4-1~4-3)의 실제 적용과 검증을 완료**했습니다. PR4의 4-4에서 CI·CD를 적용했고, main 머지로 첫 자동 배포(ledger·payment 롤링)까지 확인했습니다. 4-5에서 운영 검증(업무·보안 흐름, 롤링·자동 롤백, 경보 전달, 안정성 기록)을 마쳤습니다. 11-19까지 운영한 뒤 종료합니다.
 
 설계·구현 기준은 [Terraform 설계·구현 원칙](https://app.notion.com/p/413530b4fe5980cf9edbc37ec93b957e)에 모으고, 이 문서는 인프라 담당자의 실행·이전 절차만 다룹니다.
 
@@ -114,7 +114,7 @@ export AWS_PROFILE=travelpay
 aws sts get-caller-identity
 ```
 
-출력된 Account와 사용할 계정 ID가 같은지 확인합니다. 액세스 키·비밀번호를 `.tf`, tfvars, Backend 설정이나 Git에 넣지 않습니다. `.env`는 Terraform이 자동으로 읽는 입력 파일이 아닙니다.
+출력된 Account와 사용할 계정 ID가 같은지 확인합니다. 이 터미널의 `AWS_PROFILE`은 Terraform의 S3 Backend와 AWS Provider에도 적용됩니다. Python 도구에만 `--profile`을 지정해도 앞선 Terraform 명령의 프로필이 설정되는 것은 아닙니다. 액세스 키·비밀번호를 `.tf`, tfvars, Backend 설정이나 Git에 넣지 않습니다. `.env`는 Terraform이 자동으로 읽는 입력 파일이 아닙니다.
 
 예시의 `123456789012`는 설명용 계정 ID이며 이 프로젝트의 실제 계정으로 확인한 값이 아닙니다. 계정 ID는 인증 비밀값과 구분하지만 실제 개인 입력·Backend 파일은 Git에서 제외합니다. 실행 권한은 SSO·IAM 자격 증명으로 확인하며 숫자 12자리 검사만으로 확보되는 것은 아닙니다.
 
@@ -228,7 +228,7 @@ VPC의 원래 Main Route Table도 local만 유지합니다. Public 여부는 IGW
 
 SG 본체와 개별 규칙을 분리해 상호 참조에 따른 생성 순환을 피합니다. `aws_vpc_security_group_rules_exclusive`가 선언한 규칙 전체를 관리하고 VPC 기본 SG는 닫습니다. 다른 도구·수동 규칙을 같은 SG에 섞으면 다음 apply에서 제거될 수 있으므로 보존할 변경을 먼저 코드에 반영합니다.
 
-DB 계정·스키마 초기화 때만 `enable_database_bootstrap_access=true`로 Data → RDS 5432와 해당 RDS 관리자 Secret 조회 권한, 앱 DB 암호 조회를 엽니다. 완료 후 `false`로 되돌려 plan/apply합니다. 평상시 Data는 Redis 암호 두 개와 Grafana 관리자 암호만 조회합니다. EC2에는 역할별 SG를 연결하며 앱 Task 연결과 실제 허용·차단 검증은 배치 단계에서 확인합니다.
+DB 계정·스키마 초기화 때만 `enable_database_bootstrap_access=true`로 Data → RDS 5432와 해당 RDS 관리자 Secret 조회 권한, 앱 DB 암호 조회를 엽니다. 완료 후 `false`로 되돌려 plan/apply합니다. 평상시 Data는 Redis 암호 두 개와 Grafana 관리자 암호, Slack Webhook 주소만 조회합니다. EC2에는 역할별 SG를 연결하며 앱 Task 연결과 실제 허용·차단 검증은 배치 단계에서 확인합니다.
 
 ## 실행 기반 적용 순서
 
@@ -252,10 +252,10 @@ python3 infra/aws/scripts/check-runtime-plan.py infra/aws/stage-4.tfplan --profi
 python3 infra/aws/scripts/prepare-parameters.py infra/aws/stage-4.tfplan --profile travelpay --account 123456789012
 ```
 
-비밀값 준비 도구는 기본적으로 미리보기만 실행합니다. 승인 후 같은 명령에 `--apply`를 추가하면 DB 6개·Redis 2개·Grafana 관리자 암호·원본 인증 값(`ORIGIN_AUTH`)을 SecureString으로 만듭니다. 인프라 담당자의 Linux에서 비밀값을 익명 메모리 파일로 AWS CLI에 전달하며 기존 SecureString을 덮어쓰지 않습니다. AWS CLI 기록(`cli_history`)이 켜져 있으면 요청 내용이 로컬 기록에 남으므로 쓰기를 거절합니다.
+비밀값 준비 도구는 기본적으로 미리보기만 실행합니다. 승인 후 같은 명령에 `--apply`를 추가하면 DB 6개·Redis 2개·Grafana 관리자 암호·원본 인증 값(`ORIGIN_AUTH`)을 SecureString으로 만듭니다. 외부에서 발급받는 값(환율 API 키·Slack Webhook 주소)은 아래처럼 따로 입력합니다. 인프라 담당자의 Linux에서 비밀값을 익명 메모리 파일로 AWS CLI에 전달하며 기존 SecureString을 덮어쓰지 않습니다. AWS CLI 기록(`cli_history`)이 켜져 있으면 요청 내용이 로컬 기록에 남으므로 쓰기를 거절합니다.
 
 - Wallet 계좌번호 키(무작위 32바이트의 Base64)는 `--apply --create-wallet-key`를 줄 때만 만듭니다. 데이터가 생긴 뒤 바꾸거나, 지워진 뒤 새로 만들면 저장된 계좌번호를 풀 수 없으므로 Wallet 데이터가 생기기 전 처음 한 번만 씁니다.
-- 수출입은행에서 발급받은 환율 API 키는 `--apply --external`을 줄 때만 입력받습니다. 입력을 숨길 수 있는 터미널에서 직접 실행해야 하며, 파이프 입력처럼 입력이 화면에 보일 수 있으면 거절합니다. 키를 명령 인자·파일·채팅에 남기지 않습니다.
+- 수출입은행에서 발급받은 환율 API 키와 Slack이 발급한 Incoming Webhook 주소(`SLACK_WEBHOOK_URL`)는 `--apply --external`을 줄 때만 입력받습니다. 없는 값만 차례로 묻고 이미 있는 값은 그대로 둡니다. 입력을 숨길 수 있는 터미널에서 직접 실행해야 하며, 파이프 입력처럼 입력이 화면에 보일 수 있으면 거절합니다. Webhook 주소는 `https://hooks.slack.com/services/`로 시작하는 발급 형식만 받습니다. 키와 주소를 명령 인자·파일·채팅에 남기지 않습니다.
 - DB 앱 계정 암호 6개는 `--apply --rotate-database-passwords`를 줄 때만 새 임의 값으로 바꿉니다. SSM 값만 바뀌므로 아래 DB 작업 창에서 초기화 스크립트를 다시 실행해야 DB에 반영되고, 그 전에 시작한 Task는 DB 로그인에 실패합니다. 새 값은 출력하지 않으며 사람이 알 필요가 없습니다. Task는 시작할 때, 초기화 스크립트는 실행할 때 SSM에서 읽습니다. 앱이 실행 중일 때 교체했다면 초기화 스크립트를 실행한 뒤 CD의 **Run workflow**에서 DB를 쓰는 서비스를 `services`에 지정해 새 Task로 다시 띄웁니다.
 
 ```bash
@@ -372,7 +372,7 @@ Task 정의의 설정은 두 곳에서 옵니다. 비밀이 아닌 값(DB 주소
 | 메모리·힙 | Task 메모리는 상한, 힙은 그 절반, OOM 시 종료 | 메타스페이스·스레드·직접 버퍼 몫을 남기고, 메모리 부족 상태로 남지 않고 ECS가 다시 띄우게 합니다 |
 | health 확인 | 관리 포트의 liveness, 시작 후 180초 유예 | 여러 Task가 한꺼번에 시작해 예약 몫만 받는 최악의 기동 시간(114초)보다 길게 둡니다. liveness는 DB·Redis 상태를 보지 않습니다 |
 | DB | `sslmode=verify-full`, 이미지의 RDS CA, Hikari 최대 5·최소 1 | DB 서비스 6개가 롤링 중 2배가 되어도 60개로 `max_connections=100` 안에 둡니다 |
-| Eureka | 목록 조회 5초, LoadBalancer 캐시 5초, 서버 응답 캐시 5초 | 세 캐시의 합(15초)이 시작 스크립트의 종료 전 대기 20초보다 짧고, 대기·종료 처리 합(최대 55초)이 `stopTimeout` 60초 안에 끝납니다(테스트로 확인) |
+| Eureka | heartbeat·목록 조회 5초, 서버 응답 캐시 5초, LoadBalancer 중복 캐시 끄기 | 서버의 기대 갱신 주기도 5초로 맞추고 등록 만료는 기본 90초를 유지합니다. 정상 전파 주기의 합(10초)은 종료 전 대기 20초보다 짧습니다. 네트워크 지연·재시도가 포함된 실제 전파 시간의 상한은 아닙니다. 종료 대기·상태 변경·Spring 종료의 설정 합은 55초로 `stopTimeout` 60초 안에 둡니다 |
 | 지표 | `SPRING_APPLICATION_JSON`의 HTTP histogram | `application.yml`에만 있는 설정이며 점이 든 지표 이름은 환경 변수 이름으로 쓸 수 없습니다 |
 | 파일시스템 | 루트 읽기 전용, `/tmp`만 Task 볼륨 | 앱 파일 변조를 막습니다. Tomcat·Netty 임시 파일은 Task와 함께 지워집니다 |
 
@@ -393,7 +393,7 @@ ALB는 Public A/B에 두고 기존 SG가 Cloudflare 주소의 443만 허용합�
 
 이 단계에서 확인한 앱 설정 사실과 남은 일입니다.
 
-- Ledger의 Hikari `connection-timeout`·`validation-timeout`은 `application.yml`에만 있어 운영에서는 기본값(30초·5초)이 적용됩니다. 의도인지 서비스 담당자에게 확인합니다.
+- Ledger의 Hikari `connection-timeout`·`validation-timeout`은 `application.yml`에만 있어 운영에서는 기본값(30초·5초)이 적용됐습니다. 이후 운영 파일에도 같은 값을 넣어 개발 설정과 맞췄습니다(아래 "운영 실행 설정(application-prod.yml) 점검").
 - Exchange는 환율 API 키(`KOREAEXIM_API_KEY`)가 없으면 시작하지 않습니다. 배포 전 비밀값 준비 도구의 `--external`로 저장합니다.
 - ALB 접근 로그는 켜지 않았습니다. Cloudflare만 접근할 수 있고 요청 기록은 Gateway 로그와 ALB 지표로 확인합니다.
 - SG의 Cloudflare 주소 허용은 원본을 인증하지 않습니다. 다른 Cloudflare 사용자 영역을 거친 요청도 ALB에 닿을 수 있어 이 영역의 WAF·속도 제한을 우회할 수 있습니다. Host 규칙이 다른 이름을 404로 막지만 Host를 바꾼 요청까지 막지는 못합니다. PR4의 4-3에서 Cloudflare가 붙이는 비밀 헤더(`Origin-Auth`)를 ALB 규칙이 확인하도록 해 막습니다.
@@ -415,17 +415,17 @@ Task 정의·ALB와 앱 호스트 2대를 확인한 뒤 `enable_app_services=tru
 기동 순서는 두지 않습니다.
 
 - 호스트 교체나 장애 복구 때도 Task는 순서 없이 시작하므로 앱이 이를 견뎌야 합니다.
-- Eureka 클라이언트는 서버에 닿지 못하면 30초마다 등록을 다시 시도합니다. 서버가 모르는 인스턴스라고 답하면(heartbeat 404) 다시 등록합니다(eureka-client 2.0.6 소스).
+- Eureka 클라이언트는 설정한 heartbeat 주기(5초)로 갱신하고, 서버가 모르는 인스턴스라고 답하면(heartbeat 404) 다시 등록합니다(eureka-client 2.0.6 소스). 통신 실패·재시도·실행 지연까지 5초 안에 끝난다는 뜻은 아닙니다.
 - Eureka·Mock Bank 이름이 아직 등록되지 않았을 때의 "이름 없음" 응답은 이 영역의 SOA TTL(15초)만큼만 캐시됩니다.
 
 Eureka 재시작·재배포 때는 짧은 공백이 생길 수 있습니다.
 
 - eureka-server는 단독 서버라 받아 올 목록이 없습니다. Spring Cloud는 이 경우에도 조회를 바로 허용하므로, 새 Eureka는 시작 직후부터 비었거나 일부만 찬 목록으로 답합니다(`InstanceRegistry.openForTraffic`, Spring Cloud Netflix 5.0.3 소스).
-- 클라이언트는 200 응답이면 받은 목록으로 바꿉니다. 그래서 각 서비스가 다음 heartbeat(최대 30초)에 다시 등록할 때까지 Gateway가 일부 서비스를 찾지 못해 503을 낼 수 있습니다.
+- 클라이언트는 전체 목록을 200 응답으로 받으면 기존 목록을 바꿉니다. 그래서 각 서비스가 다시 등록하고 목록이 전파될 때까지 Gateway가 일부 서비스를 찾지 못해 503을 낼 수 있습니다. heartbeat 단축은 이 대기를 줄이며 빈 목록 자체를 막지는 않습니다.
 - 서버에 닿지 못한 동안에는 받아 둔 목록을 그대로 씁니다.
 - 롤링 중에는 이전·새 Eureka가 같은 이름으로 잠시 함께 응답해 목록이 갈릴 수도 있습니다.
 
-이 시간은 4-5의 Eureka 재시작·재배포 시험에서 측정합니다. 길면 Eureka만 이전 Task를 먼저 내리는 배포나 시작 대기 설정을 검토합니다.
+재배포 전후의 요청 실패 건수·지속 시간을 따로 측정합니다. 단독 Eureka의 목록 복원 대기를 없애야 한다면 피어 간 목록 복제를 별도로 설계해야 합니다.
 
 Gateway Service가 생긴 뒤부터 원본 인증(4-3)을 넣기 전까지는, 다른 Cloudflare 영역을 거친 요청이 ALB를 통해 Gateway에 닿을 수 있었습니다(앞의 SG 한계). 이 공백은 같은 날 4-3 적용으로 닫혔습니다.
 
@@ -499,7 +499,24 @@ Data 호스트의 모니터링은 Redis·Kafka와 Compose 프로젝트, systemd 
 - **대시보드·알림:** 운영 대시보드와 송금 알림 규칙은 `infra/monitoring`의 로컬 파일에서 데이터소스, 환경, 로그 job, uid만 바꿔 만듭니다. 원본에서 바꿀 곳의 수는 테스트가 확인합니다.
 - **AWS 기본 지표:** RDS·호스트·ECS·ALB 지표와 경보 상태는 CloudWatch 대시보드(`travelpay-production`)로 봅니다. Data 호스트는 IMDS hop 제한(1)으로 컨테이너가 인스턴스 역할 자격 증명을 받지 못하게 했습니다. 그래서 Grafana는 AWS API를 조회하지 않습니다.
 
-Grafana 알림 규칙은 네 개입니다. 알림 채널(contact point)은 두지 않으므로 상태는 Grafana Alerting 화면에서 확인합니다.
+Grafana 알림 규칙은 다섯 개이고, Webhook을 발급할 때 선택한 Slack 채널(예: `#monitoring`)로 보냅니다. 규칙마다 받을 곳을 정하지 않고 기본 알림 정책 하나(`templates/monitoring/grafana-alert-notifications.yml`)를 따릅니다. 같은 규칙의 알림은 묶어서 보내며, 해결 알림도 보내고 미해결 상태는 4시간마다 다시 알립니다. 알림 정책은 트리 전체를 이 파일로 관리하므로 Grafana 화면에서 바꾸지 않습니다.
+
+Webhook 주소는 Parameter Store의 `SLACK_WEBHOOK_URL`에 두고 S3 설정 묶음에는 넣지 않습니다. Data 호스트가 이 값을 root만 읽는 `/run/travelpay/grafana-env/slack.env`로 만들고 Compose가 Grafana 환경 변수로 넘깁니다. 연락처 YAML은 유효한 Webhook을 읽은 뒤에만 Grafana 폴더에 원자적으로 설치합니다. 주소가 없는 상태에서 새 연락처 파일만 먼저 노출되는 것을 막습니다. 호스트의 root·Docker 접근 권한이 있으면 환경 변수와 원본 Docker 로그에서 주소를 읽을 수 있습니다.
+
+Grafana는 Slack 전송 실패 로그에 주소를 남길 수 있어, Data 호스트의 Alloy가 Loki로 보내기 전에 토큰을 가립니다. 새 Grafana보다 Alloy를 먼저 교체하도록 Compose 의존성을 둡니다. 가림은 Loki 전달 경로에 적용되며 원본 Docker 로그를 지우거나 가리는 기능은 아닙니다. 주소가 유출되면 Slack에서 기존 Webhook을 폐기하고 새로 발급받습니다.
+
+Webhook이 없으면 준비 단계가 실패하고 새 연락처 설정은 설치하지 않습니다. 실행 중인 컨테이너는 이 준비 실패로 중지하지 않습니다. 서버를 재시작하면 모니터링 유닛이 시작하지 못하므로 plan 생성 → 비밀값 준비(`--apply --external`) → 계획 검토 → apply 순서를 지킵니다. 최초 Grafana는 시작 후 정책 동기화에 약 1분이 걸렸으며, 이는 고정 대기 시간이 아닙니다(2026-11-16 Grafana 13.3.0 확인). 네트워크를 막은 실제 Grafana 이미지로 규칙 5개·연락처·정책·전송 시도를 `tests/test_grafana_alerting.py`에서 확인합니다. 로그 가림은 `tests/test_monitoring_pipeline.py`, 서킷 상태 패널과 서킷 차단 규칙의 PromQL은 `tests/test_dashboard_queries.py`로 검사합니다. 이 선택 검사는 `TRAVELPAY_TEST_DOCKER_MONITORING=1`로 실행하며 실제 Slack에 보내지 않습니다.
+
+Webhook 교체 시에는 새로 검토한 plan으로 다음 명령을 실행합니다. 기본은 미리보기이며 `--apply`를 추가할 때 입력을 숨겨 받아 `SLACK_WEBHOOK_URL`만 덮어씁니다. 도구는 다른 누락된 기본 비밀값도 준비하므로 먼저 미리보기 결과를 확인합니다.
+
+```bash
+python3 infra/aws/scripts/prepare-parameters.py <저장한 plan> --profile <프로필> --account <계정 ID> --set-slack-webhook
+python3 infra/aws/scripts/prepare-parameters.py <저장한 plan> --profile <프로필> --account <계정 ID> --apply --set-slack-webhook
+```
+
+SSM 변경만으로 실행 중인 Grafana에 새 주소가 적용되지는 않습니다. Data 호스트에서 `systemctl reload travelpay-monitoring.service`를 실행하면 준비 스크립트가 새 값을 읽고 Compose가 변경된 Grafana를 재생성합니다. 모니터링이 기동되지 않은 상태는 `systemctl start travelpay-monitoring.service`를 사용합니다. 이 명령은 Redis·Kafka 유닛을 재시작하지 않습니다.
+
+2026-11-16 운영 반영 후 실제 수신을 확인했습니다. 앱과 무관한 임시 규칙(`vector(1)`)을 Grafana API로 만들어 발생 알림을 받고, 조건을 `vector(0)`으로 바꿔 해결 알림(첫 알림 5분 뒤, 묶음 간격)을 받은 뒤 규칙을 지웠습니다. 두 전송 모두 Grafana 기록에 오류가 없었고, Grafana 원본 로그에 Webhook 주소가 남은 줄은 0건이었습니다. Webhook을 바꾼 뒤에도 같은 방법으로 확인합니다.
 
 | 규칙 | 조건 | 지표가 없을 때 |
 |---|---|---|
@@ -507,6 +524,7 @@ Grafana 알림 규칙은 네 개입니다. 알림 채널(contact point)은 두�
 | 송금 30분 넘게 PROCESSING | 오래 확정되지 않은 송금이 1건 이상 | 정상 |
 | 서비스 지표 수집 중단 | 서비스별 정상 수집 대상이 0개인 상태가 2분 지속. Eureka에서 사라진 서비스도 0으로 셈 | 경보 |
 | 결제·송금 복구 스케줄러 정지 | `recover` 스케줄러의 실행 횟수가 2분 동안 늘지 않은 상태가 2분 지속. payment-service는 수집되는데 실행 기록 지표가 없는 경우(스케줄러 비활성, 클래스 이름 변경)도 포함 | 정상(payment-service 중단은 수집 중단 규칙이 알림) |
+| 서킷이 호출을 계속 차단 | 어떤 서비스의 서킷이든 최근 1분에 호출을 거절한 상태가 2분 지속(서비스·서킷 이름별). Gateway 세션 확인 서킷이면 User 장애로 로그인이 필요한 업무 API가 503인 상태. 한 번 열렸다 바로 회복하면 알리지 않음. 열린 동안 들어온 호출만 거절로 세므로 요청이 거의 없으면 알리지 않을 수 있음 | 정상(서킷이 없거나 거절이 없음. 서비스 중단은 수집 중단 규칙이 알림) |
 
 Grafana는 관리자 계정 `admin` 하나로 씁니다. 암호는 Parameter Store의 `GRAFANA_ADMIN_PASSWORD`이며, 비밀값 준비 도구가 처음에 무작위 값으로 만듭니다. 이 값이 없으면 모니터링 유닛이 시작하지 않으므로, 이 단계는 plan을 저장한 뒤 apply 전에 준비 도구를 `--apply`로 실행합니다. 기존 값은 그대로 두고 없는 값만 만듭니다.
 
@@ -586,7 +604,7 @@ Task 정의는 `SPRING_CONFIG_NAME=application-prod`로 운영 파일만 읽습�
 
 **참고로 남긴 것.**
 
-- Spring Cloud LoadBalancer가 운영에서는 Caffeine 캐시를 권하는 경고를 남깁니다. 기본 캐시도 5초 만료로 동작해 의존성을 추가하지 않았습니다.
+- 로컬 실행에서 Spring Cloud LoadBalancer의 기본 캐시 경고가 나올 수 있습니다. 운영은 Eureka 클라이언트가 이미 목록을 캐시하므로 LoadBalancer 중복 캐시를 끄고, Caffeine 의존성은 추가하지 않습니다.
 - 비정상 종료된 인스턴스는 자기 보호를 꺼도 Eureka에서 지워지기까지 시간이 걸립니다. 1개는 약 3~4분이고, 여러 개는 1분에 정리하는 수에 상한이 있어 3개에 4~6분입니다(임대 만료와 정리 주기 동작). 그동안 그쪽으로 간 요청은 Gateway에서 2초, 서비스 간 호출에서 1~2초 만에 실패합니다. 정상 종료는 시작 스크립트가 바로 빼므로 해당하지 않고, 임대 시간은 조정하지 않았습니다.
 - Ledger 수정은 커넥션을 얻을 때까지의 대기만 줄입니다. DB가 멈췄을 때 이미 실행 중인 쿼리는 JDBC 소켓 시간 제한이 없어(기본 0) 더 오래 걸릴 수 있습니다. 바꾸면 Flyway 마이그레이션 같은 긴 작업에도 걸리므로 조정하지 않았습니다.
 
@@ -785,9 +803,9 @@ ECS의 애플리케이션 Task는 아직 상시 실행하지 않습니다. 앱�
 | 비밀값 | 적용 출력, 작업용 파일, 최근 30분 앱 로그(8개 서비스)에서 0건. 저장한 plan 파일은 적용 직후 삭제 |
 | 적용 후 재검사 | 본 root plan `No changes` |
 
-Transform Rule은 DNS 전환 전에 이미 켜져 있었습니다. 그동안 `api`는 임시 원본에 TCP 연결이 되지 않아 522였으므로, HTTP 요청이 원본으로 전달되지는 않은 것으로 봅니다. Gateway가 실제 접속자 IP(`CF-Connecting-IP`)를 쓰는지는 Gateway가 요청마다 로그를 남기지 않아 확인하지 못했으며, 4-5의 로그인 시도 제한 시험에서 확인합니다.
+Transform Rule은 DNS 전환 전에 이미 켜져 있었습니다. 그동안 `api`는 임시 원본에 TCP 연결이 되지 않아 522였으므로, HTTP 요청이 원본으로 전달되지는 않은 것으로 봅니다. Gateway가 실제 접속자 IP(`CF-Connecting-IP`)를 쓰는지는 Gateway가 요청마다 로그를 남기지 않아 확인하지 못했으며, 4-5의 로그인 시도 제한 시험에서 확인했습니다(아래 4-5 결과).
 
-2026-11-12 자동 배포(CD) 연결(4-4)은 다음과 같이 확인했습니다. 첫 실제 배포 결과는 main 머지 뒤 기록합니다.
+2026-11-12 자동 배포(CD) 연결(4-4)은 다음과 같이 확인했습니다. 첫 실제 배포 결과는 아래 표에 있습니다.
 
 | 대상 | 확인한 결과 |
 |---|---|
@@ -799,5 +817,111 @@ Transform Rule은 DNS 전환 전에 이미 켜져 있었습니다. 그동안 `ap
 | GitHub 환경 | `production`의 배포 브랜치 규칙이 `main`(Branch) 하나(공개 API로 확인). 환경 비밀값 `AWS_DEPLOY_ROLE_ARN`은 운영자가 등록 |
 | 경보 | `gateway-5xx`가 Gateway Target Group 차원으로 바뀌어 Grafana Target의 5xx를 세지 않음. ALB가 이 차원의 지표를 발행함을 확인 |
 | 적용 후 재검사 | 본 root plan `No changes` |
+
+2026-11-13 main 머지(`749aadc`, PR #303)로 첫 자동 배포가 돌았고 다음과 같이 확인했습니다.
+
+| 대상 | 확인한 결과 |
+|---|---|
+| 실행 | CD 성공, 전체 약 19분: CI 10분 41초(Gradle) → 배포 대상 선택 36초 → 이미지 빌드(동시) ledger 1분 25초·payment 1분 53초 → 배포 5분 37초 |
+| AWS 권한 | GitHub OIDC로 배포 역할 받기 성공(소유자·저장소 ID가 든 subject, `production` 환경 비밀값) |
+| 배포 대상 | `ledger`·`payment`만 선택(실행 중 이미지 `c22b3046ee28` 이후 이미지 변경). 나머지 6개는 건너뜀 |
+| 롤링 | ledger 리비전 2→3 약 2분 10초, 끝난 뒤 payment 3→4 약 2분 35초. 새 배포가 PRIMARY가 되고, 새 Task가 정상이 된 뒤 이전 Task를 내림. 이전 배포 상태는 ACTIVE → DRAINING을 거쳐 목록에서 사라짐(DRAINING은 API 문서에 없는 값이지만 배포 판단에는 쓰지 않음) |
+| 실행 중인 것 | 두 서비스 모두 main 커밋 태그 `749aadca1c9f` 이미지, Task RUNNING·HEALTHY |
+| 앱 | Eureka 등록 응답 204, 기동 11초·12초, ERROR 로그 0건. WARN은 LoadBalancer 기본 캐시 안내 1건씩 |
+| 공개 경로 | 배포 내내 5초마다 `GET /api/v1/terms`(Gateway → user) 186회 모두 200. ledger·payment의 무중단은 ECS 상태와 Eureka 등록으로 확인 |
+| 적용 후 재검사 | 본 root plan `No changes`. CD가 바꾼 리비전을 Terraform이 되돌리지 않음(`ignore_changes`) |
+
+감시 도중 Python 기본 사용자 에이전트(`Python-urllib`)의 요청은 Cloudflare가 오류 1010(브라우저 서명 차단)으로 403을 돌려줬습니다. 같은 요청에 사용자 에이전트를 지정하면 200이었습니다. 스크립트로 공개 API를 확인할 때는 `User-Agent`를 지정합니다.
+
+2026-11-13 운영 검증(4-5)은 운영 환경에서 다음과 같이 했습니다. 시험 요청은 사용자 에이전트를 지정한 스크립트로 보냈고, 정식 부하 시험(4-A2)은 계속 보류합니다. 서버 처리 시간은 ALB 기준입니다.
+
+| 대상 | 확인한 결과 |
+|---|---|
+| 가입·로그인·CSRF | 시험 회원 2명 가입·로그인·본인 조회. 로그인하면 CSRF 토큰이 바뀌어, 로그인 전 토큰으로 보낸 변경 요청은 403(`COMMON_CSRF_INVALID`) |
+| 충전 | Mock Bank 정상 계좌 2개 `COMPLETED`. 잔액 부족 계좌는 `BANK_INSUFFICIENT_BALANCE`, 정지 계좌는 `BANK_ACCOUNT_SUSPENDED`로 실패하고 잔액 변화 없음. 같은 멱등 키로 다시 보내면 새로 처리하지 않고 같은 충전을 200으로 돌려줌 |
+| 송금·환전 | 송금 1,000원 `COMPLETED`, 환전 5,000원(수수료 포함 5,050원 차감) → 597엔 `COMPLETED`, 잔액 정확히 일치. 잔액 부족 송금 422, 본인 송금 400, 한도 초과 환전 견적 400, 잔액 부족 환전 422(원장 거절)이고 거절 뒤 잔액 그대로. 같은 키 재요청은 송금·환전 모두 한 번만 처리 |
+| 결제·환불 | 관리자가 가맹점 생성 → 회원 결제 1,000원 `APPROVED` → 환불 신청 → 가맹점 주인 환불 실행 → `REFUNDED`, 회원·가맹점 잔액 원래대로. 같은 키 결제 재요청은 같은 결제, 잔액 초과 결제는 422(`PAYMENT_DECLINED`) |
+| 원장·은행 대조 | 지갑 잔액 API가 원장 계정을 읽으므로 위 잔액 일치가 원장 대조. 관리자 수동 대조(11-13 00:00~10:01 KST)는 충전 94건 모두 일치, 불일치·확인 불가 0. 같은 날 10분마다 도는 자동 대조 62회도 모두 불일치 0 |
+| 수동 처리 대기 | 결제·환불·정산·충전·송금·환전의 `MANUAL_REVIEW` 모두 0건 |
+| 실제 접속자 IP | 같은 이메일·IP로 5번 틀리면 6번째가 429. 실행 중인 Gateway가 믿는 프록시 대역이 ALB 서브넷 2개와 같음. 접속자가 `CF-Connecting-IP`를 직접 넣으면 Cloudflare가 원본에 보내지 않고 403(오류 1000). Gateway가 요청마다 로그를 남기지 않아 Gateway가 판단한 IP 값 자체는 보지 못함 |
+| 롤링 1차 | `services=wallet,gateway` 수동 실행, CD 약 17분(CI 8분 반). 0.5초마다 조회·1분마다 충전을 보내는 동안 wallet 교체(1분 49초) 211건, gateway 교체(2분 6초) 313건 모두 성공. ALB 5xx·연결 오류 0, 정상 Gateway Target 1개 이상 유지, 충전 31건 모두 `COMPLETED`. wallet은 새 Task가 Kafka 파티션을 넘겨받았고, 이전 Task는 종료 신호 약 23초 뒤(대기 20초) 처리 중인 요청 없이 종료 |
+| 롤링 2차 payment | 같은 리비전으로 새 Task 교체(`forceNewDeployment`, 새 리비전 등록 없음). 교체 중 226건 모두 성공, 1분마다 보낸 송금 모두 `COMPLETED` |
+| 롤링 2차 eureka | 09:27:26~52(약 26초) 동안 26건 503, 처음 약 12초는 거의 모든 API. 이전 Eureka가 내려가자 서비스들이 빈 목록의 새 Eureka로 넘어갔고, 각 서비스가 다음 상태 신호(30초 간격) 때 다시 등록(새 Eureka 로그 기준 Gateway 09:27:29부터 Exchange 09:27:47까지)한 뒤 약 5초 안에 회복. 충전 1건은 503으로 접수되지 않아 돈 이동 없음. `gateway-5xx` 경보 09:30:48 ALARM → 09:45:48 OK, 메일 수신 |
+| 배포 시작 대기 | CD는 리비전 등록 3초 뒤 갱신을 요청했고, ECS가 배포를 시작하기까지 ALB가 없는 서비스 4~10초, ALB가 붙은 gateway 51초(그동안 ECS가 대상 그룹을 확인, 오류 없음). 자리 부족·ENI·확장 대기는 아님(CloudTrail·ECS 배포 기록). 이전 Task가 계속 응답해 영향 없음 |
+| 실패 → 자동 롤백 | mock-bank에 시작하자마자 종료하는 리비전을 CLI로 배포. 새 Task가 4번 시작했다가 종료했고(4번째는 ECS가 재시도 간격을 늘려 약 5분 뒤), 요청 약 8분 뒤 서킷 브레이커가 실패를 판정해 이전 배포를 다시 살림(약 9분에 안정). 이전 Task는 재시작 없이 계속 응답(요청 987건·충전 10건 모두 성공). 같은 상황에서 CD의 감시 함수는 "서킷 브레이커 실패"로 멈춤. 깨진 리비전은 등록 해제했고 본 root plan `No changes` |
+| 관리자 계정 | 역할을 바꾸는 API가 없어, 관리자 계정 1개를 일반 가입한 뒤 DB 작업 창을 열고 Data 호스트에서 SSM 명령으로 그 회원 1명의 역할만 `MASTER`로 바꿈(정확히 1건이 아니면 취소). 역할은 요청마다 DB에서 읽어 바로 반영. 창을 닫은 뒤 plan `No changes`, Data 호스트에서 DB 암호 조회 거부·5432 연결 차단 확인. 로그인 정보는 운영자가 따로 관리 |
+| 경보 메일 | 11-11 처음 경보 12건은 발행됐지만 전달 0건(SNS 지표). 구독 확인 링크를 누르기 전이었던 것으로 봄. 11-13 테스트 메일과 위 실제 ALARM·OK 메일은 바로 수신 |
+
+안정성 기록(11-13 하루, CloudWatch 지표와 SSM 읽기 명령)은 다음과 같습니다. 비용은 종료 때 Cost Explorer 콘솔에서 크레딧 차감 전 금액으로 한 번 기록합니다.
+
+| 대상 | 기록 |
+|---|---|
+| ECS 클러스터 | 예약 최대 CPU 75%·메모리 73.9%(롤링 중 새 Task를 함께 띄울 때), 사용 최대 CPU 50%·메모리 29% |
+| 서비스 | 메모리 최대 Task 상한의 34~48%. CPU는 컨테이너 단위 값이라 상한이 아닌 비율이며, Java 기동 때 남는 CPU를 빌려 Task 기준 최대 765%(같은 시간 호스트 CPU 최대 50%) |
+| HikariCP | 서비스마다 최대 5개 유지. 사용 중 연결 0, 연결 획득 평균 약 1ms, RDS CPU 최대 6.7%라 늘릴 이유가 없음. 앱 계정이 쓸 수 있는 연결은 `max_connections` 100에서 관리자 예약 5개(`superuser_reserved_connections` 3, `reserved_connections` 2)를 뺀 95개이고, 설계는 DB를 쓰는 6개 서비스가 모두 Task 2개가 되는 경우(호스트 교체 등)를 기준으로 함. 그 경우 7이면 84개로 연결 경보 기준(80)을 넘고, 8이면 96개로 95를 넘음. DB가 2 vCPU라 동시에 잘 처리하는 쿼리는 약 4~5개(HikariCP 문서의 기준식)여서 풀을 늘려도 처리량은 늘지 않음. 특정 서비스의 사용 중 연결이 상한에 붙거나 획득 시간이 오르면 그 서비스만 늘림 |
+| 호스트 | 앱 메모리 최대 38.7%·디스크 15.7%, Data 메모리 27.6%·루트 34%(5.4/16GB). Data 컨테이너 7개 재시작 0회·정상 |
+| 저장 | Kafka 30MB/30GB, 모니터링 148MB/20GB(Prometheus 약 34시간에 143MB, 7일이면 약 0.7GB 예상. Loki 2.8MB) |
+| RDS | CPU 최대 6.7%, 연결 최대 11(한도 100), 여유 메모리 최소 2.8GB, 여유 저장 17.1GB |
+| 응답 | 9,516건, p50 12.1ms·p99 66.4ms(시간대 최악 168.8ms, 관리자 대조를 실행한 10시). 5xx는 eureka 시험 26건뿐, ALB 자체 5xx 0 |
+
+**7일 운영 점검(28단계).** 경보 12개와 메일 전달을 실제로 확인했으므로 매일 점검하지 않고 다음 경우에만 봅니다.
+
+- 경보 메일이나 CD 실패 알림(GitHub)이 오면 대응합니다.
+- 시연·평가 직전에 업무 흐름(가입부터 충전·송금·환전까지)과 Mock Bank 시드 계좌 잔액을 한 번 확인합니다. 5xx 경보는 요청이 있어야 울려서 사용자가 없는 시간의 중단은 다음 사용 때 드러나고, 비동기 처리(충전 등)가 멈추면 5xx가 나지 않아 경보가 울리지 않기 때문입니다. Grafana 알림 규칙(지표 수집 중단 등)은 연락처 없이 화면에서만 상태를 봅니다.
+- 비용은 종료 때 한 번 기록합니다.
+
+**알려진 한계.**
+
+- 초기 운영 시험에서는 eureka 재배포 중 약 26초 동안 일부 요청이 503이었습니다. 아래 개선으로 재등록 대기를 줄이지만 무중단을 보장하지는 않습니다. eureka가 배포 대상인 변경은 사용자가 없는 시간에 진행합니다([CI·CD 가이드](ci-cd.md)의 규칙).
+- 11-13 기준 앱 호스트 한 대에 8개 서비스 중 6개가 있고(그 호스트 CPU 예약 87.5%), Service에 배치 규칙을 따로 정하지 않았습니다. 서비스마다 Task가 1개라 호스트가 멈추면 그 위 서비스가 멈추고, 남은 호스트가 모두 받지 못해 일부는 교체 호스트를 기다립니다. 배치 규칙은 Task가 교체될 때만 반영되므로 7일 운영에서는 바꾸지 않습니다.
+- 짧은 5xx 뒤 경보가 OK로 돌아오기까지 약 15분 걸립니다. 새 값이 없으면 평가 범위 안의 마지막 실제 값으로 판단하는 CloudWatch 동작입니다(AWS 문서).
+- 운영자 PC에서 잰 응답은 약 0.6초로, 서버 처리(약 13ms)보다 Cloudflare 경유(도쿄·홍콩)와 요청마다 새 연결을 맺는 시간이 대부분입니다. 감시 요청 약 8,900건 중 3건은 이 구간에서 시간 초과였고, 그때 ALB는 정상이었습니다.
+- 운영 DB에 시험 데이터가 있습니다. 이메일이 `ops-check-`로 시작하는 시험 회원과 그 지갑·거래, 시험 가맹점 1개, 관리자 계정 1개입니다. 종료 때 백업 범위와 함께 정리합니다.
+
+**Eureka 재등록 지연 개선(2026-11-13).**
+
+클라이언트 6개의 heartbeat를 30초에서 5초로 줄이고 서버의 기대 갱신 주기도 맞춥니다. 등록 만료 90초·목록 조회 5초·서버 응답 캐시 5초·종료 전 대기 20초는 유지합니다. 목록은 Eureka 클라이언트가 이미 보관하므로 LoadBalancer의 중복 캐시를 끕니다.
+
+| 로컬 재현 설정 | 클라이언트의 대상 목록 공백 |
+|---|---:|
+| heartbeat 30초, LoadBalancer 캐시 5초 | 약 24.9초 |
+| heartbeat 5초, LoadBalancer 캐시 5초 | 약 4.9초 |
+| heartbeat 5초, LoadBalancer 중복 캐시 끄기 | 약 5.0초 |
+
+Spring Cloud Netflix 5.0.3·Eureka Client 2.0.6의 실제 서버·클라이언트와 Spring Cloud LoadBalancer 5.0.4를 사용했습니다. 로컬 HTTP 업무 서버는 계속 실행한 채 Eureka만 교체했고, 각 설정을 한 번씩 측정했습니다. Gateway의 실제 503이나 AWS 롤링 배포 시간 측정은 아닙니다. 이 재현에서 공백 단축은 heartbeat 변경의 효과이며, 중복 캐시 제거에 추가 단축 효과가 있었다고 보지 않습니다.
+
+**heartbeat 5초 선택 근거.** 추가로 등록하는 클라이언트와 목록을 읽는 클라이언트를 분리하고, 조회 클라이언트를 2.5초 늦게 시작했습니다. 목록 조회·서버 응답 캐시는 5초, LoadBalancer 중복 캐시는 끈 상태로 고정했습니다. 초기 목록과 heartbeat를 확인한 뒤 0.1초·4.1초 시점에 Eureka를 교체해 각 후보를 두 조건에서 확인했습니다.
+
+| heartbeat | 목록 공백 관측 1 / 관측 2 | 서비스 6개의 이론상 heartbeat 요청/분 |
+|---|---|---:|
+| 1초 | 0초 / 약 5초 | 360 |
+| 2초 | 0초 / 약 5초 | 180 |
+| 5초 | 약 10초 / 0초 | 72 |
+| 10초 | 약 10초 / 약 5초 | 36 |
+
+두 조건의 관측값이며 통계적 분포나 복구 시간의 상한이 아닙니다. 1·2초는 재등록을 더 빨리 시작할 수 있지만, 서버 응답 캐시와 목록 조회 시점도 결과에 영향을 줍니다. 5초 설정에서도 약 10초 공백을 관측했으므로 heartbeat 주기를 복구 보장 시간으로 설명하지 않습니다.
+
+Eureka 2.0.6의 `TimedSupervisorTask`는 heartbeat 주기를 갱신 작업의 완료 대기 한도로도 사용합니다. 한도를 넘으면 타임아웃을 세고 다음 시도 대기를 늘립니다. 실제 라이브러리 감독 태스크에 지연을 넣은 시험에서 1.5초 작업은 1초 설정에서, 2.5초 작업은 2초 설정에서 타임아웃으로 판정됐고 다음 대기가 각각 2초·4초로 늘었습니다. 5초 설정은 두 작업을 모두 완료했습니다. 이는 의도적으로 넣은 지연이며 운영에서 같은 지연을 관측했다는 뜻은 아닙니다. 근거: [TimedSupervisorTask 2.0.6 소스](https://github.com/Netflix/eureka/blob/v2.0.6/eureka-client/src/main/java/com/netflix/discovery/TimedSupervisorTask.java).
+
+현재는 갱신 작업에 5초 여유를 두고, 기존 목록 조회 주기·호출량·아래 운영 검증 결과를 함께 고려해 5초를 유지합니다. 1·2초를 오류 설정으로 보거나 이 요청량이 바로 과부하를 일으킨다고 판단하지는 않습니다. 5초는 이 프로젝트의 실용적인 운영 선택이며 유일한 최적값으로 입증한 것은 아닙니다.
+
+클라이언트 6개 기준 heartbeat 요청은 이론상 분당 12회에서 72회로 늘어납니다(재시도 제외). 서버의 갱신 기준을 함께 맞추고, 만료 시간을 줄이지 않아 일시적인 갱신 누락만으로 더 빨리 제거되지는 않게 합니다. 실제 HTTP 통합 테스트는 최초 등록·등록 유실 뒤 복구·`OUT_OF_SERVICE` 반영을 확인하고, 바인딩 테스트는 ECS 환경 변수가 실제 Spring 설정에 들어가는지 확인합니다.
+
+Task 정의 변경을 apply해도 실행 중인 Task에는 반영되지 않습니다. 기존 CD에서 클라이언트 6개를 먼저 순차 교체한 뒤 Eureka를 교체해 실패 구간을 확인합니다. CD의 `services` 입력은 강제 배포 목록이며 이미지가 바뀐 다른 서비스도 선택될 수 있으므로 Plan 작업의 실제 선택 결과를 확인합니다. 적용 후에는 다시 Terraform plan을 실행해 의도하지 않은 변경이 없는지 확인합니다.
+
+**운영 적용 확인.** 저장 plan으로 Task 정의 7개를 갱신했고 이전 리비전은 보존했습니다. 이미 CI를 통과한 운영 main의 이미지 digest를 유지한 채, GitHub Actions가 사용하는 동일한 CD 배포 함수로 설정만 순차 반영했습니다. 새 GitHub Actions 실행이나 이미지 빌드는 하지 않았습니다.
+
+- 클라이언트 6개 교체 중 읽기 전용 `GET /api/v1/terms` 1,580건, 이어진 Eureka 교체 중 339건이 모두 200이었습니다. Cloudflare 캐시 상태는 `DYNAMIC`이었습니다.
+- 6개 앱의 실제 시작 로그에서 heartbeat 5초를 확인했고, 새 Eureka에 6개 서비스가 모두 등록됐습니다. 최종 앱 8개는 모두 `HEALTHY`이며 Mock Bank의 리비전은 그대로입니다.
+- 현재 실행 중인 Task의 해당 시험 시간대 JSON 로그에서 `ERROR`는 관측되지 않았습니다. Terraform apply 직후와 CD 반영 후 실제 plan은 모두 변경 0건이었습니다.
+
+운영 결과는 대표 API 한 경로의 재배포 시험 1회입니다. 여러 업무 API를 포함했던 기존 26초 기록과 측정 조건이 같지 않으므로 전체 API의 장애 시간이 0초가 됐다고 해석하지 않습니다.
+
+근거: [Eureka 등록 주기와 운영 주의](https://docs.spring.io/spring-cloud-netflix/reference/spring-cloud-netflix.html#why-is-it-so-slow-to-register-a-service), [Eureka 사용 시 LoadBalancer 중복 캐시 제거](https://docs.spring.io/spring-cloud-commons/reference/spring-cloud-commons/loadbalancer.html#spring-cloud-loadbalancer-caching). 공식 문서는 운영에서 기본 heartbeat 유지를 권고하므로, 이 프로젝트의 소규모 구성에서 확인한 결과와 변경 비용을 근거로 단축합니다. 이 결과를 일반적인 운영 환경의 권장값으로 확대하지 않습니다.
+
+**운영에서 하지 않은 시험.** 설계는 장애 시험을 승인된 시험 환경에서 하도록 정했습니다.
+
+- Redis·Kafka·DB 중지: 세션 Redis는 디스크에 저장하지 않아(`save ""`, `appendonly no`) 다시 시작하면 모든 사용자가 로그아웃되고, DB를 다시 시작하면 그동안 전체 서비스가 멈춥니다.
+- 스케줄러 실행 중 Task 종료: wallet·payment 교체 때는 스케줄러가 처리할 일이 없어 정상 종료만 확인했습니다. 처리 중에 끊는 시험은 운영에서 안전하게 만들 수 없어 하지 않았습니다.
 
 근거: [Terraform S3 Backend](https://developer.hashicorp.com/terraform/language/backend/s3), [Provider mocking](https://developer.hashicorp.com/terraform/language/tests/mocking), [Terraform 파일 구성](https://developer.hashicorp.com/terraform/language/files).

@@ -87,8 +87,14 @@ public class PaymentRepositoryImpl implements PaymentRepository  {
     }
 
     @Override
-    public List<Payment> findRecoveryTargets(Instant now, int limit) {
-        return paymentJpaRepository.findRecoveryTargets(now, limit);
+    public List<Payment> claimRecoveryTargets(Instant now, Instant claimedAt, int limit) {
+        return paymentJpaRepository.claimRecoveryTargets(now, claimedAt, limit);
+    }
+
+    @Override
+    public List<Payment> findManualReviewsAfter(Instant updatedBefore, Instant afterCreatedAt, UUID afterId,
+                                                int limit) {
+        return paymentJpaRepository.findManualReviewsAfter(updatedBefore, afterCreatedAt, afterId, limit);
     }
 
     @Override

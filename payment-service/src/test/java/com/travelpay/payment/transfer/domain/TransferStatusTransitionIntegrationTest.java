@@ -30,7 +30,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @Transactional
 class TransferStatusTransitionIntegrationTest extends PostgresContainerSupport {
 
-    private static final String REQUEST_HASH = "0".repeat(64);
     private static final Instant NOW = Instant.parse("2026-11-06T00:00:00Z");
 
     /** 시작 시도 횟수입니다. 0이 아니어야 시도 횟수 +1(결과 모름)과 0으로 되돌림(재처리)을 구분할 수 있습니다. */
@@ -52,12 +51,6 @@ class TransferStatusTransitionIntegrationTest extends PostgresContainerSupport {
 
     /** 상태를 바꾸는 조건부 UPDATE와 그 허용 시작 상태·결과입니다. */
     enum Operation {
-        CANCEL(TransferStatus.REQUESTED, TransferStatus.CANCELLED, null, null, START_ATTEMPTS) {
-            @Override
-            int apply(TransferRepository repository, Transfer transfer) {
-                return repository.cancelRequested(transfer.getId(), transfer.getSenderId(), NOW);
-            }
-        },
         FINISH_COMPLETED(TransferStatus.PROCESSING, TransferStatus.COMPLETED, null, null, START_ATTEMPTS) {
             @Override
             int apply(TransferRepository repository, Transfer transfer) {
@@ -71,10 +64,10 @@ class TransferStatusTransitionIntegrationTest extends PostgresContainerSupport {
                         TransferFailureReason.ACCOUNT_UNAVAILABLE, NOW);
             }
         },
-        CLAIM_FOR_RECOVERY(TransferStatus.PROCESSING, TransferStatus.PROCESSING, null, null, START_ATTEMPTS) {
+        RENEW_RECOVERY_CLAIM(TransferStatus.PROCESSING, TransferStatus.PROCESSING, null, null, START_ATTEMPTS) {
             @Override
             int apply(TransferRepository repository, Transfer transfer) {
-                return repository.claimForRecovery(transfer.getId(), transfer.getUpdatedAt(), NOW);
+                return repository.renewRecoveryClaim(transfer.getId(), transfer.getUpdatedAt(), NOW);
             }
         },
         RECORD_UNKNOWN(TransferStatus.PROCESSING, TransferStatus.PROCESSING, null, null, START_ATTEMPTS + 1) {
@@ -149,7 +142,7 @@ class TransferStatusTransitionIntegrationTest extends PostgresContainerSupport {
      * 시도 횟수는 결과 모름 기록만 +1, 운영자 재처리(PROCESSING)만 0으로 되돌리고 나머지는 그대로입니다.
      * 그 밖의 시작 상태: 0행이며 상태·사유·시도 횟수·수정 시각이 모두 그대로입니다.
      * 따라서 COMPLETED·FAILED·CANCELLED는 어떤 경로로도 바뀌지 않는 종료 상태이고,
-     * REQUESTED는 취소만, MANUAL_REVIEW는 운영자 확정만 받습니다.
+     * 예전 데이터인 REQUESTED도 바뀌지 않으며(취소 API 제거), MANUAL_REVIEW는 운영자 확정만 받습니다.
      */
     @ParameterizedTest(name = "{0} from {1}")
     @MethodSource("everyOperationFromEveryStatus")
@@ -173,10 +166,10 @@ class TransferStatusTransitionIntegrationTest extends PostgresContainerSupport {
         }
     }
 
-    /** 원하는 상태의 송금을 만듭니다. 생성 경로는 REQUESTED·PROCESSING뿐이므로 나머지는 SQL로 상태를 맞춥니다. */
+    /** 원하는 상태의 송금을 만듭니다. 생성 경로는 PROCESSING뿐이므로 나머지는 SQL로 상태를 맞춥니다. */
     private Transfer savedIn(TransferStatus status) {
         Transfer saved = transferRepository.saveAndFlush(Transfer.process(UUID.randomUUID(), UUID.randomUUID(),
-                UUID.randomUUID(), UUID.randomUUID(), 1_000L, "KRW", null, "transition", REQUEST_HASH));
+                UUID.randomUUID(), UUID.randomUUID(), 1_000L, "KRW", null, "transition"));
         String[] reasons = REASONS.getOrDefault(status, new String[] {null, null});
         jdbcTemplate.update(
                 "update transfer set status = ?, failure_reason = ?, review_reason = ?, attempt_count = ? where id = ?",

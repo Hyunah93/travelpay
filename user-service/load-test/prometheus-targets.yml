@@ -1,0 +1,21 @@
+- targets: [auth-gateway:18080]
+  labels:
+    service: gateway
+    environment: load-test
+- targets: [auth-user:18081]
+  labels:
+    service: user-service
+    environment: load-test
+- targets: [auth-eureka:18061]
+  labels:
+    service: eureka-server
+    environment: load-test
+# 업무 구성(--profile business)을 띄웠을 때만 수집됩니다. 꺼져 있으면 대상이 DOWN으로 보입니다.
+- targets: [auth-wallet:18082]
+  labels:
+    service: wallet-service
+    environment: load-test
+- targets: [auth-ledger:18085]
+  labels:
+    service: ledger-service
+    environment: load-test

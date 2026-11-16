@@ -97,6 +97,11 @@ class ExchangeOrderRepositoryAdapter implements ExchangeOrderRepository {
     }
 
     @Override
+    public List<ExchangeOrder> findNotCheckedSince(Instant cycleStartedAt, int limit) {
+        return jpaRepository.findNotCheckedSince(cycleStartedAt, limit);
+    }
+
+    @Override
     public long countProcessingRequestedAtOrBefore(Instant cutoff) {
         return jpaRepository.countProcessingRequestedAtOrBefore(cutoff);
     }

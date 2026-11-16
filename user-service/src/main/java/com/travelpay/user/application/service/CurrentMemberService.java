@@ -24,8 +24,7 @@ public class CurrentMemberService {
 
     public CurrentMemberService(UserRepository userRepository, PlatformTransactionManager transactionManager) {
         this.userRepository = userRepository;
-        this.readTransactions = new TransactionTemplate(transactionManager);
-        this.readTransactions.setReadOnly(true);
+        this.readTransactions = ReadTransactions.create(transactionManager);
     }
 
     public AuthenticatedUser requireActive(UUID userId) {

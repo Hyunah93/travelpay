@@ -6,6 +6,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.auth.AuthRole;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
@@ -58,6 +60,7 @@ class LoginServiceIntegrationTest {
     private static final String CLIENT_IP = "203.0.113.10";
 
     @Autowired private LoginService loginService;
+    @Autowired private DataSource dataSource;
     @Autowired private EntityManagerFactory entityManagerFactory;
     @Autowired private PlatformTransactionManager transactionManager;
     @Autowired private TrackingPasswordEncoder encoder;
@@ -127,6 +130,12 @@ class LoginServiceIntegrationTest {
 
         assertError(state == UserStatus.SUSPENDED ? UserErrorCode.ACCOUNT_SUSPENDED : UserErrorCode.ACCOUNT_CLOSED,
                 new LoginCommand(EMAIL, PASSWORD, CLIENT_IP));
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.user_credentials",
+                () -> loginService.login(new LoginCommand(EMAIL, PASSWORD, CLIENT_IP)));
     }
 
     @Test

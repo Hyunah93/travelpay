@@ -15,12 +15,14 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.config.YamlPropertiesFactoryBean;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.task.TaskSchedulingAutoConfiguration;
+import org.springframework.boot.convert.ApplicationConversionService;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.scheduling.support.PeriodicTrigger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -85,10 +87,12 @@ class SchedulingThreadPoolTest {
         doAnswer(invocation -> {
             recoveryStarted.countDown();
             releaseRecovery.await();
-            return new ExchangeOrderRecoveryService.RecoveryResult(1, 0, 1, 0);
-        }).when(recoveryService).recover(anyInt());
+            return new ExchangeOrderRecoveryService.RecoveryCycle(1, 1, 0, 1, 0, ExchangeOrderRecoveryService.EndReason.LEDGER_UNAVAILABLE, false);
+        }).when(recoveryService).recoverPending(anyInt(), any());
 
+        // 실제 앱처럼 "20s" 같은 설정값을 Duration으로 바꾸는 변환기를 쓴다(복구 제한 시간 time-budget)
         return new ApplicationContextRunner()
+                .withInitializer(context -> context.getBeanFactory().setConversionService(ApplicationConversionService.getSharedInstance()))
                 .withConfiguration(AutoConfigurations.of(TaskSchedulingAutoConfiguration.class))
                 .withUserConfiguration(ExchangeRateCollectionScheduler.class, ExchangeOrderRecoveryScheduler.class)
                 .withBean(ExchangeRateCollector.class, () -> collector)

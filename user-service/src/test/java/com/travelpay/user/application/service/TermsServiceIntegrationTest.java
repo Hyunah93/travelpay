@@ -5,6 +5,8 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 
+import javax.sql.DataSource;
+
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.user.application.dto.TermsResult;
@@ -52,6 +54,9 @@ class TermsServiceIntegrationTest {
     private TermsService termsService;
 
     @Autowired
+    private DataSource dataSource;
+
+    @Autowired
     private EntityManagerFactory entityManagerFactory;
 
     @Autowired
@@ -67,6 +72,12 @@ class TermsServiceIntegrationTest {
         // 이 클래스 전용 PostgreSQL 테스트 컨텍스트의 약관 데이터만 정리합니다.
         transactions.executeWithoutResult(status -> entityManager.createQuery("delete from TermsDocument")
                 .executeUpdate());
+    }
+
+    @Test
+    void aReadBlockedByATableLockGivesUpAtTheReadLimit() throws Exception {
+        ReadLimitCheck.assertGivesUpAtTheReadLimit(dataSource, "user_service.terms_documents",
+                () -> termsService.getCurrentTerms());
     }
 
     @Test

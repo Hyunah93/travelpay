@@ -1,9 +1,11 @@
 import base64
 import importlib.util
+import io
 from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 path = Path(__file__).parents[1] / "scripts" / "prepare-parameters.py"
 spec = importlib.util.spec_from_file_location("parameter_preparation", path)
@@ -86,15 +88,26 @@ class ParameterPreparationTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(parameters.ParameterPreparationError):
                 parameters.read_external("/travelpay/production/KOREAEXIM_API_KEY", prompt=lambda message: value)
 
+    def test_slack_webhook_input_accepts_only_the_issued_url_format(self):
+        # 발급 형식만 받아 env_file 줄바꿈 주입과 Grafana의 $ 치환을 막고, 다른 주소로 알림이 새지 않게 합니다.
+        name = "/travelpay/production/SLACK_WEBHOOK_URL"
+        url = "https://hooks.slack.com/services/T0123ABCD/B0456EFGH/abcDEF0123456789ghiJKL"
+        self.assertEqual(parameters.read_external(name, prompt=lambda message: url), url)
+        for value in ["", url + " ", url + "\nGF_X=1", url + "$HOME", "http://hooks.slack.com/services/T0/B0/x",
+                      "https://example.com/services/T0/B0/x", "https://hooks.slack.com/services/T0/B0",
+                      "https://hooks.slack.com.example.com/services/T0/B0/x"]:
+            with self.subTest(value=value), self.assertRaises(parameters.ParameterPreparationError):
+                parameters.read_external(name, prompt=lambda message: value)
+
     def test_contract_must_classify_every_secret(self):
         account = "123456789012"
         names = [f"{prefix}_DB_PASSWORD" for prefix in ["USER", "WALLET", "PAYMENT", "EXCHANGE", "LEDGER", "MOCK_BANK"]]
         names += ["REDIS_SESSION_PASSWORD", "REDIS_CACHE_PASSWORD", "WALLET_ACCOUNT_NUMBER_KEY", "GRAFANA_ADMIN_PASSWORD",
-                  "ORIGIN_AUTH", "KOREAEXIM_API_KEY"]
+                  "ORIGIN_AUTH", "KOREAEXIM_API_KEY", "SLACK_WEBHOOK_URL"]
         contract = {name: f"arn:aws:ssm:ap-northeast-2:{account}:parameter/travelpay/production/{name}" for name in names}
         ordered = parameters.parameter_names(contract, account)
-        self.assertEqual(len(ordered), 12)
-        self.assertEqual(ordered[-1], "/travelpay/production/KOREAEXIM_API_KEY")
+        self.assertEqual(len(ordered), 13)
+        self.assertEqual(ordered[-2:], ["/travelpay/production/KOREAEXIM_API_KEY", "/travelpay/production/SLACK_WEBHOOK_URL"])
         missing_wallet_with_extra_database = {name: arn for name, arn in contract.items() if name != "WALLET_ACCOUNT_NUMBER_KEY"}
         missing_wallet_with_extra_database["AUDIT_DB_PASSWORD"] = f"arn:aws:ssm:ap-northeast-2:{account}:parameter/travelpay/production/AUDIT_DB_PASSWORD"
         for broken in [
@@ -102,6 +115,7 @@ class ParameterPreparationTest(unittest.TestCase):
             {**contract, "NEW_SERVICE_TOKEN": f"arn:aws:ssm:ap-northeast-2:{account}:parameter/travelpay/production/NEW_SERVICE_TOKEN"},
             {**contract, "USER_DB_PASSWORD": f"arn:aws:ssm:ap-northeast-2:999999999999:parameter/travelpay/production/USER_DB_PASSWORD"},
             {name: arn for name, arn in contract.items() if name != "KOREAEXIM_API_KEY"},
+            {name: arn for name, arn in contract.items() if name != "SLACK_WEBHOOK_URL"},
             {name: arn for name, arn in contract.items() if name != "GRAFANA_ADMIN_PASSWORD"},
             {name: arn for name, arn in contract.items() if name != "ORIGIN_AUTH"},
         ]:
@@ -171,6 +185,53 @@ class ParameterPreparationTest(unittest.TestCase):
         host = importlib.util.module_from_spec(host_spec)
         host_spec.loader.exec_module(host)
         self.assertEqual(parameters.GRAFANA_PASSWORD_PATTERN, host.GRAFANA_PASSWORD_PATTERN)
+        self.assertEqual(parameters.SLACK_WEBHOOK_PATTERN, host.SLACK_WEBHOOK_PATTERN)
+
+    def test_set_slack_webhook_overwrites_only_that_parameter(self):
+        # 주소가 새어 Slack에서 다시 발급받았을 때 명령 인자에 주소를 남기지 않고 바꾸는 경로입니다.
+        calls = []
+        url = "https://hooks.slack.com/services/T0123ABCD/B0456EFGH/abcDEF0123456789ghiJKL"
+        parameters.set_slack_webhook(lambda operation, payload: calls.append((operation, payload)), url)
+        self.assertEqual(calls, [("put-parameter", {"Name": "/travelpay/production/SLACK_WEBHOOK_URL", "Value": url,
+                                                    "Type": "SecureString", "Tier": "Standard", "Overwrite": True})])
+
+    def test_slack_rotation_cli_previews_without_input_and_updates_only_slack(self):
+        names = [name + "_DB_PASSWORD" for name in ["USER", "WALLET", "PAYMENT", "EXCHANGE", "LEDGER", "MOCK_BANK"]]
+        names += ["REDIS_SESSION_PASSWORD", "REDIS_CACHE_PASSWORD", "WALLET_ACCOUNT_NUMBER_KEY",
+                  "GRAFANA_ADMIN_PASSWORD", "ORIGIN_AUTH", "KOREAEXIM_API_KEY", "SLACK_WEBHOOK_URL"]
+        contract = {name: f"arn:aws:ssm:ap-northeast-2:123456789012:parameter/travelpay/production/{name}" for name in names}
+        webhook = "https://hooks.slack.com/services/TTEST0000/BTEST0000/notarealtoken"
+        for apply in [False, True]:
+            with self.subTest(apply=apply):
+                writes = []
+
+                def run(command, payload=None, env=None):
+                    if command[0] == "terraform":
+                        return {"planned_values": {"outputs": {"runtime_secret_parameters": {"value": contract}}}}
+                    if "get-caller-identity" in command:
+                        return {"Account": "123456789012", "UserId": "test", "Arn": "arn:aws:iam::123456789012:user/test"}
+                    if "describe-parameters" in command:
+                        return {"Parameters": [{"Name": payload["ParameterFilters"][0]["Values"][0], "Type": "SecureString"}]}
+                    if "put-parameter" in command:
+                        writes.append(payload)
+                        return {}
+                    self.fail("예상하지 않은 외부 호출")
+
+                arguments = ["prepare-parameters.py", "test.tfplan", "--profile", "test", "--account", "123456789012",
+                             "--set-slack-webhook"] + (["--apply"] if apply else [])
+                output = io.StringIO()
+                with patch.object(sys, "argv", arguments), patch.object(parameters, "run_json", side_effect=run), \
+                        patch.object(parameters, "history_enabled", return_value=False), \
+                        patch.object(parameters, "read_external", return_value=webhook) as prompt, \
+                        patch.object(sys, "stdout", output):
+                    parameters.main()
+                self.assertEqual(len(writes), 1 if apply else 0)
+                if apply:
+                    self.assertEqual(writes, [{"Name": "/travelpay/production/SLACK_WEBHOOK_URL", "Value": webhook,
+                                              "Type": "SecureString", "Tier": "Standard", "Overwrite": True}])
+                else:
+                    self.assertFalse(prompt.called)
+                self.assertNotIn(webhook, output.getvalue())
 
     def test_set_grafana_password_overwrites_only_that_parameter(self):
         calls = []

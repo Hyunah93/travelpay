@@ -8,6 +8,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import com.travelpay.payment.transfer.application.TransferRecoveryScheduler;
+import com.travelpay.payment.transfer.application.TransferReviewReconciler;
 import com.travelpay.payment.transfer.application.TransferService;
 import com.travelpay.payment.infra.client.ledger.LedgerFeignApi;
 import com.travelpay.payment.transfer.support.TransferApiIntegrationSupport;
@@ -29,6 +30,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -53,7 +55,8 @@ class TransferRecoverySchedulerIntegrationTest extends TransferApiIntegrationSup
         // 복구는 DB의 모든 처리 중 송금을 다루므로, 다른 처리 중 송금이 있으면 결과가 섞여 실행하지 않습니다.
         assumeTrue(countByStatus("PROCESSING") == 0, "DB에 다른 PROCESSING 송금이 없어야 합니다.");
         meterRegistry = new SimpleMeterRegistry();
-        scheduler = new TransferRecoveryScheduler(transferService, meterRegistry);
+        // MANUAL_REVIEW 자동 대사는 TransferReviewReconcilerIntegrationTest에서 확인합니다.
+        scheduler = new TransferRecoveryScheduler(transferService, mock(TransferReviewReconciler.class), meterRegistry);
     }
 
     /** TC-10-I1: 결과 모름으로 남은 송금을 재요청 없이 스케줄러가 같은 reference로 재전송해 COMPLETED로 확정합니다. */
@@ -175,6 +178,8 @@ class TransferRecoverySchedulerIntegrationTest extends TransferApiIntegrationSup
                 .andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.data.status").value("PROCESSING")));
         assertEquals(1, ((Number) row(id).get("attempt_count")).intValue());
+        // 준비용으로 낸 원장 실패가 쌓여 서킷이 열리면 복구가 원장에 보내지 않으므로, 서킷 기록을 지웁니다.
+        resetLedgerCircuitBreaker();
         return id;
     }
 
