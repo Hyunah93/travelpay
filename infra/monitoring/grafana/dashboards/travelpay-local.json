@@ -1056,7 +1056,7 @@
     {
       "id": 20,
       "title": "서킷 상태",
-      "description": "서비스별 Resilience4j 서킷 상태입니다. 닫힘은 호출 허용, 열림은 호출 차단, 반열림은 회복 시험 호출 중입니다. 비활성·계측만은 호출을 차단하지 않는 모드입니다. 여러 Task가 공존하면 보호 해제(계측만·비활성), 열림, 반열림, 닫힘 순으로 우선 표시하며 서로 다른 Task의 상태 값을 더하지 않습니다. Gateway는 세션 확인 API, Wallet은 은행별, Payment·Exchange는 원장 호출 서킷입니다. 강제 열림도 열림으로 표시합니다. 짧은 열림은 15초 수집 주기 사이에 지나갈 수 있어 거절 횟수 패널을 함께 봅니다. User에는 서킷이 없고 User로 가는 세션 확인 서킷은 gateway에 있으므로, 서킷이 있는 서비스(gateway·wallet-service·payment-service·exchange-service)를 골라야 표시됩니다. 서킷이 없는 서비스만 고르면 빈 결과가 'Data does not have a time field'로 보입니다.",
+      "description": "서비스별 Resilience4j 서킷 상태입니다. 닫힘은 호출 허용, 열림은 호출 차단, 반열림은 회복 시험 호출 중입니다. 비활성·계측만은 호출을 차단하지 않는 모드입니다. 여러 Task가 공존하면 보호 해제(계측만·비활성), 열림, 반열림, 닫힘 순으로 우선 표시하며 서로 다른 Task의 상태 값을 더하지 않습니다. Gateway는 세션 확인 API, Wallet은 은행별, Payment·Exchange는 원장 호출 서킷입니다. 강제 열림도 열림으로 표시합니다. 짧은 열림은 15초 수집 주기 사이에 지나갈 수 있어 거절 횟수 패널을 함께 봅니다. User에는 서킷이 없고 User로 가는 세션 확인 서킷은 gateway에 있으므로, 서킷이 있는 서비스(gateway·wallet-service·payment-service·exchange-service)를 골라야 표시됩니다. Wallet의 은행 서킷은 그 은행을 처음 호출할 때 생기므로 배포 직후에는 없을 수 있습니다. 표시할 서킷이 없으면 빈 결과가 'Data does not have a time field'로 보입니다.",
       "type": "state-timeline",
       "gridPos": {
         "x": 0,

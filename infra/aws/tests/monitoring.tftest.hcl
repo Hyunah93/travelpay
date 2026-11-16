@@ -334,7 +334,11 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
     condition = (
       [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.uid] == ["service-metrics-missing", "payment-recovery-scheduler-stalled", "circuit-breaker-rejecting"] &&
       [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : [rule.noDataState, rule.for]] == [["Alerting", "2m"], ["OK", "2m"], ["OK", "2m"]] &&
-      # 서킷 차단 규칙의 시간 조건(1분 창·2분 지속)은 tests/test_dashboard_queries.py가 promtool로 확인하므로 식을 고정합니다.
+      # 임계값이 뒤집히면(예: 0건일 때 알림) 모든 서킷·서비스가 울리므로 세 규칙의 판정 조건을 고정합니다.
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.data[1].model.conditions[0].evaluator] == [
+        { type = "lt", params = [1] }, { type = "lt", params = [1] }, { type = "gt", params = [0] },
+      ] &&
+      # 서킷 차단 규칙의 1분 창·2분 지속·임계값은 tests/test_dashboard_queries.py가 이 템플릿에서 읽어 promtool로 시점별로 확인합니다.
       yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[2].data[0].model.expr == "sum by (service, name) (increase(resilience4j_circuitbreaker_not_permitted_calls_total{job=\"spring-jvm\",environment=\"production\"}[1m]))" &&
       # 식의 뜻(0으로 채우기·실행 기록 없음 보완)은 실제 Prometheus·Grafana로 확인했으므로 식 전체를 고정합니다.
       yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[0].data[0].model.expr == join(" or ", concat(

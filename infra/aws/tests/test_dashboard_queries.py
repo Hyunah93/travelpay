@@ -59,23 +59,28 @@ class DashboardQueryTest(unittest.TestCase):
 
 
     def test_circuit_rule_fires_only_for_sustained_rejections(self):
-        # 운영 규칙(grafana-alert-operations.yml.tftpl)의 식과 같은 평가 주기(30s)·지속 조건(2m)으로 Prometheus 규칙을 만들어 봅니다.
-        # 계속 거절하는 서킷은 알리고, 한 번 열렸다 바로 회복한 서킷은 알리지 않아야 합니다.
+        # 운영 규칙(grafana-alert-operations.yml.tftpl)의 식·임계값·지속 시간을 그대로 읽어 같은 평가 주기(30s)의 Prometheus 규칙으로
+        # 바꿔 봅니다. 계속 거절하는 서킷은 알리고, 한 번 열렸다 바로 회복한 서킷은 어느 시점에도 알리지 않아야 합니다.
         template = (ROOT / "templates/monitoring/grafana-alert-operations.yml.tftpl").read_text()
         rule = template[template.index("uid: circuit-breaker-rejecting"):]
         expr = re.search(r"expr: >-\n\s+(.+)\n", rule).group(1)
-        self.assertIn("for: 2m", rule)
+        evaluator, threshold = re.search(r"type: (gt|lt)\n\s+params: \[([0-9.]+)\]", rule).groups()
+        duration = re.search(r"\n\s+for: (\S+)\n", rule).group(1)
+        operator = {"gt": ">", "lt": "<"}[evaluator]
         rules = {"groups": [{"name": "circuit", "interval": "30s",
-                             "rules": [{"alert": "CircuitRejecting", "expr": expr + " > 0", "for": "2m"}]}]}
+                             "rules": [{"alert": "CircuitRejecting", "expr": f"{expr} {operator} {threshold}", "for": duration}]}]}
         labels = 'job="spring-jvm",environment="production",service="gateway",name="{}"'
+        sustained = [{"exp_labels": {"service": "gateway", "name": "sustained"}}]
+        # 짧은 거절(blip)은 1분 15초에 한 번 늘고 멈춥니다. 2분은 지속 조건을 줄였을 때, 3분 30초는 창을 늘렸을 때 알림이 나는
+        # 시점이라 함께 봅니다. 계속 거절하는 서킷은 30초부터 조건을 만족해 2분 30초에 알림이 됩니다.
+        checks = [("2m", []), ("3m", sustained), ("3m30s", sustained), ("4m", sustained)]
         fixture = {"rule_files": ["/work/rules.json"], "evaluation_interval": "30s", "tests": [{
             "interval": "15s",
             "input_series": [
                 {"series": "resilience4j_circuitbreaker_not_permitted_calls_total{" + labels.format("sustained") + "}", "values": "0+1x30"},
                 {"series": "resilience4j_circuitbreaker_not_permitted_calls_total{" + labels.format("blip") + "}", "values": "0x4 5x26"},
             ],
-            "alert_rule_test": [{"eval_time": "4m", "alertname": "CircuitRejecting",
-                                 "exp_alerts": [{"exp_labels": {"service": "gateway", "name": "sustained"}}]}],
+            "alert_rule_test": [{"eval_time": at, "alertname": "CircuitRejecting", "exp_alerts": alerts} for at, alerts in checks],
         }]}
         with tempfile.TemporaryDirectory() as work:
             (Path(work) / "rules.json").write_text(json.dumps(rules))
@@ -87,6 +92,7 @@ class DashboardQueryTest(unittest.TestCase):
                                      "--entrypoint", "/bin/promtool", "-v", f"{work}:/work:ro", PROMETHEUS_IMAGE,
                                      "test", "rules", "/work/test.json"], capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
