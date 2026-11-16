@@ -266,7 +266,7 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
       ] :
       token => length(split(token, file("${path.module}/../monitoring/grafana/dashboards/travelpay-local.json"))) - 1
       } == {
-      "prometheus-local"                                                                   = 23, "loki-local" = 1, "travelpay-local-perf" = 1,
+      "prometheus-local"                                                                   = 27, "loki-local" = 1, "travelpay-local-perf" = 1,
       "TRAVELPAY | Local Performance"                                                      = 1, "local|load-test" = 2, "docker-local|spring-local" = 1, "\"local\"" = 3,
       "local=로컬 개발 앱, load-test=전용 부하 시험 앱. 한 환경씩 선택합니다. 이 필터는 메트릭에만 적용되며 로그에는 적용하지 않습니다." = 1,
       "수집된 로컬 앱·개발 인프라 로그입니다."                                                             = 1, "Trace ID는 로그 원문을 검색하며 메트릭 환경 필터는 로그에 적용되지 않습니다." = 1,
