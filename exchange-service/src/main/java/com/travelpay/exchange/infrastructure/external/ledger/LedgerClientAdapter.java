@@ -74,6 +74,16 @@ public class LedgerClientAdapter implements LedgerClient {
         }
     }
 
+    /**
+     * 서킷이 열려 있으면(원장에 보내지 않는 상태) false입니다. 반열림은 시험 호출을 보내야 하므로 true입니다.
+     * 서킷은 열린 뒤 대기 시간이 지나면 호출이 없어도 스스로 반열림으로 바뀝니다(LedgerCircuitBreakerConfiguration).
+     */
+    @Override
+    public boolean isAvailable() {
+        CircuitBreaker.State state = circuitBreaker.getState();
+        return state != CircuitBreaker.State.OPEN && state != CircuitBreaker.State.FORCED_OPEN;
+    }
+
     private LedgerPostResult register(LedgerPosting posting) {
         ApiResponse<LedgerTransactionResponse> response;
         try {

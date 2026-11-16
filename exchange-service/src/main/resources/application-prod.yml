@@ -74,6 +74,37 @@ exchange:
       CNY:
         min: 10.00
         max: 10000.00
+  order:
+    # 결과를 모르는 주문의 복구(#317). application.yml과 같은 값을 둔다(이 파일만 읽으므로 빠지면 코드 기본값이 쓰임).
+    # 5초마다 깨어나 batch-size건씩 가져와 처리하고 밀린 게 남았으면 time-budget까지 이어서 처리한다.
+    # 적체 지표(30분 넘은 PROCESSING 수 등)는 backlog-refresh마다 따로 센다
+    recovery:
+      enabled: true
+      fixed-delay: 5s
+      batch-size: 50
+      time-budget: 20s
+      backlog-refresh: 30s
+  ledger:
+    # 원장 거래 등록 서킷 브레이커(#282). application.yml과 같은 값을 둔다.
+    # 최근 10초 동안 20건 이상 호출됐고 절반 이상이 실패(시간 초과·연결 실패·5xx)이거나 2초 이상 걸리면 열고,
+    # 10초 뒤 스스로 반열림으로 바뀌어 5건을 시험으로 보낸다
+    circuit-breaker:
+      sliding-window: 10s
+      minimum-calls: 20
+      failure-rate-percent: 50
+      slow-call-duration: 2s
+      slow-call-rate-percent: 50
+      wait-in-open: 10s
+      half-open-calls: 5
+  reservation:
+    # 예약 환전(#240). application.yml과 같은 값을 둔다. 최대 예약 기간과 회원당 동시 대기 예약 수
+    max-period: 30d
+    max-waiting-per-user: 10
+    # 만료 시각이 지난 대기 예약을 EXPIRED로 바꾸는 주기와 한 배치 크기
+    expiry:
+      enabled: true
+      fixed-delay: 1m
+      batch-size: 500
 
 server:
   port: 8080
@@ -88,6 +119,8 @@ eureka:
       defaultZone: http://eureka-server:8761/eureka/
 
 management:
+  # HTTP 응답 시간 히스토그램(percentiles-histogram)은 application.yml(로컬)에만 켠다. 운영은 지표 저장 비용 때문에 팀 방침으로
+  # 끄고, p95·p99 같은 측정은 로컬 모니터링 환경에서 본다
   health:
     redis:
       # 캐시 Redis가 꺼져도 DB로 조회해 서비스는 동작하므로, Redis 상태로 앱 health를 DOWN으로 만들지 않는다

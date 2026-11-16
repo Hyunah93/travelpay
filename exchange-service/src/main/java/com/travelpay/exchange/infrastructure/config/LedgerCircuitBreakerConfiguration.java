@@ -52,6 +52,9 @@ public class LedgerCircuitBreakerConfiguration {
                 .slowCallRateThreshold(properties.slowCallRatePercent())
                 .waitDurationInOpenState(properties.waitInOpen())
                 .permittedNumberOfCallsInHalfOpenState(properties.halfOpenCalls())
+                // 열린 뒤 대기 시간이 지나면 호출이 없어도 반열림으로 바꾼다(#317). 복구는 서킷이 열려 있으면 원장을 부르지 않으므로,
+                // 이게 없으면 신청이 없는 시간대에 아무도 원장을 부르지 않아 서킷이 계속 열려 있고 복구도 멈춘다
+                .automaticTransitionFromOpenToHalfOpenEnabled(true)
                 // 원장 클라이언트는 실패를 예외 대신 결과로 돌려주므로, 결과 모름만 실패로 센다
                 .recordResult(result -> result instanceof LedgerPostResult.Unknown)
                 .build();

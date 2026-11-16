@@ -35,6 +35,7 @@ import tools.jackson.databind.json.JsonMapper;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -378,6 +379,21 @@ class LedgerClientAdapterTest {
             assertInstanceOf(LedgerPostResult.Rejected.class, guarded.post(POSTING));
         }
         verify(feignClient, times(5)).register(any());
+    }
+
+    /** 서킷이 열려 있을 때만 "보낼 수 없음". 반열림은 시험 호출을 보내야 하므로 보낼 수 있음(#317) */
+    @Test
+    void reportsAvailabilityFromCircuitState() {
+        CircuitBreaker circuit = CircuitBreaker.ofDefaults("test");
+        LedgerClientAdapter guarded = new LedgerClientAdapter(feignClient, circuit);
+
+        assertTrue(guarded.isAvailable());
+        circuit.transitionToOpenState();
+        assertFalse(guarded.isAvailable());
+        circuit.transitionToHalfOpenState();
+        assertTrue(guarded.isAvailable());
+        circuit.transitionToForcedOpenState();
+        assertFalse(guarded.isAvailable());
     }
 
     /** 최근 2건 중 절반이 실패·느린 호출이면 여는 작은 서킷(테스트용). 결과 판단은 실제 설정과 같다 */
