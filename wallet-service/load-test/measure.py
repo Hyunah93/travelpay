@@ -322,6 +322,8 @@ def charge_metrics(data, since, until=None, ignore_members=False):
         "byBank": charges_by_bank(measured),
         # 꼬리 지표 1: 완료 지연 분포(충전 하나의 접수 → 첫 COMPLETED). completionLatencyMs와 같은 데이터·같은 백분위 함수
         "completionLatencyTailMs": {"count": int(completed_count), "p99": optional_ms(p99), "max": optional_ms(max_ms)},
+        # 측정 충전을 낸 회원 수(user_id 종류). --recompute가 이 키가 있는 결과 파일에서만 비교
+        "memberCount": int(psql(f"SELECT count(DISTINCT user_id) FROM ({measured}) m;")[0][0]),
     }
     # 꼬리 지표 2·3: 종결 진행(전체 첫 접수 기준), 꼬리 구간(종결 순서 앞 99% 뒤) 충전 구성
     result.update(terminal_progress(measured, first_created, result["byBank"]))
@@ -364,7 +366,7 @@ PROGRESS_DEFINITION = ("terminalProgress = 전체 첫 접수(firstCreatedAt)부�
                        " 은행별도 기준점은 전체 firstCreatedAt. tailSeconds = 99% 시각 → 100% 시각."
                        " 충전 하나의 접수 → 완료 지연(completionLatencyMs·completionLatencyTailMs)과 다른 지표")
 TAIL_DEFINITION = ("tailCharges = 종결 시각(같으면 충전 ID) 순으로 정렬해 앞 99%(건수 올림) 뒤에 오는 충전(전체 기준)."
-                   " 종결되지 않은 충전은 맨 뒤. recovered는 recoveredCharges와 같은 기준")
+                   " 종결되지 않은 충전은 충전 ID 순으로 맨 뒤. recovered는 recoveredCharges와 같은 기준")
 
 
 def progress_seconds(ordered, total, first_created):
@@ -399,7 +401,8 @@ def terminal_progress(measured, first_created, by_bank):
         by_bank[bank]["terminalProgress"] = progress["byBank"][bank]
     progress["definition"] = PROGRESS_DEFINITION
 
-    ordered = terminated + [charge for charge in charges if charge[0] is None]
+    # 종결되지 않은 충전은 충전 ID 순으로 맨 뒤에 붙임(조회 순서에 따라 꼬리 구성이 바뀌지 않게)
+    ordered = terminated + sorted((charge for charge in charges if charge[0] is None), key=lambda c: c[1])
     tail = ordered[-(-len(ordered) * TAIL_FROM // 100):]
     return {
         "terminalProgress": progress,
@@ -798,7 +801,7 @@ def parse_iso(text):
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
 
 
-def recompute_checks(original, charges, recovered, members, member_limit):
+def recompute_checks(original, charges, recovered):
     """다시 계산한 값과 결과 파일 값 (이름, 결과 파일, 다시 계산) 목록"""
     source = original["charges"]
     checks = [("accepted", source["accepted"], charges["accepted"]),
@@ -819,9 +822,9 @@ def recompute_checks(original, charges, recovered, members, member_limit):
     for key in ("p50", "p95"):
         checks.append((f"recoveredLatencyMs.{key}", (fault.get("recoveredLatencyMs") or {}).get(key),
                        recovered["recoveredLatencyMs"][key]))
-    if member_limit is not None:
-        # 측정 당시 회원 수는 결과 파일에 없어 지금 users.json 회원 수(같은 prepare.py 설정)와 비교
-        checks.append(("memberCount(users.json 회원 수와 비교)", member_limit, members))
+    if "memberCount" in source:
+        # charges.memberCount가 없는 이전 결과 파일은 회원 수를 비교하지 않음(지금 users.json과는 비교하지 않음)
+        checks.append(("memberCount", source["memberCount"], charges["memberCount"]))
     return [{"name": name, "original": before, "recomputed": after, "same": before == after}
             for name, before, after in checks]
 
@@ -845,9 +848,8 @@ def recompute(label, ignore_members=False):
                          " 다시 계산하지 않습니다.")
     measured = measured_sql(data, since, until, ignore_members)
     recovered = recovered_metrics(measured)
-    members = int(psql(f"SELECT count(DISTINCT user_id) FROM ({measured}) m;")[0][0])
-    checks = recompute_checks(original, charges, recovered, members,
-                              len(data["users"]) if ignore_members else None)
+    members = charges["memberCount"]   # 참고값. 결과 파일에 charges.memberCount가 있을 때만 검증에 들어감
+    checks = recompute_checks(original, charges, recovered)
     differ = [check for check in checks if not check["same"]]
     if differ:
         for check in differ:
@@ -863,7 +865,7 @@ def recompute(label, ignore_members=False):
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     latency = charges.get("completionLatencyMs") or {}
     print(f"[{result['label']}] 다시 계산 ({source.name}, 조회 {charges['accepted']}건 = 결과 파일 {expected}건,"
-          f" 회원 {members}명, 검증 {len(checks)}개 값 일치)")
+          f" 회원 {members}명(참고), 검증 {len(checks)}개 값 일치)")
     if ignore_members:
         print(f"  회원 조건 없이 고름(--ignore-members): {INDIRECT_ONLY}")
     print(f"  완료 처리량 {charges.get('completionTps')}건/초 | 완료 지연 P50 {latency.get('p50')}ms P95 {latency.get('p95')}ms")
