@@ -349,7 +349,10 @@ Mock 은행이 출금 2xx 응답을 비율만큼 처리·커밋한 뒤 500으로
 | `charges.accepted`, `statuses` | `charge_requests` | 실제 접수 건수(DB), 상태별 건수·금액 |
 | `charges.completionTps` | `charge_requests.created_at`, `charge_status_history` | 접수 건수 ÷ (첫 `created_at` ~ 마지막 종결 시각) |
 | `charges.completionLatencyMs` | `charge_status_history` | `COMPLETED` 기록 시각 − `created_at`의 P50·P95 |
-| `charges.byBank.<은행 코드>` | `charge_requests.bank_code` | 은행별 `accepted`(접수 건수), `statuses`(상태별 건수·금액), `completionLatencyMs`(P50·P95·`count`, 계산은 전체 값과 같음). 은행이 하나여도 남음 |
+| `charges.byBank.<은행 코드>` | `charge_requests.bank_code` | 은행별 `accepted`(접수 건수), `statuses`(상태별 건수·금액), `completionLatencyMs`(P50·P95·`count`, 계산은 전체 값과 같음). 은행이 하나여도 남음. 아래 꼬리 지표(`completionLatencyTailMs`, `terminalProgress`)도 은행별로 남음 |
+| `charges.completionLatencyTailMs` | `charge_status_history` | **완료 지연 분포**(충전 하나의 접수 → 완료)의 P99·최댓값. `completionLatencyMs`와 같은 데이터·같은 백분위 계산 |
+| `charges.terminalProgress` | `charge_requests.created_at`, `charge_status_history` | **종결 진행**: 전체 첫 접수부터 측정 충전의 50·90·99·100%(건수 올림)가 종결된 시각(초). 충전 하나의 지연이 아니라 묶음 전체가 끝나 가는 모습이며, 은행별도 기준점은 전체 첫 접수. `tailSeconds` = 99% 시각 → 100% 시각 |
+| `charges.tailCharges` | `charge_status_history` | 종결 순서 앞 99%(올림) 뒤에 오는 충전의 건수·은행별 건수·그중 복구 개입 건수(`recoveredCharges`와 같은 기준) |
 | `services.<서비스>.<경로>.avgMs` | `http_server_requests_seconds` 합계·횟수 차이 | wallet 충전 접수, user I03, ledger 거래 등록, mock-bank 출금(·환불) 평균 처리 시간 |
 | `services.<서비스>.hikariPending` / `hikariActive` | `hikaricp_connections_*` | 커넥션 대기·사용 평균·최대 (wallet·ledger를 봄) |
 | `services.systemCpuPercent` | wallet `system_cpu_usage` | Docker 가상 머신 전체 CPU(컨테이너 CPU 한도 없음) |
@@ -362,6 +365,10 @@ Mock 은행이 출금 2xx 응답을 비율만큼 처리·커밋한 뒤 500으로
 | `failures` | | 종료 코드 1의 이유 |
 
 서비스 지표 구간은 k6 시작 ~ 마지막 종결 시각입니다(접수 뒤에도 SAGA가 은행·원장을 부르므로).
+
+지난 측정의 충전 지표(꼬리 지표 포함)는 `python measure.py --recompute <LABEL>`로 다시 계산합니다. `results/<LABEL>-c*-metrics.json`(정확히 1개)의 `window`로 충전을 다시 고르고(측정 회원 + `window.from − 5초 ≤ created_at ≤ window.to`), 조회 건수가 결과 파일의 `accepted`와 다르면 멈춥니다. 결과는 `results/<원래 파일명>-recompute.json`에 쓰고 원래 파일은 그대로 둡니다. 측정 회원은 지금의 `data/users.json`이라, 측정 뒤 `prepare.py`로 회원을 새로 만들었으면 0건으로 멈춥니다.
+
+그럴 때만 `--ignore-members`를 붙여 회원 조건 없이 기간만으로 고릅니다. 이때는 건수(전체·은행별), `firstCreatedAt`, `lastTerminalAt`, 완료 지연 P50·P95(전체·은행별), `recoveredCharges`·`recoveredLatencyMs` P50·P95, 회원 수(지금 `users.json`의 회원 수와 비교)가 결과 파일과 하나라도 다르면 멈춥니다. 결과 파일의 `selection`에 `ignoreMembers: true`와 "동일 충전 집합 미증명(통계값 일치로 간접 확인)"이 남습니다. 충전 ID 목록은 어디에도 기록되지 않아 같은 충전인지 직접 비교할 수 없기 때문입니다(대사는 어긋난 충전만 남김).
 
 `fault` 블록:
 
