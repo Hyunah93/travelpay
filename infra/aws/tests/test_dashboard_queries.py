@@ -58,5 +58,35 @@ class DashboardQueryTest(unittest.TestCase):
                          ["닫힘", "반열림", "열림", "비활성", "계측만"])
 
 
+    def test_circuit_rule_fires_only_for_sustained_rejections(self):
+        # 운영 규칙(grafana-alert-operations.yml.tftpl)의 식과 같은 평가 주기(30s)·지속 조건(2m)으로 Prometheus 규칙을 만들어 봅니다.
+        # 계속 거절하는 서킷은 알리고, 한 번 열렸다 바로 회복한 서킷은 알리지 않아야 합니다.
+        template = (ROOT / "templates/monitoring/grafana-alert-operations.yml.tftpl").read_text()
+        rule = template[template.index("uid: circuit-breaker-rejecting"):]
+        expr = re.search(r"expr: >-\n\s+(.+)\n", rule).group(1)
+        self.assertIn("for: 2m", rule)
+        rules = {"groups": [{"name": "circuit", "interval": "30s",
+                             "rules": [{"alert": "CircuitRejecting", "expr": expr + " > 0", "for": "2m"}]}]}
+        labels = 'job="spring-jvm",environment="production",service="gateway",name="{}"'
+        fixture = {"rule_files": ["/work/rules.json"], "evaluation_interval": "30s", "tests": [{
+            "interval": "15s",
+            "input_series": [
+                {"series": "resilience4j_circuitbreaker_not_permitted_calls_total{" + labels.format("sustained") + "}", "values": "0+1x30"},
+                {"series": "resilience4j_circuitbreaker_not_permitted_calls_total{" + labels.format("blip") + "}", "values": "0x4 5x26"},
+            ],
+            "alert_rule_test": [{"eval_time": "4m", "alertname": "CircuitRejecting",
+                                 "exp_alerts": [{"exp_labels": {"service": "gateway", "name": "sustained"}}]}],
+        }]}
+        with tempfile.TemporaryDirectory() as work:
+            (Path(work) / "rules.json").write_text(json.dumps(rules))
+            (Path(work) / "test.json").write_text(json.dumps(fixture))
+            Path(work).chmod(0o755)
+            for name in ("rules.json", "test.json"):
+                (Path(work) / name).chmod(0o644)
+            result = subprocess.run(["docker", "run", "--rm", "--network", "none", "--pull=never",
+                                     "--entrypoint", "/bin/promtool", "-v", f"{work}:/work:ro", PROMETHEUS_IMAGE,
+                                     "test", "rules", "/work/test.json"], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 if __name__ == "__main__":
     unittest.main()

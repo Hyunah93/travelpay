@@ -499,13 +499,13 @@ Data 호스트의 모니터링은 Redis·Kafka와 Compose 프로젝트, systemd 
 - **대시보드·알림:** 운영 대시보드와 송금 알림 규칙은 `infra/monitoring`의 로컬 파일에서 데이터소스, 환경, 로그 job, uid만 바꿔 만듭니다. 원본에서 바꿀 곳의 수는 테스트가 확인합니다.
 - **AWS 기본 지표:** RDS·호스트·ECS·ALB 지표와 경보 상태는 CloudWatch 대시보드(`travelpay-production`)로 봅니다. Data 호스트는 IMDS hop 제한(1)으로 컨테이너가 인스턴스 역할 자격 증명을 받지 못하게 했습니다. 그래서 Grafana는 AWS API를 조회하지 않습니다.
 
-Grafana 알림 규칙은 네 개이고, Webhook을 발급할 때 선택한 Slack 채널(예: `#monitoring`)로 보냅니다. 규칙마다 받을 곳을 정하지 않고 기본 알림 정책 하나(`templates/monitoring/grafana-alert-notifications.yml`)를 따릅니다. 같은 규칙의 알림은 묶어서 보내며, 해결 알림도 보내고 미해결 상태는 4시간마다 다시 알립니다. 알림 정책은 트리 전체를 이 파일로 관리하므로 Grafana 화면에서 바꾸지 않습니다.
+Grafana 알림 규칙은 다섯 개이고, Webhook을 발급할 때 선택한 Slack 채널(예: `#monitoring`)로 보냅니다. 규칙마다 받을 곳을 정하지 않고 기본 알림 정책 하나(`templates/monitoring/grafana-alert-notifications.yml`)를 따릅니다. 같은 규칙의 알림은 묶어서 보내며, 해결 알림도 보내고 미해결 상태는 4시간마다 다시 알립니다. 알림 정책은 트리 전체를 이 파일로 관리하므로 Grafana 화면에서 바꾸지 않습니다.
 
 Webhook 주소는 Parameter Store의 `SLACK_WEBHOOK_URL`에 두고 S3 설정 묶음에는 넣지 않습니다. Data 호스트가 이 값을 root만 읽는 `/run/travelpay/grafana-env/slack.env`로 만들고 Compose가 Grafana 환경 변수로 넘깁니다. 연락처 YAML은 유효한 Webhook을 읽은 뒤에만 Grafana 폴더에 원자적으로 설치합니다. 주소가 없는 상태에서 새 연락처 파일만 먼저 노출되는 것을 막습니다. 호스트의 root·Docker 접근 권한이 있으면 환경 변수와 원본 Docker 로그에서 주소를 읽을 수 있습니다.
 
 Grafana는 Slack 전송 실패 로그에 주소를 남길 수 있어, Data 호스트의 Alloy가 Loki로 보내기 전에 토큰을 가립니다. 새 Grafana보다 Alloy를 먼저 교체하도록 Compose 의존성을 둡니다. 가림은 Loki 전달 경로에 적용되며 원본 Docker 로그를 지우거나 가리는 기능은 아닙니다. 주소가 유출되면 Slack에서 기존 Webhook을 폐기하고 새로 발급받습니다.
 
-Webhook이 없으면 준비 단계가 실패하고 새 연락처 설정은 설치하지 않습니다. 실행 중인 컨테이너는 이 준비 실패로 중지하지 않습니다. 서버를 재시작하면 모니터링 유닛이 시작하지 못하므로 plan 생성 → 비밀값 준비(`--apply --external`) → 계획 검토 → apply 순서를 지킵니다. 최초 Grafana는 시작 후 정책 동기화에 약 1분이 걸렸으며, 이는 고정 대기 시간이 아닙니다(2026-11-16 Grafana 13.3.0 확인). 네트워크를 막은 실제 Grafana 이미지로 규칙 4개·연락처·정책·전송 시도를 `tests/test_grafana_alerting.py`에서 확인합니다. 로그 가림은 `tests/test_monitoring_pipeline.py`, 서킷 상태 PromQL은 `tests/test_dashboard_queries.py`로 검사합니다. 이 선택 검사는 `TRAVELPAY_TEST_DOCKER_MONITORING=1`로 실행하며 실제 Slack에 보내지 않습니다.
+Webhook이 없으면 준비 단계가 실패하고 새 연락처 설정은 설치하지 않습니다. 실행 중인 컨테이너는 이 준비 실패로 중지하지 않습니다. 서버를 재시작하면 모니터링 유닛이 시작하지 못하므로 plan 생성 → 비밀값 준비(`--apply --external`) → 계획 검토 → apply 순서를 지킵니다. 최초 Grafana는 시작 후 정책 동기화에 약 1분이 걸렸으며, 이는 고정 대기 시간이 아닙니다(2026-11-16 Grafana 13.3.0 확인). 네트워크를 막은 실제 Grafana 이미지로 규칙 5개·연락처·정책·전송 시도를 `tests/test_grafana_alerting.py`에서 확인합니다. 로그 가림은 `tests/test_monitoring_pipeline.py`, 서킷 상태 패널과 서킷 차단 규칙의 PromQL은 `tests/test_dashboard_queries.py`로 검사합니다. 이 선택 검사는 `TRAVELPAY_TEST_DOCKER_MONITORING=1`로 실행하며 실제 Slack에 보내지 않습니다.
 
 Webhook 교체 시에는 새로 검토한 plan으로 다음 명령을 실행합니다. 기본은 미리보기이며 `--apply`를 추가할 때 입력을 숨겨 받아 `SLACK_WEBHOOK_URL`만 덮어씁니다. 도구는 다른 누락된 기본 비밀값도 준비하므로 먼저 미리보기 결과를 확인합니다.
 
@@ -524,6 +524,7 @@ SSM 변경만으로 실행 중인 Grafana에 새 주소가 적용되지는 않�
 | 송금 30분 넘게 PROCESSING | 오래 확정되지 않은 송금이 1건 이상 | 정상 |
 | 서비스 지표 수집 중단 | 서비스별 정상 수집 대상이 0개인 상태가 2분 지속. Eureka에서 사라진 서비스도 0으로 셈 | 경보 |
 | 결제·송금 복구 스케줄러 정지 | `recover` 스케줄러의 실행 횟수가 2분 동안 늘지 않은 상태가 2분 지속. payment-service는 수집되는데 실행 기록 지표가 없는 경우(스케줄러 비활성, 클래스 이름 변경)도 포함 | 정상(payment-service 중단은 수집 중단 규칙이 알림) |
+| 서킷이 호출을 계속 차단 | 어떤 서비스의 서킷이든 최근 1분에 호출을 거절한 상태가 2분 지속(서비스·서킷 이름별). Gateway 세션 확인 서킷이면 User 장애로 로그인이 필요한 업무 API가 503인 상태. 한 번 열렸다 바로 회복하면 알리지 않음 | 정상(서킷이 없거나 거절이 없음. 서비스 중단은 수집 중단 규칙이 알림) |
 
 Grafana는 관리자 계정 `admin` 하나로 씁니다. 암호는 Parameter Store의 `GRAFANA_ADMIN_PASSWORD`이며, 비밀값 준비 도구가 처음에 무작위 값으로 만듭니다. 이 값이 없으면 모니터링 유닛이 시작하지 않으므로, 이 단계는 plan을 저장한 뒤 apply 전에 준비 도구를 `--apply`로 실행합니다. 기존 값은 그대로 두고 없는 값만 만듭니다.
 

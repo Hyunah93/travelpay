@@ -83,7 +83,8 @@ class GrafanaAlertingTest(unittest.TestCase):
         rules = json.loads(self.api("/api/v1/provisioning/alert-rules"))
         expected_templates = {"transfer-manual-review": "{{ $values.A.Value }}", "transfer-processing-stuck": "{{ $values.A.Value }}",
                               "service-metrics-missing": "{{ $labels.service }}",
-                              "payment-recovery-scheduler-stalled": "{{ $labels.code_namespace }}"}
+                              "payment-recovery-scheduler-stalled": "{{ $labels.code_namespace }}",
+                              "circuit-breaker-rejecting": "{{ $labels.name }}"}
         self.assertEqual({rule["uid"] for rule in rules}, set(expected_templates))
         for rule in rules:
             with self.subTest(rule=rule["uid"]):

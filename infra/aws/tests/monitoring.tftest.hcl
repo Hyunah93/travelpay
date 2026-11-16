@@ -332,8 +332,10 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
 
   assert {
     condition = (
-      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.uid] == ["service-metrics-missing", "payment-recovery-scheduler-stalled"] &&
-      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : [rule.noDataState, rule.for]] == [["Alerting", "2m"], ["OK", "2m"]] &&
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : rule.uid] == ["service-metrics-missing", "payment-recovery-scheduler-stalled", "circuit-breaker-rejecting"] &&
+      [for rule in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules : [rule.noDataState, rule.for]] == [["Alerting", "2m"], ["OK", "2m"], ["OK", "2m"]] &&
+      # 서킷 차단 규칙의 시간 조건(1분 창·2분 지속)은 tests/test_dashboard_queries.py가 promtool로 확인하므로 식을 고정합니다.
+      yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[2].data[0].model.expr == "sum by (service, name) (increase(resilience4j_circuitbreaker_not_permitted_calls_total{job=\"spring-jvm\",environment=\"production\"}[1m]))" &&
       # 식의 뜻(0으로 채우기·실행 기록 없음 보완)은 실제 Prometheus·Grafana로 확인했으므로 식 전체를 고정합니다.
       yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"]).groups[0].rules[0].data[0].model.expr == join(" or ", concat(
         ["sum by (service) (up{job=\"spring-jvm\",environment=\"production\"} == 1)"],
@@ -344,7 +346,7 @@ run "production_dashboard_and_rules_come_from_the_local_files" {
         [for scheduler in local.payment_recovery_schedulers : "label_replace(count(up{job=\"spring-jvm\",environment=\"production\",service=\"payment-service\"} == 1) * 0, \"code_namespace\", \"${scheduler}\", \"\", \"\")"]
       ))
     )
-    error_message = "수집 중단 규칙은 8개 서비스 모두를 0으로 채워 감시하고, 복구 스케줄러 규칙은 두 스케줄러의 실행 횟수와 실행 기록 없음을 봐야 합니다."
+    error_message = "수집 중단 규칙은 8개 서비스 모두를 0으로 채워 감시하고, 복구 스케줄러 규칙은 두 스케줄러의 실행 횟수와 실행 기록 없음을, 서킷 규칙은 서비스·서킷별 거절 횟수를 봐야 합니다."
   }
 
   # 복구 스케줄러 클래스 목록이 payment-service 코드와 같은지 봅니다(담당 서비스 코드는 읽기만 합니다).
