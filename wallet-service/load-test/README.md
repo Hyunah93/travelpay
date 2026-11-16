@@ -141,6 +141,8 @@ MONITORING_LOAD_TEST_TARGETS_FILE=./wallet-service/load-test/prometheus-targets.
 docker compose -f compose.monitoring.yaml -f compose.monitoring.load-test.yaml up -d prometheus
 ```
 
+로그는 앱 4개에 단 `io.travelpay.logs=load-test` 라벨을 보고 공용 Alloy가 Loki로 보냅니다. Alloy는 시작할 때만 설정을 읽으므로, 설정 파일이 바뀌었거나 Alloy API(`http://127.0.0.1:12345/api/v0/web/components`)에 `loki.source.docker.load_test_local`이 없으면 `docker compose -f compose.monitoring.yaml restart alloy`로 다시 시작합니다. Grafana Explore(Loki)에서 `{environment="load-test", service_name="wallet-service"} | json | traceId != ""`처럼 봅니다(`service_name`: `user-service`·`ledger-service`·`mock-bank`·`wallet-service`). 보존 기간은 72시간입니다.
+
 ### 측정 전 PC 조건 (같은 날 비교할 측정끼리 같게)
 
 충전기 연결, Windows 전원 모드 "최고 성능", 빌드 등 무거운 작업 끄기, 측정 중 PC 조작하지 않기. 같은 날 비교할 측정은 모두 같은 상태에서 잽니다.
