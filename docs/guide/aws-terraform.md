@@ -114,7 +114,7 @@ export AWS_PROFILE=travelpay
 aws sts get-caller-identity
 ```
 
-출력된 Account와 사용할 계정 ID가 같은지 확인합니다. 액세스 키·비밀번호를 `.tf`, tfvars, Backend 설정이나 Git에 넣지 않습니다. `.env`는 Terraform이 자동으로 읽는 입력 파일이 아닙니다.
+출력된 Account와 사용할 계정 ID가 같은지 확인합니다. 이 터미널의 `AWS_PROFILE`은 Terraform의 S3 Backend와 AWS Provider에도 적용됩니다. Python 도구에만 `--profile`을 지정해도 앞선 Terraform 명령의 프로필이 설정되는 것은 아닙니다. 액세스 키·비밀번호를 `.tf`, tfvars, Backend 설정이나 Git에 넣지 않습니다. `.env`는 Terraform이 자동으로 읽는 입력 파일이 아닙니다.
 
 예시의 `123456789012`는 설명용 계정 ID이며 이 프로젝트의 실제 계정으로 확인한 값이 아닙니다. 계정 ID는 인증 비밀값과 구분하지만 실제 개인 입력·Backend 파일은 Git에서 제외합니다. 실행 권한은 SSO·IAM 자격 증명으로 확인하며 숫자 12자리 검사만으로 확보되는 것은 아닙니다.
 
@@ -228,7 +228,7 @@ VPC의 원래 Main Route Table도 local만 유지합니다. Public 여부는 IGW
 
 SG 본체와 개별 규칙을 분리해 상호 참조에 따른 생성 순환을 피합니다. `aws_vpc_security_group_rules_exclusive`가 선언한 규칙 전체를 관리하고 VPC 기본 SG는 닫습니다. 다른 도구·수동 규칙을 같은 SG에 섞으면 다음 apply에서 제거될 수 있으므로 보존할 변경을 먼저 코드에 반영합니다.
 
-DB 계정·스키마 초기화 때만 `enable_database_bootstrap_access=true`로 Data → RDS 5432와 해당 RDS 관리자 Secret 조회 권한, 앱 DB 암호 조회를 엽니다. 완료 후 `false`로 되돌려 plan/apply합니다. 평상시 Data는 Redis 암호 두 개와 Grafana 관리자 암호만 조회합니다. EC2에는 역할별 SG를 연결하며 앱 Task 연결과 실제 허용·차단 검증은 배치 단계에서 확인합니다.
+DB 계정·스키마 초기화 때만 `enable_database_bootstrap_access=true`로 Data → RDS 5432와 해당 RDS 관리자 Secret 조회 권한, 앱 DB 암호 조회를 엽니다. 완료 후 `false`로 되돌려 plan/apply합니다. 평상시 Data는 Redis 암호 두 개와 Grafana 관리자 암호, Slack Webhook 주소만 조회합니다. EC2에는 역할별 SG를 연결하며 앱 Task 연결과 실제 허용·차단 검증은 배치 단계에서 확인합니다.
 
 ## 실행 기반 적용 순서
 
@@ -252,10 +252,10 @@ python3 infra/aws/scripts/check-runtime-plan.py infra/aws/stage-4.tfplan --profi
 python3 infra/aws/scripts/prepare-parameters.py infra/aws/stage-4.tfplan --profile travelpay --account 123456789012
 ```
 
-비밀값 준비 도구는 기본적으로 미리보기만 실행합니다. 승인 후 같은 명령에 `--apply`를 추가하면 DB 6개·Redis 2개·Grafana 관리자 암호·원본 인증 값(`ORIGIN_AUTH`)을 SecureString으로 만듭니다. 인프라 담당자의 Linux에서 비밀값을 익명 메모리 파일로 AWS CLI에 전달하며 기존 SecureString을 덮어쓰지 않습니다. AWS CLI 기록(`cli_history`)이 켜져 있으면 요청 내용이 로컬 기록에 남으므로 쓰기를 거절합니다.
+비밀값 준비 도구는 기본적으로 미리보기만 실행합니다. 승인 후 같은 명령에 `--apply`를 추가하면 DB 6개·Redis 2개·Grafana 관리자 암호·원본 인증 값(`ORIGIN_AUTH`)을 SecureString으로 만듭니다. 외부에서 발급받는 값(환율 API 키·Slack Webhook 주소)은 아래처럼 따로 입력합니다. 인프라 담당자의 Linux에서 비밀값을 익명 메모리 파일로 AWS CLI에 전달하며 기존 SecureString을 덮어쓰지 않습니다. AWS CLI 기록(`cli_history`)이 켜져 있으면 요청 내용이 로컬 기록에 남으므로 쓰기를 거절합니다.
 
 - Wallet 계좌번호 키(무작위 32바이트의 Base64)는 `--apply --create-wallet-key`를 줄 때만 만듭니다. 데이터가 생긴 뒤 바꾸거나, 지워진 뒤 새로 만들면 저장된 계좌번호를 풀 수 없으므로 Wallet 데이터가 생기기 전 처음 한 번만 씁니다.
-- 수출입은행에서 발급받은 환율 API 키는 `--apply --external`을 줄 때만 입력받습니다. 입력을 숨길 수 있는 터미널에서 직접 실행해야 하며, 파이프 입력처럼 입력이 화면에 보일 수 있으면 거절합니다. 키를 명령 인자·파일·채팅에 남기지 않습니다.
+- 수출입은행에서 발급받은 환율 API 키와 Slack이 발급한 Incoming Webhook 주소(`SLACK_WEBHOOK_URL`)는 `--apply --external`을 줄 때만 입력받습니다. 없는 값만 차례로 묻고 이미 있는 값은 그대로 둡니다. 입력을 숨길 수 있는 터미널에서 직접 실행해야 하며, 파이프 입력처럼 입력이 화면에 보일 수 있으면 거절합니다. Webhook 주소는 `https://hooks.slack.com/services/`로 시작하는 발급 형식만 받습니다. 키와 주소를 명령 인자·파일·채팅에 남기지 않습니다.
 - DB 앱 계정 암호 6개는 `--apply --rotate-database-passwords`를 줄 때만 새 임의 값으로 바꿉니다. SSM 값만 바뀌므로 아래 DB 작업 창에서 초기화 스크립트를 다시 실행해야 DB에 반영되고, 그 전에 시작한 Task는 DB 로그인에 실패합니다. 새 값은 출력하지 않으며 사람이 알 필요가 없습니다. Task는 시작할 때, 초기화 스크립트는 실행할 때 SSM에서 읽습니다. 앱이 실행 중일 때 교체했다면 초기화 스크립트를 실행한 뒤 CD의 **Run workflow**에서 DB를 쓰는 서비스를 `services`에 지정해 새 Task로 다시 띄웁니다.
 
 ```bash
@@ -499,7 +499,24 @@ Data 호스트의 모니터링은 Redis·Kafka와 Compose 프로젝트, systemd 
 - **대시보드·알림:** 운영 대시보드와 송금 알림 규칙은 `infra/monitoring`의 로컬 파일에서 데이터소스, 환경, 로그 job, uid만 바꿔 만듭니다. 원본에서 바꿀 곳의 수는 테스트가 확인합니다.
 - **AWS 기본 지표:** RDS·호스트·ECS·ALB 지표와 경보 상태는 CloudWatch 대시보드(`travelpay-production`)로 봅니다. Data 호스트는 IMDS hop 제한(1)으로 컨테이너가 인스턴스 역할 자격 증명을 받지 못하게 했습니다. 그래서 Grafana는 AWS API를 조회하지 않습니다.
 
-Grafana 알림 규칙은 네 개입니다. 알림 채널(contact point)은 두지 않으므로 상태는 Grafana Alerting 화면에서 확인합니다.
+Grafana 알림 규칙은 네 개이고, Webhook을 발급할 때 선택한 Slack 채널(예: `#monitoring`)로 보냅니다. 규칙마다 받을 곳을 정하지 않고 기본 알림 정책 하나(`templates/monitoring/grafana-alert-notifications.yml`)를 따릅니다. 같은 규칙의 알림은 묶어서 보내며, 해결 알림도 보내고 미해결 상태는 4시간마다 다시 알립니다. 알림 정책은 트리 전체를 이 파일로 관리하므로 Grafana 화면에서 바꾸지 않습니다.
+
+Webhook 주소는 Parameter Store의 `SLACK_WEBHOOK_URL`에 두고 S3 설정 묶음에는 넣지 않습니다. Data 호스트가 이 값을 root만 읽는 `/run/travelpay/grafana-env/slack.env`로 만들고 Compose가 Grafana 환경 변수로 넘깁니다. 연락처 YAML은 유효한 Webhook을 읽은 뒤에만 Grafana 폴더에 원자적으로 설치합니다. 주소가 없는 상태에서 새 연락처 파일만 먼저 노출되는 것을 막습니다. 호스트의 root·Docker 접근 권한이 있으면 환경 변수와 원본 Docker 로그에서 주소를 읽을 수 있습니다.
+
+Grafana는 Slack 전송 실패 로그에 주소를 남길 수 있어, Data 호스트의 Alloy가 Loki로 보내기 전에 토큰을 가립니다. 새 Grafana보다 Alloy를 먼저 교체하도록 Compose 의존성을 둡니다. 가림은 Loki 전달 경로에 적용되며 원본 Docker 로그를 지우거나 가리는 기능은 아닙니다. 주소가 유출되면 Slack에서 기존 Webhook을 폐기하고 새로 발급받습니다.
+
+Webhook이 없으면 준비 단계가 실패하고 새 연락처 설정은 설치하지 않습니다. 실행 중인 컨테이너는 이 준비 실패로 중지하지 않습니다. 서버를 재시작하면 모니터링 유닛이 시작하지 못하므로 plan 생성 → 비밀값 준비(`--apply --external`) → 계획 검토 → apply 순서를 지킵니다. 최초 Grafana는 시작 후 정책 동기화에 약 1분이 걸렸으며, 이는 고정 대기 시간이 아닙니다(2026-11-16 Grafana 13.3.0 확인). 네트워크를 막은 실제 Grafana 이미지로 규칙 4개·연락처·정책·전송 시도를 `tests/test_grafana_alerting.py`에서 확인합니다. 로그 가림은 `tests/test_monitoring_pipeline.py`, 서킷 상태 PromQL은 `tests/test_dashboard_queries.py`로 검사합니다. 이 선택 검사는 `TRAVELPAY_TEST_DOCKER_MONITORING=1`로 실행하며 실제 Slack에 보내지 않습니다.
+
+Webhook 교체 시에는 새로 검토한 plan으로 다음 명령을 실행합니다. 기본은 미리보기이며 `--apply`를 추가할 때 입력을 숨겨 받아 `SLACK_WEBHOOK_URL`만 덮어씁니다. 도구는 다른 누락된 기본 비밀값도 준비하므로 먼저 미리보기 결과를 확인합니다.
+
+```bash
+python3 infra/aws/scripts/prepare-parameters.py <저장한 plan> --profile <프로필> --account <계정 ID> --set-slack-webhook
+python3 infra/aws/scripts/prepare-parameters.py <저장한 plan> --profile <프로필> --account <계정 ID> --apply --set-slack-webhook
+```
+
+SSM 변경만으로 실행 중인 Grafana에 새 주소가 적용되지는 않습니다. Data 호스트에서 `systemctl reload travelpay-monitoring.service`를 실행하면 준비 스크립트가 새 값을 읽고 Compose가 변경된 Grafana를 재생성합니다. 모니터링이 기동되지 않은 상태는 `systemctl start travelpay-monitoring.service`를 사용합니다. 이 명령은 Redis·Kafka 유닛을 재시작하지 않습니다.
+
+2026-11-16 운영 반영 후 실제 수신을 확인했습니다. 앱과 무관한 임시 규칙(`vector(1)`)을 Grafana API로 만들어 발생 알림을 받고, 조건을 `vector(0)`으로 바꿔 해결 알림(첫 알림 5분 뒤, 묶음 간격)을 받은 뒤 규칙을 지웠습니다. 두 전송 모두 Grafana 기록에 오류가 없었고, Grafana 원본 로그에 Webhook 주소가 남은 줄은 0건이었습니다. Webhook을 바꾼 뒤에도 같은 방법으로 확인합니다.
 
 | 규칙 | 조건 | 지표가 없을 때 |
 |---|---|---|

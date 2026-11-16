@@ -2,9 +2,9 @@
 """검토한 plan의 앱 비밀값을 SSM에 준비합니다. 기존 값은 덮어쓰지 않습니다.
 
 DB·Redis·Grafana 관리자 암호와 원본 인증 값은 새로 만듭니다. Wallet 계좌번호 키는 --create-wallet-key를 줄 때만 만들고,
-외부에서 발급받은 키는 --external을 줄 때만 화면에 표시하지 않고 입력받습니다. 기존 값을 덮어쓰는 경우는 두 가지뿐입니다.
-Grafana 관리자 암호는 --set-grafana-password를 줄 때 운영자가 정한 값으로, DB 앱 계정 암호 6개는
---rotate-database-passwords를 줄 때 새 임의 값으로 바꿉니다.
+외부에서 발급받은 값(환율 API 키·Slack Webhook 주소)은 --external을 줄 때만 화면에 표시하지 않고 입력받습니다. 기존 값을 덮어쓰는 경우는 세 가지뿐입니다.
+Grafana 관리자 암호는 --set-grafana-password를 줄 때 운영자가 정한 값으로, Slack Webhook 주소는 --set-slack-webhook을 줄 때
+다시 발급받은 값으로, DB 앱 계정 암호 6개는 --rotate-database-passwords를 줄 때 새 임의 값으로 바꿉니다.
 """
 
 import argparse
@@ -20,8 +20,13 @@ import sys
 import warnings
 
 PARAMETER_PREFIX = "/travelpay/production/"
-# 수출입은행에서 발급받는 키입니다. 만들어 낼 수 없으므로 운영자가 입력합니다.
-EXTERNAL_NAMES = {"KOREAEXIM_API_KEY"}
+# Grafana 알림을 보낼 Slack Incoming Webhook 주소입니다(grafana-alert-notifications.yml).
+SLACK_WEBHOOK_NAME = "SLACK_WEBHOOK_URL"
+# 수출입은행 키와 Slack이 발급한 Webhook 주소입니다. 만들어 낼 수 없으므로 운영자가 입력합니다.
+EXTERNAL_NAMES = {"KOREAEXIM_API_KEY", SLACK_WEBHOOK_NAME}
+# Slack이 발급하는 Webhook 주소 형식입니다. Grafana가 환경 변수로 받으므로 줄바꿈·$ 같은 문자가 섞이지 않게 형식을 고정하며,
+# Data 호스트의 prepare-monitoring.py와 같은 규칙입니다.
+SLACK_WEBHOOK_PATTERN = r"https://hooks\.slack\.com/services/[A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9]+"
 # Wallet은 이 값을 Base64로 풀어 32바이트 AES 키로 씁니다. 데이터가 생긴 뒤 바꾸거나 지워진 뒤 새로 만들면
 # 저장된 계좌번호를 풀 수 없으므로, 처음 한 번만 명시적으로 만듭니다.
 WALLET_KEY_NAME = "WALLET_ACCOUNT_NUMBER_KEY"
@@ -65,7 +70,12 @@ def ask_hidden(prompt, message):
 
 
 def read_external(name, prompt=getpass.getpass):
-    value = ask_hidden(prompt, f"{name.rsplit('/', 1)[-1]} (입력 내용은 표시되지 않습니다): ")
+    short_name = name.rsplit('/', 1)[-1]
+    value = ask_hidden(prompt, f"{short_name} (입력 내용은 표시되지 않습니다): ")
+    if short_name == SLACK_WEBHOOK_NAME:
+        if not re.fullmatch(SLACK_WEBHOOK_PATTERN, value):
+            raise ParameterPreparationError("Slack Webhook 주소는 https://hooks.slack.com/services/로 시작하는 발급 주소여야 합니다")
+        return value
     # 쿼리 인자로 보내는 키입니다. 공백·제어 문자가 섞이면 복사 실수로 보고 저장하지 않습니다.
     if not re.fullmatch(r"[!-~]{8,512}", value):
         raise ParameterPreparationError("외부 키는 공백 없는 8~512자의 ASCII여야 합니다")
@@ -83,6 +93,11 @@ def read_grafana_password(prompt=getpass.getpass):
 
 def set_grafana_password(aws, value):
     aws("put-parameter", {"Name": PARAMETER_PREFIX + GRAFANA_PASSWORD_NAME, "Value": value, "Type": "SecureString",
+                          "Tier": "Standard", "Overwrite": True})
+
+
+def set_slack_webhook(aws, value):
+    aws("put-parameter", {"Name": PARAMETER_PREFIX + SLACK_WEBHOOK_NAME, "Value": value, "Type": "SecureString",
                           "Tier": "Standard", "Overwrite": True})
 
 
@@ -109,7 +124,7 @@ def parameter_names(contract, account):
         names.append(PARAMETER_PREFIX + name)
     database_names = [name for name in contract if name.endswith("_DB_PASSWORD")]
     if len(database_names) != DATABASE_PASSWORD_COUNT or not REQUIRED_NAMES <= set(contract):
-        raise ParameterPreparationError("DB 6개·Redis 2개·Grafana·Wallet 키·원본 인증 값·외부 키의 계약을 확인하세요.")
+        raise ParameterPreparationError("DB 6개·Redis 2개·Grafana·Wallet 키·원본 인증 값·외부 키(환율·Slack)의 계약을 확인하세요.")
     # 외부 키 입력을 잘못해 중단돼도 만들 수 있는 값은 먼저 준비되도록 외부 키를 마지막에 둡니다.
     return sorted(names, key=lambda name: (name.rsplit("/", 1)[-1] in EXTERNAL_NAMES, name))
 
@@ -180,12 +195,16 @@ def main():
     parser.add_argument("--profile", required=True)
     parser.add_argument("--account", required=True)
     parser.add_argument("--apply", action="store_true", help="생성 승인 후에만 사용합니다. 기본은 읽기 전용 미리보기입니다.")
-    parser.add_argument("--external", action="store_true", help="--apply와 함께 주면 없는 외부 발급 키를 화면에 표시하지 않고 입력받습니다.")
+    parser.add_argument("--external", action="store_true",
+                        help="--apply와 함께 주면 없는 외부 발급 값(환율 API 키·Slack Webhook 주소)을 화면에 표시하지 않고 입력받습니다.")
     parser.add_argument("--create-wallet-key", action="store_true",
                         help="--apply와 함께 주면 Wallet 계좌번호 키를 만듭니다. Wallet 데이터가 생기기 전 처음 한 번만 씁니다.")
     parser.add_argument("--set-grafana-password", action="store_true",
                         help="--apply와 함께 주면 Grafana 관리자 암호를 화면에 표시하지 않고 두 번 입력받아 바꿉니다. "
                              "실행 중인 Grafana에 반영하는 절차는 가이드를 따릅니다.")
+    parser.add_argument("--set-slack-webhook", action="store_true",
+                        help="--apply와 함께 주면 Slack Webhook 주소를 화면에 표시하지 않고 입력받아 바꿉니다. "
+                             "Slack에서 주소를 다시 발급받았을 때 쓰며, 실행 중인 Grafana에 반영하는 절차는 가이드를 따릅니다.")
     parser.add_argument("--rotate-database-passwords", action="store_true",
                         help="--apply와 함께 주면 DB 앱 계정 암호 6개를 새 임의 값으로 바꿉니다. DB에는 초기화 스크립트를 다시 "
                              "실행해야 반영되므로 가이드의 DB 작업 창 안에서만 씁니다.")
@@ -225,6 +244,10 @@ def main():
         if args.apply:
             set_grafana_password(aws, read_grafana_password())
         print(f"{PARAMETER_PREFIX}{GRAFANA_PASSWORD_NAME}: {'updated' if args.apply else 'would-update'}", flush=True)
+    if args.set_slack_webhook:
+        if args.apply:
+            set_slack_webhook(aws, read_external(PARAMETER_PREFIX + SLACK_WEBHOOK_NAME))
+        print(f"{PARAMETER_PREFIX}{SLACK_WEBHOOK_NAME}: {'updated' if args.apply else 'would-update'}", flush=True)
 
 
 if __name__ == "__main__":

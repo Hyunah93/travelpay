@@ -18,8 +18,8 @@ locals {
     mock_bank = { name = "mock-bank", port = 8090, management_port = 8090, schema = "mock_bank", db_username = "mock_bank_app", secret_names = ["MOCK_BANK_DB_PASSWORD"] }
   }
 
-  # Data 호스트의 Grafana 관리자 암호입니다. 앱 비밀값과 같은 경로·준비 도구를 쓰고 Data 역할만 읽습니다.
-  monitoring_secret_names = ["GRAFANA_ADMIN_PASSWORD"]
+  # Data 호스트의 Grafana 관리자 암호와 알림을 보낼 Slack Incoming Webhook 주소입니다. 앱 비밀값과 같은 경로·준비 도구를 쓰고 Data 역할만 읽습니다.
+  monitoring_secret_names = ["GRAFANA_ADMIN_PASSWORD", "SLACK_WEBHOOK_URL"]
   # Cloudflare가 ALB로 보내는 요청에 붙이는 원본 인증 값입니다. Terraform이 읽어 ALB 규칙에 넣고, 호스트·Task 역할은 읽지 않습니다.
   edge_secret_names = ["ORIGIN_AUTH"]
   secret_parameter_arns = {

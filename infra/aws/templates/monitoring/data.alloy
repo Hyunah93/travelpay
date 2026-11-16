@@ -33,7 +33,17 @@ loki.source.docker "data" {
 	host       = "unix:///var/run/docker.sock"
 	targets    = discovery.relabel.data.output
 	labels     = {job = "docker-data", environment = "production", host = constants.hostname}
+	forward_to = [loki.process.redact.receiver]
+}
+
+// Grafana는 Slack 전송에 실패하면 Webhook 주소 전체를 오류 로그에 남깁니다. 주소는 비밀값이므로 Loki에 쓰기 전에 가립니다.
+loki.process "redact" {
 	forward_to = [loki.write.data.receiver]
+
+	stage.replace {
+		expression = "hooks\\.slack\\.com/services/([A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9]+)"
+		replace    = "<redacted>"
+	}
 }
 
 loki.write "data" {

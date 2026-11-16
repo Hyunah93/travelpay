@@ -167,6 +167,32 @@ run "data_host_monitoring_is_pinned_private_and_least_privileged" {
   }
 
   assert {
+    condition = (
+      yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.env_file == ["/run/travelpay/grafana-env/slack.env"] &&
+      contains(yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.depends_on, "alloy") &&
+      !contains(keys(yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services.grafana.environment), "SLACK_WEBHOOK_URL") &&
+      # Webhook 주소는 S3 설정 묶음에 들어가지 않고 Data 호스트가 Parameter Store에서 받습니다(스크립트의 형식 검사 문구는 주소가 아님).
+      length(regexall("hooks\\.slack\\.com/services/[A-Za-z0-9]", local.data_bundle_json)) == 0
+    )
+    error_message = "Slack Webhook 주소는 설정 묶음이 아니라 Data 호스트가 만든 env_file로만 Grafana에 넘겨야 합니다."
+  }
+
+  assert {
+    condition = (
+      [for point in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-notifications.yml"]).contactPoints : [
+        for receiver in point.receivers : [point.name, receiver.type, receiver.settings.url, receiver.disableResolveMessage]
+      ]] == [[["slack-monitoring", "slack", "$SLACK_WEBHOOK_URL", false]]] &&
+      [for policy in yamldecode(jsondecode(local.data_bundle_json)["grafana-alert-notifications.yml"]).policies : [
+        policy.receiver, policy.group_by, policy.repeat_interval
+      ]] == [["slack-monitoring", ["grafana_folder", "alertname"], "4h"]] &&
+      # 규칙이 받을 곳을 직접 고르면 기본 정책을 거치지 않으므로, 모든 규칙은 기본 정책(Slack)을 따라야 합니다.
+      length(regexall("notification_settings|receiver", jsondecode(local.data_bundle_json)["grafana-alert-transfer.yml"])) == 0 &&
+      length(regexall("notification_settings|receiver", jsondecode(local.data_bundle_json)["grafana-alert-operations.yml"])) == 0
+    )
+    error_message = "알림 규칙은 받을 곳을 직접 정하지 않고, 기본 알림 정책이 해결 알림까지 Slack 연락처로 보내야 합니다."
+  }
+
+  assert {
     condition = alltrue([
       for name in ["prometheus", "loki", "grafana", "alloy"] :
       yamldecode(jsondecode(local.data_bundle_json)["monitoring-compose.yaml"]).services[name].environment.TRAVELPAY_CONFIG_SHA256 == local.monitoring_config_sha256[name]
