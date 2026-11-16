@@ -15,8 +15,9 @@ class ApplyError(Exception):
     pass
 
 
+# Slack 연락처 설정(grafana-alert-notifications.yml)은 Webhook 주소를 받은 뒤 prepare-monitoring.py가 Grafana 폴더에 넣습니다.
 DATA_FILES = ("runtime.json", "compose.yaml", "monitoring-compose.yaml", "mount-data-volumes.py", "prepare-data.py",
-              "prepare-monitoring.py", "bootstrap-database.py", "apply-data-bundle.py")
+              "prepare-monitoring.py", "bootstrap-database.py", "apply-data-bundle.py", "grafana-alert-notifications.yml")
 # Redis·Kafka를 먼저 반영합니다. 모니터링 반영이 실패해도 Redis·Kafka는 반영된 채로 남고 적용 실패로 드러납니다.
 UNITS = ("travelpay-data.service", "travelpay-monitoring.service")
 # 모니터링 설정은 비밀값이 없고 root가 아닌 컨테이너 사용자가 읽어야 하므로 별도 경로에 0644로 둡니다.

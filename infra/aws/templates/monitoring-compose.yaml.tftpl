@@ -68,6 +68,10 @@ services:
   grafana:
     image: ${grafana_image}
     restart: unless-stopped
+    # Slack 연락처(provisioning/alerting/notifications.yml)가 쓰는 SLACK_WEBHOOK_URL입니다. Grafana 알림 프로비저닝이
+    # 연락처 설정의 환경 변수를 치환합니다. prepare-monitoring.py가 Parameter Store 값으로 만들며, 이 호스트의 root는
+    # docker inspect로 이 값을 볼 수 있습니다(env_file 파일과 같은 범위).
+    env_file: [/run/travelpay/grafana-env/slack.env]
     environment:
       TRAVELPAY_CONFIG_SHA256: ${grafana_config_sha256}
       GF_SECURITY_ADMIN_USER: admin
@@ -123,7 +127,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
-    depends_on: [prometheus, loki]
+    # 새 Grafana의 Slack 오류 로그를 이전 Alloy가 주소 가림 없이 전달하지 않도록 수집기부터 교체합니다.
+    depends_on: [prometheus, loki, alloy]
     logging: *bounded-logs
 
   alloy:

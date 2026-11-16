@@ -22,6 +22,8 @@ TEMPLATES = ROOT / "templates"
 IMAGES = dict(re.findall(r'^\s+(prometheus|loki|grafana|alloy)\s+= "([^"]+@sha256:[0-9a-f]{64})"$',
                          (ROOT / "monitoring.tf").read_text(), re.M))
 PROBE = "busybox:1.37.0"
+# 형식만 맞춘 가짜 Slack Webhook 주소입니다.
+FAKE_WEBHOOK = "https://hooks.slack.com/services/TTEST0000/BTEST0000/notarealtoken"
 spec = importlib.util.spec_from_file_location("monitoring_preparation", ROOT / "scripts" / "prepare-monitoring.py")
 preparation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preparation)
@@ -65,7 +67,9 @@ class MonitoringPipelineTest(unittest.TestCase):
             "other": ["--label", "com.docker.compose.project=travelpay-other", "--label", "com.docker.compose.service=other-service"],
         }
         for name, flags in labels.items():
-            cls.start(name, "--network", "none", *flags, PROBE, "sh", "-c", f"while true; do echo {name}-line; sleep 1; done", network=False)
+            # Grafana가 Slack 전송 실패 때 남기는 형태로 가짜 Webhook 주소를 함께 출력합니다.
+            line = f"{name}-line {FAKE_WEBHOOK}" if name == "grafana" else f"{name}-line"
+            cls.start(name, "--network", "none", *flags, PROBE, "sh", "-c", f"while true; do echo '{line}'; sleep 1; done", network=False)
         # 운영 유닛·Compose와 같은 권한 제한과 저장 경로로 실행합니다.
         for name, config in [("alloy-app", cls.work / "app.alloy"), ("alloy-data", TEMPLATES / "monitoring" / "data.alloy")]:
             cls.start(name, "--memory", "256m", "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -106,6 +110,15 @@ class MonitoringPipelineTest(unittest.TestCase):
         services = {s.get("service_name") for s in self.series('{job="docker-data"}')}
         self.assertLessEqual({"grafana", "kafka"}, services)
         self.assertNotIn("other-service", services)
+
+    def test_slack_webhook_is_redacted_before_reaching_loki(self):
+        # Grafana가 Slack 전송 실패 로그에 남기는 Webhook 주소(비밀값)는 Loki에 저장되기 전에 가려져야 합니다.
+        query = urllib.parse.quote('{job="docker-data",service_name="grafana"}')
+        result = self.loki(f"query_range?query={query}&limit=20").get("data", {}).get("result") or []
+        lines = [line for stream in result for _, line in stream["values"]]
+        self.assertTrue(lines)
+        self.assertTrue(all("hooks.slack.com/services/<redacted>" in line for line in lines), lines[:3])
+        self.assertFalse(any("notarealtoken" in line for line in lines))
 
     def test_pause_container_logs_are_not_collected_even_without_labels(self):
         self.assertEqual(self.series('{service_name="unknown_service"}'), [])

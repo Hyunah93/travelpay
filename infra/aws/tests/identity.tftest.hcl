@@ -98,9 +98,10 @@ run "host_ssm_policy_cannot_read_application_secrets" {
         "arn:aws:ssm:ap-northeast-2:123456789012:parameter/travelpay/production/REDIS_SESSION_PASSWORD",
         "arn:aws:ssm:ap-northeast-2:123456789012:parameter/travelpay/production/REDIS_CACHE_PASSWORD",
         "arn:aws:ssm:ap-northeast-2:123456789012:parameter/travelpay/production/GRAFANA_ADMIN_PASSWORD",
+        "arn:aws:ssm:ap-northeast-2:123456789012:parameter/travelpay/production/SLACK_WEBHOOK_URL",
       ])
     )
-    error_message = "Data 호스트는 기본적으로 두 Redis 비밀값과 Grafana 관리자 암호만 읽고 재귀 경로 조회는 차단해야 합니다."
+    error_message = "Data 호스트는 기본적으로 두 Redis 비밀값과 Grafana 관리자 암호·Slack Webhook 주소만 읽고 재귀 경로 조회는 차단해야 합니다."
   }
 }
 

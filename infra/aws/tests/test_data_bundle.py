@@ -34,7 +34,7 @@ FILES = {
     "prometheus.yml": "global: {}\n", "loki.yml": "auth_enabled: false\n", "data.alloy": "// alloy\n",
     "grafana-datasources.yml": "apiVersion: 1\n", "grafana-dashboards.yml": "apiVersion: 1\n",
     "grafana-alert-transfer.yml": "apiVersion: 1\n", "grafana-alert-operations.yml": "apiVersion: 1\n",
-    "dashboard-production.json": "{}",
+    "grafana-alert-notifications.yml": "apiVersion: 1\n", "dashboard-production.json": "{}",
 }
 REQUEST = {"TRAVELPAY_BUNDLE_BUCKET": "b", "TRAVELPAY_BUNDLE_KEY": "k", "TRAVELPAY_REGION": "r",
            "TRAVELPAY_APPLY_SCRIPT": "apply-data-bundle.py"}
@@ -271,6 +271,15 @@ class ApplyTest(unittest.TestCase):
                 self.assertEqual(target.read_text(), FILES[name])
                 self.assertEqual(oct(target.stat().st_mode & 0o777), "0o644")
                 self.assertEqual(oct(target.parent.stat().st_mode & 0o777), "0o755")
+
+    def test_slack_contact_point_waits_for_the_webhook_instead_of_going_live(self):
+        # Webhook 주소 없이 연락처 설정이 Grafana 폴더에 들어가면 다음 Grafana 재시작이 실패합니다. 묶음은 데이터 폴더에만 두고
+        # Grafana 폴더에는 prepare-monitoring.py가 주소를 받은 뒤 넣습니다.
+        self.apply(Recorder({self.compose_url: COMPOSE_BINARY}))
+        self.assertFalse((self.paths.monitoring / "grafana/provisioning/alerting/notifications.yml").exists())
+        staged = self.paths.data / "grafana-alert-notifications.yml"
+        self.assertEqual(staged.read_text(), FILES["grafana-alert-notifications.yml"])
+        self.assertEqual(oct(staged.stat().st_mode & 0o777), "0o600")
 
     def test_monitoring_readiness_is_checked_after_reload_with_the_private_loki_address(self):
         run = Recorder({self.compose_url: COMPOSE_BINARY})
