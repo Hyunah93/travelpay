@@ -46,18 +46,15 @@
    curl -s 127.0.0.1:19082/actuator/prometheus | grep charge_recovery_stuck
    ```
 
-3. `measure.py`·`prepare.py`를 실행할 셸에서 아래 환경 변수를 둡니다. 주소는 반드시 `localhost`가 아니라 **`127.0.0.1`**로 둡니다. compose가 포트를 `127.0.0.1`(IPv4)에만 열어서, `localhost`로 부르면 Python이 IPv6(`::1`)를 먼저 시도하다 요청마다 약 2초씩 늦어집니다(서비스 지표 표본이 7초 간격으로 벌어지고 대사 소요 시간에도 2초가 붙음).
+3. `measure.py`·`prepare.py`를 실행할 셸에서 환경 변수를 불러옵니다. 새 셸을 열 때마다 다시 실행합니다.
 
    ```bash
-   export PG_CONTAINER=travelpay-charge-load-test-measure-postgres-1
-   export USER_URL=http://127.0.0.1:8081 WALLET_URL=http://127.0.0.1:8082 \
-          LEDGER_URL=http://127.0.0.1:8085 MOCK_BANK_URL=http://127.0.0.1:8090
-   export USER_METRICS_URL=http://127.0.0.1:19081 WALLET_METRICS_URL=http://127.0.0.1:19082 \
-          LEDGER_METRICS_URL=http://127.0.0.1:19085 MOCK_BANK_METRICS_URL=http://127.0.0.1:19090
+   source measure.env
    ```
 
-   PowerShell은 `$env:PG_CONTAINER="travelpay-charge-load-test-measure-postgres-1"`처럼 하나씩 둡니다. 새 셸을 열면 다시 둡니다.
+   `measure.env`에는 측정 DB 컨테이너 이름(`PG_CONTAINER`), 네 서비스의 업무 주소(`*_URL`)와 지표 주소(`*_METRICS_URL`)가 들어 있습니다. 주소는 반드시 `localhost`가 아니라 **`127.0.0.1`**입니다. compose가 포트를 `127.0.0.1`(IPv4)에만 열어서, `localhost`로 부르면 Python이 IPv6(`::1`)를 먼저 시도하다 요청마다 약 2초씩 늦어집니다(서비스 지표 표본이 7초 간격으로 벌어지고 대사 소요 시간에도 2초가 붙음).
 
+   PowerShell은 `source`를 쓸 수 없어, 파일의 값을 `$env:PG_CONTAINER="travelpay-charge-load-test-measure-postgres-1"`처럼 하나씩 둡니다.
 4. 끄기: `docker compose --profile app down` (DB·Kafka 데이터 사라짐. 다시 띄우면 `prepare.py`부터)
 
 | 서비스 (compose) | 업무 포트 | 지표 포트 | 비고 |
