@@ -166,11 +166,11 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 
 ### 01. 회원·인증·인프라 (김이찬)
 
-- Spring Session + Redis로 세션을 애플리케이션 밖에서 관리해 여러 User 인스턴스가 인증 상태 공유
-- 세션 버전 검증으로 회원 상태·권한 변경을 반영하고, 관리자 정지 시 기존 로그인 세션 일괄 무효화
-- 60분 유휴·24시간 절대 만료, 로그인·비밀번호 변경 시 세션 ID·CSRF 토큰 갱신, Redis Lua 기반 이메일·IP별 로그인 시도 제한
-- Gateway가 세션 검증을 User Service에 위임하고, 외부 인증 헤더를 제거해 검증된 회원 정보만 내부로 전달
-- Terraform으로 AWS 인프라를 관리하고, GitHub Actions OIDC로 배포 인증 구성
+- MSA 세션 인증 체계: Spring Security·Spring Session Redis로 로그인 세션을 중앙 관리하고, Gateway가 외부 회원 헤더를 제거한 뒤 User에서 검증한 회원 정보만 내부 서비스에 전달
+- 회원 권한 관리·강제 로그아웃: 요청마다 DB의 회원 상태·권한을 검증하고, 관리자 정지·강제 로그아웃 시 세션 버전을 변경해 기존 로그인 세션 일괄 무효화
+- 인증 보안 강화: 유휴 60분·절대 24시간 세션 만료, 로그인·비밀번호 변경 시 세션 ID 교체 및 CSRF 토큰 재발급, Redis Lua 기반 이메일·IP별 로그인 시도 제한
+- Terraform 기반 AWS 인프라 구축: VPC·Private Subnet·보안 그룹으로 접근을 제어하고, ECS on EC2·RDS·ALB·모니터링 인프라를 코드로 구축·관리
+- CI/CD 및 배포 자동화: GitHub Actions·OIDC 기반 빌드·테스트·배포 자동화, 변경 서비스만 선택적으로 배포하고 ECS 롤링 업데이트·자동 롤백 적용
 
 ### 02. 지갑·충전·원장 (박현아)
 
