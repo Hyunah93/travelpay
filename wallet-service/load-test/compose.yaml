@@ -146,6 +146,9 @@ services:
       - "127.0.0.1:19081:19081"
     volumes:
       - ${USER_JAR:-../../user-service/build/libs/user-service-0.0.1-SNAPSHOT.jar}:/app/user-service.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: user-service
     healthcheck:
       <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:19081/actuator/health"]
@@ -172,6 +175,9 @@ services:
       - "127.0.0.1:19085:19085"
     volumes:
       - ${LEDGER_JAR:-../../ledger-service/build/libs/ledger-service-0.0.1-SNAPSHOT.jar}:/app/ledger-service.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: ledger-service
     healthcheck:
       <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:19085/actuator/health"]
@@ -203,6 +209,9 @@ services:
       - "127.0.0.1:19090:19090"
     volumes:
       - ${MOCK_BANK_JAR:-../../mock-bank/build/libs/mock-bank-0.0.1-SNAPSHOT.jar}:/app/mock-bank.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: mock-bank
     healthcheck:
       <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:19090/actuator/health"]
@@ -252,6 +261,9 @@ services:
       - "127.0.0.1:19082:19082"
     volumes:
       - ${WALLET_JAR:-../../wallet-service/build/libs/wallet-service-0.0.1-SNAPSHOT.jar}:/app/wallet-service.jar:ro
+    labels:
+      io.travelpay.logs: load-test
+      io.travelpay.service: wallet-service
     healthcheck:
       <<: *app-healthcheck
       test: ["CMD", "curl", "-fs", "http://localhost:19082/actuator/health"]

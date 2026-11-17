@@ -46,18 +46,15 @@
    curl -s 127.0.0.1:19082/actuator/prometheus | grep charge_recovery_stuck
    ```
 
-3. `measure.py`·`prepare.py`를 실행할 셸에서 아래 환경 변수를 둡니다. 주소는 반드시 `localhost`가 아니라 **`127.0.0.1`**로 둡니다. compose가 포트를 `127.0.0.1`(IPv4)에만 열어서, `localhost`로 부르면 Python이 IPv6(`::1`)를 먼저 시도하다 요청마다 약 2초씩 늦어집니다(서비스 지표 표본이 7초 간격으로 벌어지고 대사 소요 시간에도 2초가 붙음).
+3. `measure.py`·`prepare.py`를 실행할 셸에서 환경 변수를 불러옵니다. 새 셸을 열 때마다 다시 실행합니다.
 
    ```bash
-   export PG_CONTAINER=travelpay-charge-load-test-measure-postgres-1
-   export USER_URL=http://127.0.0.1:8081 WALLET_URL=http://127.0.0.1:8082 \
-          LEDGER_URL=http://127.0.0.1:8085 MOCK_BANK_URL=http://127.0.0.1:8090
-   export USER_METRICS_URL=http://127.0.0.1:19081 WALLET_METRICS_URL=http://127.0.0.1:19082 \
-          LEDGER_METRICS_URL=http://127.0.0.1:19085 MOCK_BANK_METRICS_URL=http://127.0.0.1:19090
+   source measure.env
    ```
 
-   PowerShell은 `$env:PG_CONTAINER="travelpay-charge-load-test-measure-postgres-1"`처럼 하나씩 둡니다. 새 셸을 열면 다시 둡니다.
+   `measure.env`에는 측정 DB 컨테이너 이름(`PG_CONTAINER`), 네 서비스의 업무 주소(`*_URL`)와 지표 주소(`*_METRICS_URL`)가 들어 있습니다. 주소는 반드시 `localhost`가 아니라 **`127.0.0.1`**입니다. compose가 포트를 `127.0.0.1`(IPv4)에만 열어서, `localhost`로 부르면 Python이 IPv6(`::1`)를 먼저 시도하다 요청마다 약 2초씩 늦어집니다(서비스 지표 표본이 7초 간격으로 벌어지고 대사 소요 시간에도 2초가 붙음).
 
+   PowerShell은 `source`를 쓸 수 없어, 파일의 값을 `$env:PG_CONTAINER="travelpay-charge-load-test-measure-postgres-1"`처럼 하나씩 둡니다.
 4. 끄기: `docker compose --profile app down` (DB·Kafka 데이터 사라짐. 다시 띄우면 `prepare.py`부터)
 
 | 서비스 (compose) | 업무 포트 | 지표 포트 | 비고 |
@@ -143,6 +140,8 @@ MONITORING_LOAD_TEST_NETWORK=travelpay-charge-load-test_default \
 MONITORING_LOAD_TEST_TARGETS_FILE=./wallet-service/load-test/prometheus-targets.yml \
 docker compose -f compose.monitoring.yaml -f compose.monitoring.load-test.yaml up -d prometheus
 ```
+
+로그는 앱 4개에 단 `io.travelpay.logs=load-test` 라벨을 보고 공용 Alloy가 Loki로 보냅니다. Alloy는 시작할 때만 설정을 읽으므로, 설정 파일이 바뀌었거나 Alloy API(`http://127.0.0.1:12345/api/v0/web/components`)에 `loki.source.docker.load_test_local`이 없으면 `docker compose -f compose.monitoring.yaml restart alloy`로 다시 시작합니다. Grafana Explore(Loki)에서 `{environment="load-test", service_name="wallet-service"} | json | traceId != ""`처럼 봅니다(`service_name`: `user-service`·`ledger-service`·`mock-bank`·`wallet-service`). 보존 기간은 72시간입니다.
 
 ### 측정 전 PC 조건 (같은 날 비교할 측정끼리 같게)
 
@@ -352,7 +351,11 @@ Mock 은행이 출금 2xx 응답을 비율만큼 처리·커밋한 뒤 500으로
 | `charges.accepted`, `statuses` | `charge_requests` | 실제 접수 건수(DB), 상태별 건수·금액 |
 | `charges.completionTps` | `charge_requests.created_at`, `charge_status_history` | 접수 건수 ÷ (첫 `created_at` ~ 마지막 종결 시각) |
 | `charges.completionLatencyMs` | `charge_status_history` | `COMPLETED` 기록 시각 − `created_at`의 P50·P95 |
-| `charges.byBank.<은행 코드>` | `charge_requests.bank_code` | 은행별 `accepted`(접수 건수), `statuses`(상태별 건수·금액), `completionLatencyMs`(P50·P95·`count`, 계산은 전체 값과 같음). 은행이 하나여도 남음 |
+| `charges.byBank.<은행 코드>` | `charge_requests.bank_code` | 은행별 `accepted`(접수 건수), `statuses`(상태별 건수·금액), `completionLatencyMs`(P50·P95·`count`, 계산은 전체 값과 같음). 은행이 하나여도 남음. 아래 꼬리 지표(`completionLatencyTailMs`, `terminalProgress`)도 은행별로 남음 |
+| `charges.completionLatencyTailMs` | `charge_status_history` | **완료 지연 분포**(충전 하나의 접수 → 완료)의 P99·최댓값. `completionLatencyMs`와 같은 데이터·같은 백분위 계산 |
+| `charges.terminalProgress` | `charge_requests.created_at`, `charge_status_history` | **종결 진행**: 전체 첫 접수부터 측정 충전의 50·90·99·100%(건수 올림)가 종결된 시각(초). 충전 하나의 지연이 아니라 묶음 전체가 끝나 가는 모습이며, 은행별도 기준점은 전체 첫 접수. `tailSeconds` = 99% 시각 → 100% 시각 |
+| `charges.tailCharges` | `charge_status_history` | 종결 순서(종결 시각, 같으면 충전 ID. 종결되지 않은 충전은 충전 ID 순으로 맨 뒤) 앞 99%(올림) 뒤에 오는 충전의 건수·은행별 건수·그중 복구 개입 건수(`recoveredCharges`와 같은 기준) |
+| `charges.memberCount` | `charge_requests.user_id` | 측정 충전을 낸 회원 수(종류). 이 키가 생기기 전 결과 파일에는 없음 |
 | `services.<서비스>.<경로>.avgMs` | `http_server_requests_seconds` 합계·횟수 차이 | wallet 충전 접수, user I03, ledger 거래 등록, mock-bank 출금(·환불) 평균 처리 시간 |
 | `services.<서비스>.hikariPending` / `hikariActive` | `hikaricp_connections_*` | 커넥션 대기·사용 평균·최대 (wallet·ledger를 봄) |
 | `services.systemCpuPercent` | wallet `system_cpu_usage` | Docker 가상 머신 전체 CPU(컨테이너 CPU 한도 없음) |
@@ -365,6 +368,10 @@ Mock 은행이 출금 2xx 응답을 비율만큼 처리·커밋한 뒤 500으로
 | `failures` | | 종료 코드 1의 이유 |
 
 서비스 지표 구간은 k6 시작 ~ 마지막 종결 시각입니다(접수 뒤에도 SAGA가 은행·원장을 부르므로).
+
+지난 측정의 충전 지표(꼬리 지표 포함)는 `python measure.py --recompute <LABEL>`로 다시 계산합니다. `results/<LABEL>-c*-metrics.json`(정확히 1개)의 `window`로 충전을 다시 고르고(측정 회원 + `window.from − 5초 ≤ created_at ≤ window.to`), 조회 건수가 결과 파일의 `accepted`와 다르면 멈춥니다. 결과는 `results/<원래 파일명>-recompute.json`에 쓰고 원래 파일은 그대로 둡니다. 측정 회원은 지금의 `data/users.json`이라, 측정 뒤 `prepare.py`로 회원을 새로 만들었으면 0건으로 멈춥니다.
+
+그럴 때만 `--ignore-members`를 붙여 회원 조건 없이 기간만으로 고릅니다. 이때는 건수(전체·은행별), `firstCreatedAt`, `lastTerminalAt`, 완료 지연 P50·P95(전체·은행별), `recoveredCharges`·`recoveredLatencyMs` P50·P95, 회원 수(결과 파일에 `charges.memberCount`가 있을 때만)가 결과 파일과 하나라도 다르면 멈춥니다. 조회된 회원 수는 출력과 `selection.memberCount`에 참고값으로 남고, 지금 `users.json`의 회원 수와는 비교하지 않습니다. 결과 파일의 `selection`에 `ignoreMembers: true`와 "동일 충전 집합 미증명(통계값 일치로 간접 확인)"이 남습니다. 충전 ID 목록은 어디에도 기록되지 않아 같은 충전인지 직접 비교할 수 없기 때문입니다(대사는 어긋난 충전만 남김).
 
 `fault` 블록:
 

@@ -5,13 +5,18 @@
 사용:
   python measure.py <LABEL> --count 1000 --rate 50 --concurrency 1 [--amount 10000] [--pre-vus N] [--max-vus N]
                     [--drain-timeout 600] [--fault-rate 0.0]
+  python measure.py --recompute <LABEL> [--ignore-members]
 결과: results/<LABEL>-c<CONCURRENCY>.json(k6) + results/<LABEL>-c<CONCURRENCY>-metrics.json(서버·DB 지표, 정합성, 대사)
+
+--recompute는 results/<LABEL>-c*-metrics.json(정확히 1개)의 window로 측정 DB에서 충전 지표를 다시 계산해
+results/<원래 파일명>-recompute.json에 씁니다(원래 결과 파일은 그대로).
 
 --concurrency는 결과에 남기는 값입니다. 실제 동시성은 지갑 실행 인자로 바꾸고 재기동합니다(스크립트가 바꾸지 않음).
 서비스 지표 구간은 k6 시작 ~ 마지막 종결 시각입니다(접수 뒤 SAGA가 은행·원장을 부르므로 종결까지 봅니다).
 """
 import argparse
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -239,11 +244,28 @@ def db_metrics(sampler, start, end):
 
 # ---- 충전 지표 (wallet DB) ----
 
-def measured_sql(data, since):
-    """이번 측정의 충전: 측정 회원 + created_at ≥ since"""
+def measured_sql(data, since, until=None, ignore_members=False):
+    """이번 측정의 충전: 측정 회원 + created_at ≥ since (+ 다시 계산할 때는 created_at ≤ until).
+
+    ignore_members는 --recompute --ignore-members에서만 씁니다(회원 조건 없이 기간만으로 고름).
+    """
     user_ids = [user["userId"] for user in data["users"]]
-    return (f"SELECT * FROM wallet_service.charge_requests WHERE user_id = ANY({sql_array(user_ids, 'uuid')})"
-            f" AND created_at >= {sql_text(iso(since))}::timestamptz")
+    members = "TRUE" if ignore_members else f"user_id = ANY({sql_array(user_ids, 'uuid')})"
+    sql = (f"SELECT * FROM wallet_service.charge_requests WHERE {members}"
+           f" AND created_at >= {sql_text(iso(since))}::timestamptz")
+    if until is not None:
+        sql += f" AND created_at <= {sql_text(iso(until))}::timestamptz"
+    return sql
+
+
+def recovered_condition(alias):
+    """복구 개입 충전 조건(recoveredCharges 기준): 상태 이력 trace_id가 recovery-로 시작하는 행이 하나 이상"""
+    return (f"EXISTS (SELECT 1 FROM wallet_service.charge_status_history h"
+            f"        WHERE h.charge_id = {alias}.id AND h.trace_id LIKE {sql_text(RECOVERY_TRACE_PREFIX + '%')})")
+
+
+def optional_ms(value):
+    return round(float(value), 1) if value not in ("", None) else None
 
 
 def wait_terminal(data, since, timeout_seconds):
@@ -260,8 +282,8 @@ def wait_terminal(data, since, timeout_seconds):
         time.sleep(5)
 
 
-def charge_metrics(data, since):
-    measured = measured_sql(data, since)
+def charge_metrics(data, since, until=None, ignore_members=False):
+    measured = measured_sql(data, since, until, ignore_members)
     statuses = {row[0]: {"count": int(row[1]), "amount": int(row[2])}
                 for row in psql(f"SELECT status, count(*), coalesce(sum(amount), 0) FROM ({measured}) m GROUP BY status;")}
     accepted = sum(entry["count"] for entry in statuses.values())
@@ -274,14 +296,15 @@ def charge_metrics(data, since):
         " (SELECT extract(epoch FROM max(h.created_at)) FROM wallet_service.charge_status_history h"
         f"   WHERE h.charge_id IN (SELECT id FROM ({measured}) x) AND h.to_status IN {TERMINAL_SQL})"
         f" FROM ({measured}) m;")[0]
-    p50, p95, completed_count = psql(
-        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*)"
+    p50, p95, completed_count, p99, max_ms = psql(
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*),"
+        " percentile_cont(0.99) WITHIN GROUP (ORDER BY ms), max(ms)"
         " FROM (SELECT extract(epoch FROM (min(h.created_at) - m.created_at)) * 1000 AS ms"
         f"       FROM ({measured}) m JOIN wallet_service.charge_status_history h ON h.charge_id = m.id"
         "       WHERE h.to_status = 'COMPLETED' GROUP BY m.id, m.created_at) c;")[0]
     first_created, last_terminal = float(first_created), float(last_terminal) if last_terminal else None
     span = (last_terminal - first_created) if last_terminal else None
-    return {
+    result = {
         "accepted": accepted,
         "statuses": statuses,
         "firstCreatedAt": first_created_iso,
@@ -297,7 +320,14 @@ def charge_metrics(data, since):
             "p95": round(float(p95), 1) if p95 else None,
         },
         "byBank": charges_by_bank(measured),
+        # 꼬리 지표 1: 완료 지연 분포(충전 하나의 접수 → 첫 COMPLETED). completionLatencyMs와 같은 데이터·같은 백분위 함수
+        "completionLatencyTailMs": {"count": int(completed_count), "p99": optional_ms(p99), "max": optional_ms(max_ms)},
+        # 측정 충전을 낸 회원 수(user_id 종류). --recompute가 이 키가 있는 결과 파일에서만 비교
+        "memberCount": int(psql(f"SELECT count(DISTINCT user_id) FROM ({measured}) m;")[0][0]),
     }
+    # 꼬리 지표 2·3: 종결 진행(전체 첫 접수 기준), 꼬리 구간(종결 순서 앞 99% 뒤) 충전 구성
+    result.update(terminal_progress(measured, first_created, result["byBank"]))
+    return result
 
 
 def charges_by_bank(measured):
@@ -307,12 +337,14 @@ def charges_by_bank(measured):
             f"SELECT bank_code, status, count(*), coalesce(sum(amount), 0) FROM ({measured}) m"
             " GROUP BY bank_code, status ORDER BY bank_code, status;"):
         entry = by_bank.setdefault(bank, {"accepted": 0, "statuses": {},
-                                          "completionLatencyMs": {"count": 0, "p50": None, "p95": None}})
+                                          "completionLatencyMs": {"count": 0, "p50": None, "p95": None},
+                                          "completionLatencyTailMs": {"count": 0, "p99": None, "max": None}})
         entry["statuses"][status] = {"count": int(count), "amount": int(amount)}
         entry["accepted"] += int(count)
-    for bank, p50, p95, completed_count in psql(
+    for bank, p50, p95, completed_count, p99, max_ms in psql(
             "SELECT bank_code, percentile_cont(0.5) WITHIN GROUP (ORDER BY ms),"
-            " percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*)"
+            " percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*),"
+            " percentile_cont(0.99) WITHIN GROUP (ORDER BY ms), max(ms)"
             " FROM (SELECT m.bank_code, extract(epoch FROM (min(h.created_at) - m.created_at)) * 1000 AS ms"
             f"       FROM ({measured}) m JOIN wallet_service.charge_status_history h ON h.charge_id = m.id"
             "       WHERE h.to_status = 'COMPLETED' GROUP BY m.id, m.created_at, m.bank_code) c"
@@ -322,7 +354,68 @@ def charges_by_bank(measured):
             "p50": round(float(p50), 1) if p50 else None,
             "p95": round(float(p95), 1) if p95 else None,
         }
+        by_bank[bank]["completionLatencyTailMs"] = {"count": int(completed_count), "p99": optional_ms(p99),
+                                                    "max": optional_ms(max_ms)}
     return by_bank
+
+
+PROGRESS_POINTS = (50, 90, 99, 100)   # 종결 진행 시각을 낼 비율(%)
+TAIL_FROM = 99                        # 꼬리 구간: 종결 순서 앞 99%(건수 올림) 뒤
+PROGRESS_DEFINITION = ("terminalProgress = 전체 첫 접수(firstCreatedAt)부터 측정 충전 중 N%(건수 올림)가 종결된 시각(초)."
+                       " 충전의 종결 시각 = 종결 상태(lastTerminalAt과 같은 상태) 이력 중 가장 늦은 시각."
+                       " 은행별도 기준점은 전체 firstCreatedAt. tailSeconds = 99% 시각 → 100% 시각."
+                       " 충전 하나의 접수 → 완료 지연(completionLatencyMs·completionLatencyTailMs)과 다른 지표")
+TAIL_DEFINITION = ("tailCharges = 종결 시각(같으면 충전 ID) 순으로 정렬해 앞 99%(건수 올림) 뒤에 오는 충전(전체 기준)."
+                   " 종결되지 않은 충전은 충전 ID 순으로 맨 뒤. recovered는 recoveredCharges와 같은 기준")
+
+
+def progress_seconds(ordered, total, first_created):
+    """종결 순서로 정렬한 목록에서 N%(올림)번째 충전의 종결 시각 − 첫 접수(초). 그만큼 종결되지 않았으면 None"""
+    points = {}
+    for percent in PROGRESS_POINTS:
+        rank = -(-total * percent // 100)
+        moment = ordered[rank - 1][0] if 0 < rank <= len(ordered) else None
+        points[f"p{percent}"] = round(moment - first_created, 3) if moment is not None else None
+    tail = (round(points["p100"] - points["p99"], 3)
+            if points["p100"] is not None and points["p99"] is not None else None)
+    return {"total": total, "terminated": len(ordered), "secondsFromFirstCreated": points, "tailSeconds": tail}
+
+
+def terminal_progress(measured, first_created, by_bank):
+    """종결 진행(전체·은행별)과 꼬리 구간 구성. by_bank 항목에 은행별 terminalProgress를 넣습니다."""
+    rows = psql(
+        "SELECT m.id, m.bank_code,"
+        " (SELECT extract(epoch FROM max(h.created_at)) FROM wallet_service.charge_status_history h"
+        f"   WHERE h.charge_id = m.id AND h.to_status IN {TERMINAL_SQL}),"
+        f" {recovered_condition('m')}"
+        f" FROM ({measured}) m;")
+    charges = [(float(moment) if moment else None, charge_id, bank, recovered == "t")
+               for charge_id, bank, moment, recovered in rows]
+    terminated = sorted((charge for charge in charges if charge[0] is not None), key=lambda c: (c[0], c[1]))
+    progress = progress_seconds(terminated, len(charges), first_created)
+    progress["byBank"] = {}
+    for bank in by_bank:
+        bank_total = sum(1 for charge in charges if charge[2] == bank)
+        bank_terminated = [charge for charge in terminated if charge[2] == bank]
+        progress["byBank"][bank] = progress_seconds(bank_terminated, bank_total, first_created)
+        by_bank[bank]["terminalProgress"] = progress["byBank"][bank]
+    progress["definition"] = PROGRESS_DEFINITION
+
+    # 종결되지 않은 충전은 충전 ID 순으로 맨 뒤에 붙임(조회 순서에 따라 꼬리 구성이 바뀌지 않게)
+    ordered = terminated + sorted((charge for charge in charges if charge[0] is None), key=lambda c: c[1])
+    tail = ordered[-(-len(ordered) * TAIL_FROM // 100):]
+    return {
+        "terminalProgress": progress,
+        "tailCharges": {
+            "count": len(tail),
+            "recovered": sum(1 for charge in tail if charge[3]),
+            "notTerminated": sum(1 for charge in tail if charge[0] is None),
+            "byBank": {bank: {"count": sum(1 for charge in tail if charge[2] == bank),
+                              "recovered": sum(1 for charge in tail if charge[2] == bank and charge[3])}
+                       for bank in by_bank},
+            "definition": TAIL_DEFINITION,
+        },
+    }
 
 
 # ---- 장애(응답 유실) 지표 ----
@@ -347,30 +440,34 @@ def lost_responses(samples, end, before):
 
 
 def fault_metrics(data, since, fault_rate, samples, end, lost_before, charges, services):
-    measured = measured_sql(data, since)
-    # 복구 처리 충전 수, 그중 COMPLETED 이력이 있는 충전의 완료 지연(완료 이력 trace_id는 조건에 넣지 않음)
-    recovered, p50, p95, completed_count = psql(
-        f"WITH m AS ({measured}),"
-        " r AS (SELECT m.id, m.created_at FROM m WHERE EXISTS (SELECT 1 FROM wallet_service.charge_status_history h"
-        f"        WHERE h.charge_id = m.id AND h.trace_id LIKE {sql_text(RECOVERY_TRACE_PREFIX + '%')}))"
-        " SELECT (SELECT count(*) FROM r),"
-        " percentile_cont(0.5) WITHIN GROUP (ORDER BY ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*)"
-        " FROM (SELECT extract(epoch FROM (min(h.created_at) - r.created_at)) * 1000 AS ms"
-        "       FROM r JOIN wallet_service.charge_status_history h ON h.charge_id = r.id"
-        "       WHERE h.to_status = 'COMPLETED' GROUP BY r.id, r.created_at) c;")[0]
     withdrawals = (services.get("mock-bank") or {}).get(WITHDRAWAL_PATH) or {}
     return {
         "faultRate": fault_rate,
         "lostResponses": lost_responses(samples, end, lost_before),
         "bankWithdrawalCalls": withdrawals.get("calls", 0),
         "acceptedCharges": charges["accepted"],
+        **recovered_metrics(measured_sql(data, since)),
+        "definition": RECOVERED_DEFINITION,
+    }
+
+
+def recovered_metrics(measured):
+    """복구 처리 충전 수, 그중 COMPLETED 이력이 있는 충전의 완료 지연(완료 이력 trace_id는 조건에 넣지 않음)"""
+    recovered, p50, p95, completed_count = psql(
+        f"WITH m AS ({measured}),"
+        f" r AS (SELECT m.id, m.created_at FROM m WHERE {recovered_condition('m')})"
+        " SELECT (SELECT count(*) FROM r),"
+        " percentile_cont(0.5) WITHIN GROUP (ORDER BY ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY ms), count(*)"
+        " FROM (SELECT extract(epoch FROM (min(h.created_at) - r.created_at)) * 1000 AS ms"
+        "       FROM r JOIN wallet_service.charge_status_history h ON h.charge_id = r.id"
+        "       WHERE h.to_status = 'COMPLETED' GROUP BY r.id, r.created_at) c;")[0]
+    return {
         "recoveredCharges": int(recovered),
         "recoveredLatencyMs": {
             "count": int(completed_count),
             "p50": round(float(p50), 1) if p50 else None,
             "p95": round(float(p95), 1) if p95 else None,
         },
-        "definition": RECOVERED_DEFINITION,
     }
 
 
@@ -652,6 +749,7 @@ def print_brief(m):
           f" | dropped {a['droppedIterations']} | 202 외 {a['errorResponses']}")
     print(f"  완료 처리량 {c.get('completionTps')}건/초 | 완료 지연 P50 {latency.get('p50')}ms P95 {latency.get('p95')}ms"
           f" | 종결 대기 {m['drainSeconds']}초")
+    print_tail(c, "  ")
     statuses = ", ".join(f"{status} {entry['count']}" for status, entry in c["statuses"].items())
     print(f"  상태 {statuses}")
     for bank, entry in (c.get("byBank") or {}).items():
@@ -659,6 +757,7 @@ def print_brief(m):
         bank_statuses = ", ".join(f"{status} {s['count']}" for status, s in entry["statuses"].items())
         print(f"  은행 {bank}: 접수 {entry['accepted']}건 | 완료 지연 P50 {bank_latency['p50']}ms"
               f" P95 {bank_latency['p95']}ms ({bank_latency['count']}건) | {bank_statuses}")
+        print_tail(entry, "    ", (c.get("tailCharges") or {}).get("byBank", {}).get(bank))
     f = m.get("fault") or {}
     if f.get("faultRate") or f.get("lostResponses"):
         recovered = f.get("recoveredLatencyMs") or {}
@@ -673,5 +772,116 @@ def print_brief(m):
     print(f"  결과: results/{m['label']}-c{m['concurrency']}-metrics.json")
 
 
+def print_tail(c, indent, bank_tail=None):
+    """꼬리 지표 줄. 완료 지연 분포(충전별)와 종결 진행(전체 첫 접수 기준)을 이름으로 나눠 씁니다."""
+    tail_latency, progress = c.get("completionLatencyTailMs"), c.get("terminalProgress")
+    if tail_latency:
+        print(f"{indent}완료 지연 분포(충전별 접수→완료) P99 {tail_latency['p99']}ms 최댓값 {tail_latency['max']}ms")
+    if progress:
+        points = progress["secondsFromFirstCreated"]
+        print(f"{indent}종결 진행(전체 첫 접수 기준, N% 종결 시각) 50% {points['p50']}초 90% {points['p90']}초"
+              f" 99% {points['p99']}초 100% {points['p100']}초 | 꼬리(99%→100%) {progress['tailSeconds']}초")
+    tail = c.get("tailCharges") if bank_tail is None else bank_tail
+    if tail:
+        banks = ", ".join(f"{bank} {entry['count']}" for bank, entry in (tail.get("byBank") or {}).items())
+        print(f"{indent}꼬리 구간 충전(전체 종결 순서 앞 99% 뒤) {tail['count']}건"
+              + (f" (은행별 {banks})" if banks else "") + f" | 그중 복구 개입 {tail['recovered']}건")
+
+
+# ---- 다시 계산 (--recompute) ----
+
+RECOMPUTE_SELECTION = ("측정 회원(data/users.json) + window.from − 5초 ≤ created_at ≤ window.to"
+                       " (측정 때 since = k6 시작 − 5초, window.to = 마지막 종결 시각)")
+RECOMPUTE_SELECTION_IGNORE_MEMBERS = ("회원 조건 없음(--ignore-members) + window.from − 5초 ≤ created_at ≤ window.to."
+                                      " 측정 뒤 data/users.json이 바뀌어 측정 회원으로 고를 수 없을 때만 씀")
+INDIRECT_ONLY = "동일 충전 집합 미증명(통계값 일치로 간접 확인)"
+
+
+def parse_iso(text):
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+
+
+def recompute_checks(original, charges, recovered):
+    """다시 계산한 값과 결과 파일 값 (이름, 결과 파일, 다시 계산) 목록"""
+    source = original["charges"]
+    checks = [("accepted", source["accepted"], charges["accepted"]),
+              ("firstCreatedAt", source.get("firstCreatedAt"), charges.get("firstCreatedAt")),
+              ("lastTerminalAt", source.get("lastTerminalAt"), charges.get("lastTerminalAt"))]
+    for key in ("p50", "p95"):
+        checks.append((f"completionLatencyMs.{key}", source["completionLatencyMs"][key],
+                       charges["completionLatencyMs"][key]))
+    for bank in sorted(set(source.get("byBank") or {}) | set(charges.get("byBank") or {})):
+        before, after = (source.get("byBank") or {}).get(bank, {}), (charges.get("byBank") or {}).get(bank, {})
+        checks.append((f"byBank.{bank}.accepted", before.get("accepted"), after.get("accepted")))
+        for key in ("p50", "p95"):
+            checks.append((f"byBank.{bank}.completionLatencyMs.{key}",
+                           (before.get("completionLatencyMs") or {}).get(key),
+                           (after.get("completionLatencyMs") or {}).get(key)))
+    fault = original.get("fault") or {}
+    checks.append(("recoveredCharges", fault.get("recoveredCharges"), recovered["recoveredCharges"]))
+    for key in ("p50", "p95"):
+        checks.append((f"recoveredLatencyMs.{key}", (fault.get("recoveredLatencyMs") or {}).get(key),
+                       recovered["recoveredLatencyMs"][key]))
+    if "memberCount" in source:
+        # charges.memberCount가 없는 이전 결과 파일은 회원 수를 비교하지 않음(지금 users.json과는 비교하지 않음)
+        checks.append(("memberCount", source["memberCount"], charges["memberCount"]))
+    return [{"name": name, "original": before, "recomputed": after, "same": before == after}
+            for name, before, after in checks]
+
+
+def recompute(label, ignore_members=False):
+    """결과 파일의 window로 충전을 다시 골라 충전 지표(기존 키 + 꼬리 지표)를 다시 계산합니다."""
+    pattern = re.compile(rf"^{re.escape(label)}-c[^-]+-metrics\.json$")
+    found = sorted(path for path in RESULTS.glob(f"{label}-c*-metrics.json") if pattern.match(path.name))
+    if len(found) != 1:
+        raise SystemExit(f"results/{label}-c*-metrics.json이 {len(found)}개입니다(1개여야 함): {[p.name for p in found]}")
+    source = found[0]
+    original = json.loads(source.read_text(encoding="utf-8"))
+    window = original["window"]
+    since = parse_iso(window["from"]) - timedelta(seconds=5)
+    until = parse_iso(window["to"])
+    data = load_data()
+    charges = charge_metrics(data, since, until, ignore_members)
+    expected = original["charges"]["accepted"]
+    if charges["accepted"] != expected:
+        raise SystemExit(f"window로 조회한 충전 {charges['accepted']}건 ≠ 결과 파일 접수 {expected}건 ({source.name})."
+                         " 다시 계산하지 않습니다.")
+    measured = measured_sql(data, since, until, ignore_members)
+    recovered = recovered_metrics(measured)
+    members = charges["memberCount"]   # 참고값. 결과 파일에 charges.memberCount가 있을 때만 검증에 들어감
+    checks = recompute_checks(original, charges, recovered)
+    differ = [check for check in checks if not check["same"]]
+    if differ:
+        for check in differ:
+            print(f"  다름: {check['name']} 결과 파일 {check['original']} ≠ 다시 계산 {check['recomputed']}")
+        raise SystemExit(f"다시 계산한 값이 결과 파일과 다릅니다({len(differ)}개, {source.name}). 결과 파일을 쓰지 않습니다.")
+    selection = {"since": iso(since), "until": iso(until), "ignoreMembers": ignore_members, "memberCount": members,
+                 "rule": RECOMPUTE_SELECTION_IGNORE_MEMBERS if ignore_members else RECOMPUTE_SELECTION}
+    if ignore_members:
+        selection["verification"] = INDIRECT_ONLY
+    result = {"source": source.name, "label": original["label"], "concurrency": original["concurrency"],
+              "window": window, "selection": selection, "checks": checks, "charges": charges, "recovered": recovered}
+    target = RESULTS / f"{source.stem}-recompute.json"
+    target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    latency = charges.get("completionLatencyMs") or {}
+    print(f"[{result['label']}] 다시 계산 ({source.name}, 조회 {charges['accepted']}건 = 결과 파일 {expected}건,"
+          f" 회원 {members}명(참고), 검증 {len(checks)}개 값 일치)")
+    if ignore_members:
+        print(f"  회원 조건 없이 고름(--ignore-members): {INDIRECT_ONLY}")
+    print(f"  완료 처리량 {charges.get('completionTps')}건/초 | 완료 지연 P50 {latency.get('p50')}ms P95 {latency.get('p95')}ms")
+    print_tail(charges, "  ")
+    for bank, entry in charges["byBank"].items():
+        bank_latency = entry["completionLatencyMs"]
+        print(f"  은행 {bank}: 접수 {entry['accepted']}건 | 완료 지연 P50 {bank_latency['p50']}ms P95 {bank_latency['p95']}ms")
+        print_tail(entry, "    ", charges["tailCharges"]["byBank"].get(bank))
+    print(f"  결과: results/{target.name}")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--recompute":
+        options = sys.argv[3:]
+        if len(sys.argv) < 3 or options not in ([], ["--ignore-members"]):
+            raise SystemExit("사용: python measure.py --recompute <LABEL> [--ignore-members]")
+        sys.exit(recompute(sys.argv[2], ignore_members=bool(options)))
     sys.exit(main())
