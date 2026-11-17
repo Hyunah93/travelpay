@@ -166,11 +166,7 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 
 ### 01. 회원·인증·인프라 (김이찬)
 
-회원·인증: [User](docs/guide/user-service.md) · [Gateway](docs/guide/gateway.md)
-
-인프라: [AWS](docs/guide/aws-terraform.md) · [CI/CD](docs/guide/ci-cd.md)
-
-공통: [공통 모듈](docs/guide/common.md)
+[User](docs/guide/user-service.md) · [Gateway](docs/guide/gateway.md) · [AWS](docs/guide/aws-terraform.md) · [CI/CD](docs/guide/ci-cd.md) · [공통 모듈](docs/guide/common.md)
 
 - MSA 세션 인증 체계: Spring Security·Spring Session Redis로 로그인 세션을 중앙 관리하고, Gateway가 외부 회원 헤더를 제거한 뒤 User에서 검증한 회원 정보만 내부 서비스에 전달
 - 회원 권한 관리·강제 로그아웃: 요청마다 DB의 회원 상태·권한을 검증하고, 관리자 정지·강제 로그아웃 시 세션 버전을 변경해 기존 로그인 세션 일괄 무효화
