@@ -166,6 +166,12 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 
 ### 01. 회원·인증·인프라 (김이찬)
 
+회원·인증: [User](docs/guide/user-service.md) · [Gateway](docs/guide/gateway.md)
+
+인프라: [AWS](docs/guide/aws-terraform.md) · [CI/CD](docs/guide/ci-cd.md)
+
+공통: [공통 모듈](docs/guide/common.md)
+
 - MSA 세션 인증 체계: Spring Security·Spring Session Redis로 로그인 세션을 중앙 관리하고, Gateway가 외부 회원 헤더를 제거한 뒤 User에서 검증한 회원 정보만 내부 서비스에 전달
 - 회원 권한 관리·강제 로그아웃: 요청마다 DB의 회원 상태·권한을 검증하고, 관리자 정지·강제 로그아웃 시 세션 버전을 변경해 기존 로그인 세션 일괄 무효화
 - 인증 보안 강화: 유휴 60분·절대 24시간 세션 만료, 로그인·비밀번호 변경 시 세션 ID 교체 및 CSRF 토큰 재발급, Redis Lua 기반 이메일·IP별 로그인 시도 제한
@@ -174,12 +180,16 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 
 ### 02. 지갑·충전·원장 (박현아)
 
+[지갑·충전 가이드](docs/guide/wallet-service.md) · [원장 가이드](docs/guide/ledger-service.md) · [Mock Bank 가이드](docs/guide/mock-bank.md)
+
 - 충전 기록과 Outbox 이벤트를 한 트랜잭션으로 저장하고, Kafka 기반 비동기 SAGA로 은행 출금 → 원장 적립 처리
 - 결과 모름은 같은 requestId로 재전송해 확정하고, 원장이 확정 거절한 경우만 환불. 판단할 수 없는 건은 MANUAL_REVIEW
 - 충전 기록·은행 거래·원장 기록 3자 대사, 관리자 보정 시 은행·원장 상태를 다시 조회해 실행할 수 있는 조치만 허용
 - (거래 유형, 업무 ID) 유일 제약으로 원장 중복 기록 방지, 은행별 서킷 브레이커로 한 은행의 장애 격리
 
 ### 03. 송금·프론트엔드 (김지혜)
+
+[송금 가이드](docs/guide/payment-transfer.md) · [프론트엔드 가이드](https://github.com/dont-worrys/travelpay-front/tree/main/docs/guide)
 
 - Idempotency-Key·요청 해시·DB UNIQUE 제약으로 중복 송금 방지
 - 비관적 잠금, 계정 ID 기준 잠금 순서 고정, DB 잔액 제약으로 동시 송금의 교착·초과 출금 방지
@@ -188,6 +198,8 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 
 ### 04. 환율·환전 (백가영)
 
+[환율·환전 가이드](docs/guide/exchange-service.md)
+
 - Redis 기반 환율·견적 처리: 환율은 수집 커밋 뒤 Redis에 갱신해 한 번에(MGET) 조회하고, 200ms 안에 응답이 없으면 DB로 대체. 견적은 Redis에 5분 TTL로 저장(noeviction)하고 1회 사용은 주문 UNIQUE 제약으로 보장해, 요청마다 DB 연결을 쓰지 않음
 - 결과 모름 자동 확정·동시성 제어: 원장에 출금·수수료·입금을 주문 ID로 한 번만 기록하고, 결과 모름은 202로 답한 뒤 복구 스케줄러가 같은 요청을 재전송해 확정. 같은 멱등 키 재요청은 원장을 부르지 않고 저장된 결과로 응답하며, 주문 상태는 WHERE status 원자적 UPDATE로 한 번만 반영
 - 서버 판정 기반 관리자 보정: 끝내 확정하지 못한 주문은 MANUAL_REVIEW로 두고, 서버가 원장 기록을 조회해 결과를 판정 (관리자는 예상 결과를 확인하고 처리만 실행)
@@ -195,6 +207,8 @@ TravelPay는 8개 MSA 서비스를 ECS on EC2에서 서비스별 Task 1개로 �
 - 이벤트 기반 예약 자동 체결: 새 환율이 저장될 때만 조건에 닿은 예약을 찾고, SKIP LOCKED로 잠근 뒤 조건을 다시 확인해 체결. 체결 주문은 멱등 키(reservation:{예약 ID})로 두 번 생성되지 않음
 
 ### 05. 결제·환불·정산 (이안근)
+
+[결제·정산 가이드](docs/guide/payment.md)
 
 - 원장 reference 멱등성으로 중복 요청·재시도로 인한 이중 결제 방지
 - 결과를 알 수 없는 거래는 백오프 재시도 후 원장 조회로 자동 확정, 확정 못 하면 운영자 검토로 전환
