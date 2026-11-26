@@ -4,6 +4,7 @@ import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.response.ApiResponse;
 import com.travelpay.ledger.application.transaction.LedgerTransactionService;
 import com.travelpay.ledger.application.transaction.dto.CancelTransactionResult;
+import com.travelpay.ledger.application.transaction.dto.ChargeReversalResult;
 import com.travelpay.ledger.application.transaction.dto.TransactionDetailResult;
 import com.travelpay.ledger.application.transaction.dto.TransactionPeriodQuery;
 import com.travelpay.ledger.application.transaction.dto.TransactionPeriodResult;
@@ -11,6 +12,8 @@ import com.travelpay.ledger.application.transaction.dto.TransactionResult;
 import com.travelpay.ledger.domain.LedgerErrorCode;
 import com.travelpay.ledger.domain.transaction.ReferenceType;
 import com.travelpay.ledger.presentation.transaction.dto.CancelTransactionRequest;
+import com.travelpay.ledger.presentation.transaction.dto.ChargeReversalRequest;
+import com.travelpay.ledger.presentation.transaction.dto.ChargeReversalResponse;
 import com.travelpay.ledger.presentation.transaction.dto.RegisterTransactionRequest;
 import com.travelpay.ledger.presentation.transaction.dto.RegisterTransactionResponse;
 import com.travelpay.ledger.presentation.transaction.dto.TransactionPeriodResponse;
@@ -67,6 +70,20 @@ public class LedgerTransactionController {
                 () -> transactionService.cancel(request.toCommand()));
         return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
                 .body(ApiResponse.success(TransactionResultResponse.from(result.transaction())));
+    }
+
+    /**
+     * 충전 취소 분개(이중 지급 바로잡기). 새로 기록 201, 이미 있으면 200(같은 거래).
+     * 원거래 없음 404, 원거래가 POSTED가 아니거나 충전 구조가 아님 422, 계정 사용 불가 422. 거절은 기록하지 않는다.
+     * 응답은 거래 응답 형식 + recoveredAmount(지갑에서 회수한 금액), receivableAmount(미수 금액)
+     */
+    @PostMapping("/charge-reversals")
+    public ResponseEntity<ApiResponse<ChargeReversalResponse>> reverseCharge(
+            @Valid @RequestBody ChargeReversalRequest request) {
+        ChargeReversalResult result = callLogging(ReferenceType.CHARGE_REVERSAL, request.chargeId(),
+                () -> transactionService.reverseCharge(request.toCommand()));
+        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
+                .body(ApiResponse.success(ChargeReversalResponse.from(result)));
     }
 
     @GetMapping

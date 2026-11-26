@@ -3,16 +3,22 @@ package com.travelpay.ledger.application.transaction;
 import com.travelpay.common.error.BusinessException;
 import com.travelpay.ledger.application.transaction.dto.CancelTransactionCommand;
 import com.travelpay.ledger.application.transaction.dto.CancelTransactionResult;
+import com.travelpay.ledger.application.transaction.dto.ChargeReversalCommand;
+import com.travelpay.ledger.application.transaction.dto.ChargeReversalResult;
 import com.travelpay.ledger.application.transaction.dto.LedgerEntryResult;
 import com.travelpay.ledger.application.transaction.dto.RegisterTransactionCommand;
 import com.travelpay.ledger.application.transaction.dto.TransactionDetailResult;
 import com.travelpay.ledger.application.transaction.dto.TransactionResult;
+import com.travelpay.ledger.domain.Currency;
 import com.travelpay.ledger.domain.LedgerErrorCode;
+import com.travelpay.ledger.domain.account.AccountType;
 import com.travelpay.ledger.domain.account.LedgerAccount;
 import com.travelpay.ledger.domain.account.LedgerAccountRepository;
 import com.travelpay.ledger.domain.account.OwnerType;
 import com.travelpay.ledger.domain.transaction.Direction;
+import com.travelpay.ledger.domain.transaction.EntryType;
 import com.travelpay.ledger.domain.transaction.LedgerEntry;
+import com.travelpay.ledger.domain.transaction.LedgerEntryLine;
 import com.travelpay.ledger.domain.transaction.LedgerTransaction;
 import com.travelpay.ledger.domain.transaction.LedgerTransactionRepository;
 import com.travelpay.ledger.domain.transaction.ReferenceType;
@@ -96,21 +102,7 @@ class LedgerTransactionRecorder {
             return reject(command, requestHash, rejectReason.get());
         }
 
-        Map<UUID, Long> lockedBalances = accounts.values().stream()
-                .collect(Collectors.toMap(LedgerAccount::getId, LedgerAccount::getBalance));
-        LedgerTransaction transaction = transactionRepository.save(LedgerTransaction.posted(
-                command.referenceType(), command.referenceId(), requestHash,
-                command.userId(), command.originalTransactionId(), command.description()));
-        List<LedgerEntry> entries = new ArrayList<>(resolvedEntries.size());
-        for (ResolvedEntry resolved : resolvedEntries) {
-            RegisterTransactionCommand.Entry entry = resolved.entry();
-            LedgerAccount account = accounts.get(resolved.accountId());
-            long balanceAfter = account.apply(entry.direction(), entry.amount());
-            entries.add(LedgerEntry.create(transaction.getId(), account.getId(), entry.currency(),
-                    entry.entryType(), entry.direction(), entry.amount(), balanceAfter));
-        }
-        verifyFinalBalances(accounts, lockedBalances, netChanges);
-        transactionRepository.saveEntries(entries);
+        LedgerTransaction transaction = post(command, requestHash, accounts, resolvedEntries, netChanges);
         return TransactionResult.of(transaction, true);
     }
 
@@ -146,6 +138,142 @@ class LedgerTransactionRecorder {
         LedgerTransaction existing = transactionRepository.findByReference(referenceType, referenceId)
                 .orElseThrow(() -> new IllegalStateException("중복으로 거절된 취소의 기존 거래를 다시 찾을 수 없습니다."));
         return new CancelTransactionResult(detail(existing), false);
+    }
+
+    /**
+     * 충전 취소 분개. 이중 지급된 충전 (CHARGE, chargeId)를 원장에서 되돌린다.
+     * 회원 지갑은 잠근 뒤의 잔액만큼 회수하고(DEBIT CHARGE_REVERSAL_OUT), 모자란 만큼은 미수 계정에 남기며
+     * (DEBIT CHARGE_REVERSAL_RECEIVABLE), 충전 원천에는 원금액을 되돌린다(CREDIT CHARGE_REVERSAL_IN).
+     * 금액이 0인 항목은 만들지 않는다. 거절(원거래 없음·구조 다름·계정 사용 불가)은 기록하지 않고 예외로 롤백한다.
+     * 같은 chargeId 동시 요청은 거래 INSERT의 UNIQUE 위반(DuplicateReferenceException)으로 롤백되고,
+     * LedgerTransactionService가 새 트랜잭션에서 먼저 저장된 취소 분개를 읽는다.
+     */
+    @Transactional(timeout = TX_TIMEOUT_SECONDS)
+    public ChargeReversalResult reverseCharge(ChargeReversalCommand command, String requestHash) {
+        Optional<LedgerTransaction> existing =
+                transactionRepository.findByReference(ReferenceType.CHARGE_REVERSAL, command.chargeId());
+        if (existing.isPresent()) {
+            return ChargeReversalResult.of(detail(existing.get()), false);
+        }
+
+        LedgerTransaction original = transactionRepository.findByReference(ReferenceType.CHARGE, command.chargeId())
+                .orElseThrow(() -> new BusinessException(LedgerErrorCode.LEDGER_TRANSACTION_NOT_FOUND));
+        if (!original.isPosted()) {
+            throw new BusinessException(LedgerErrorCode.LEDGER_ORIGINAL_NOT_REVERSIBLE);
+        }
+        LedgerEntryLine walletLine = chargeWalletLine(transactionRepository.findEntryLines(original.getId()));
+        Currency currency = walletLine.currency();
+        long amount = walletLine.amount();
+
+        // 잠금 전에는 ID만 찾는다 (record와 같은 이유). 원거래가 POSTED라 지갑·충전 원천 계정은 있고, 미수 계정은 V8 시드
+        UUID walletAccountId = accountRepository.findUserWalletAccountId(walletLine.walletId(), currency)
+                .orElseThrow(() -> new IllegalStateException("원거래의 지갑 계정을 찾을 수 없습니다."));
+        UUID sourceAccountId = accountRepository.findSystemAccountId(AccountType.CHARGE_SOURCE, currency)
+                .orElseThrow(() -> new IllegalStateException("충전 원천 계정을 찾을 수 없습니다."));
+        UUID receivableAccountId = accountRepository.findSystemAccountId(AccountType.RECEIVABLE, currency)
+                .orElseThrow(() -> new IllegalStateException("미수 계정을 찾을 수 없습니다."));
+
+        // 데드락 방지: record와 같이 계정 ID 순으로 한 번에 잠근다. 회수액이 0이어도 잔액을 읽으려고 지갑을 잠근다
+        Set<UUID> distinctIds = new LinkedHashSet<>(List.of(walletAccountId, sourceAccountId, receivableAccountId));
+        Map<UUID, LedgerAccount> accounts = accountRepository.lockAllInIdOrder(distinctIds)
+                .stream()
+                .collect(Collectors.toMap(LedgerAccount::getId, Function.identity()));
+        if (accounts.size() != distinctIds.size()) {
+            throw new IllegalStateException("잠근 계정 수가 다릅니다: expected=" + distinctIds.size()
+                    + " actual=" + accounts.size());
+        }
+        if (accounts.values().stream().anyMatch(account -> !account.isActive())) {
+            throw new BusinessException(LedgerErrorCode.LEDGER_REJECTED_WALLET_SUSPENDED);
+        }
+
+        // 잠근 뒤의 지갑 잔액으로 회수액을 정한다. USER 잔액은 음수가 아니므로 회수액은 0 이상 원금액 이하
+        long recovered = Math.min(accounts.get(walletAccountId).getBalance(), amount);
+        long shortfall = amount - recovered;
+        List<RegisterTransactionCommand.Entry> entries = new ArrayList<>(3);
+        List<UUID> accountIds = new ArrayList<>(3);
+        if (recovered > 0) {
+            entries.add(new RegisterTransactionCommand.Entry(OwnerType.USER, walletLine.walletId(), null, currency,
+                    Direction.DEBIT, recovered, EntryType.CHARGE_REVERSAL_OUT.name()));
+            accountIds.add(walletAccountId);
+        }
+        if (shortfall > 0) {
+            entries.add(new RegisterTransactionCommand.Entry(OwnerType.SYSTEM, null, AccountType.RECEIVABLE, currency,
+                    Direction.DEBIT, shortfall, EntryType.CHARGE_REVERSAL_RECEIVABLE.name()));
+            accountIds.add(receivableAccountId);
+        }
+        entries.add(new RegisterTransactionCommand.Entry(OwnerType.SYSTEM, null, AccountType.CHARGE_SOURCE, currency,
+                Direction.CREDIT, amount, EntryType.CHARGE_REVERSAL_IN.name()));
+        accountIds.add(sourceAccountId);
+
+        RegisterTransactionCommand reversal = new RegisterTransactionCommand(ReferenceType.CHARGE_REVERSAL,
+                command.chargeId(), original.getUserId(), command.description(), original.getId(), entries);
+        List<ResolvedEntry> resolvedEntries = inApplyOrder(reversal, accountIds);
+        LedgerTransaction transaction = post(reversal, requestHash, accounts, resolvedEntries,
+                netChanges(resolvedEntries));
+        // 항목 조회(JPQL) 전에 저장 대기 중인 항목이 반영되므로, 이미 있던 경우와 같은 형식·순서로 돌려준다
+        return ChargeReversalResult.of(detail(transaction), true);
+    }
+
+    /** 취소 분개와 동시에 먼저 저장된 취소 분개를 새 트랜잭션에서 다시 읽어 그대로 돌려준다 */
+    @Transactional(readOnly = true, timeout = TX_TIMEOUT_SECONDS)
+    public ChargeReversalResult existingChargeReversal(UUID chargeId) {
+        LedgerTransaction existing = transactionRepository.findByReference(ReferenceType.CHARGE_REVERSAL, chargeId)
+                .orElseThrow(() -> new IllegalStateException("중복으로 거절된 취소 분개를 다시 찾을 수 없습니다."));
+        return ChargeReversalResult.of(detail(existing), false);
+    }
+
+    /**
+     * 원거래가 충전 구조인지 확인하고 지갑 항목을 돌려준다. 아니면 422(LEDGER_ORIGINAL_NOT_REVERSIBLE).
+     * 기대 구조: 항목 정확히 2개 = SYSTEM CHARGE_SOURCE DEBIT CHARGE_OUT + USER WALLET CREDIT CHARGE_IN, 금액·통화 같음
+     */
+    private static LedgerEntryLine chargeWalletLine(List<LedgerEntryLine> lines) {
+        if (lines.size() != 2) {
+            throw new BusinessException(LedgerErrorCode.LEDGER_ORIGINAL_NOT_REVERSIBLE);
+        }
+        LedgerEntryLine source = lines.stream().filter(LedgerTransactionRecorder::isChargeSourceLine).findFirst()
+                .orElseThrow(() -> new BusinessException(LedgerErrorCode.LEDGER_ORIGINAL_NOT_REVERSIBLE));
+        LedgerEntryLine wallet = lines.stream().filter(LedgerTransactionRecorder::isChargeWalletLine).findFirst()
+                .orElseThrow(() -> new BusinessException(LedgerErrorCode.LEDGER_ORIGINAL_NOT_REVERSIBLE));
+        if (source.amount() != wallet.amount() || source.currency() != wallet.currency()) {
+            throw new BusinessException(LedgerErrorCode.LEDGER_ORIGINAL_NOT_REVERSIBLE);
+        }
+        return wallet;
+    }
+
+    private static boolean isChargeSourceLine(LedgerEntryLine line) {
+        return line.ownerType() == OwnerType.SYSTEM && line.accountType() == AccountType.CHARGE_SOURCE
+                && line.direction() == Direction.DEBIT && EntryType.CHARGE_OUT.name().equals(line.entryType());
+    }
+
+    private static boolean isChargeWalletLine(LedgerEntryLine line) {
+        return line.ownerType() == OwnerType.USER && line.accountType() == AccountType.WALLET
+                && line.walletId() != null
+                && line.direction() == Direction.CREDIT && EntryType.CHARGE_IN.name().equals(line.entryType());
+    }
+
+    /**
+     * 잠근 계정에 항목을 반영 순서대로 적용하고 POSTED 거래·항목을 저장한다 (record·reverseCharge 공통).
+     * 거래 행을 먼저 저장(flush)하므로 같은 reference면 여기서 DuplicateReferenceException으로 롤백된다
+     */
+    private LedgerTransaction post(RegisterTransactionCommand command, String requestHash,
+                                   Map<UUID, LedgerAccount> accounts, List<ResolvedEntry> resolvedEntries,
+                                   Map<UUID, Long> netChanges) {
+        Map<UUID, Long> lockedBalances = accounts.values().stream()
+                .collect(Collectors.toMap(LedgerAccount::getId, LedgerAccount::getBalance));
+        LedgerTransaction transaction = transactionRepository.save(LedgerTransaction.posted(
+                command.referenceType(), command.referenceId(), requestHash,
+                command.userId(), command.originalTransactionId(), command.description()));
+        List<LedgerEntry> entries = new ArrayList<>(resolvedEntries.size());
+        for (ResolvedEntry resolved : resolvedEntries) {
+            RegisterTransactionCommand.Entry entry = resolved.entry();
+            LedgerAccount account = accounts.get(resolved.accountId());
+            long balanceAfter = account.apply(entry.direction(), entry.amount());
+            entries.add(LedgerEntry.create(transaction.getId(), account.getId(), entry.currency(),
+                    entry.entryType(), entry.direction(), entry.amount(), balanceAfter));
+        }
+        verifyFinalBalances(accounts, lockedBalances, netChanges);
+        transactionRepository.saveEntries(entries);
+        return transaction;
     }
 
     private TransactionDetailResult detail(LedgerTransaction transaction) {
