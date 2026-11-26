@@ -60,7 +60,7 @@ wallet-service는 회원 지갑의 개설·잔액 조회와 원화 충전을 맡
 |---|---|
 | Swagger UI | `http://localhost:8082/swagger-ui.html` |
 | 그룹 `wallet` (지갑·충전) | 회원용 `/api/v1/**` (관리자 경로 제외). 명세 `/v3/api-docs/wallet` |
-| 그룹 `charge-admin` (충전 관리) | `/api/v1/admin/charges/**` (대사·보정). 명세 `/v3/api-docs/charge-admin` |
+| 그룹 `charge-admin` (충전 관리) | `/api/v1/admin/charges/**` (대사·보정·이중 지급 정정 조회). 명세 `/v3/api-docs/charge-admin` |
 
 - 내부 API(`/internal/**`)는 문서에 없습니다.
 - 지갑을 직접 호출하므로 Gateway가 넣어 주는 헤더를 직접 넣습니다. 회원 API는 `User-Id`(회원 UUID)·`User-Role: USER`, 관리자 API는 `User-Role: MASTER`입니다. MASTER가 아니면 관리자 API는 403입니다.
@@ -79,6 +79,7 @@ wallet-service는 회원 지갑의 개설·잔액 조회와 원화 충전을 맡
 | `GET /api/v1/charges/{chargeId}` | 회원 | 내 충전 단건 | 200 | |
 | `GET /api/v1/charges` | 회원 | 내 충전 목록 | 200 | |
 | `GET /api/v1/admin/charges` | 관리자(`MASTER`) | 전체 충전 목록 | 200 | |
+| `GET /api/v1/admin/charges/double-payment-corrections` | 관리자(`MASTER`) | 이중 지급 자동 정정 목록([관리자 조회](#관리자-조회)) | 200 | |
 | `GET /internal/v1/wallets?userId=` | 내부 | 지갑 조회(송금 파트 계약) | 200 | |
 | `GET /internal/v1/wallets/balances?userId=` | 내부 | 통화별 잔액(환전 파트 계약) | 200 | |
 
@@ -389,7 +390,7 @@ reference가 원장의 멱등 키라 같은 충전을 다시 보내도 한 번�
 - 서킷이 반열림인 은행은 제외하지 않습니다. 복구 대상이 시험 호출로 나가야 닫힐 수 있기 때문입니다.
 - 한계: 원장 묶음이 멈춘 주기에도 은행 묶음 대상은 출금 뒤 원장을 부릅니다. SAGA 컨슈머와 같은 동작이고, 출금 성공 뒤 `CREDIT_PROCESSING` 전이가 원장 호출 전에 커밋되므로 정합성 문제는 없습니다. 원장 호출은 복구 스케줄러 안에서만 장애를 감지하며, 은행 호출은 컨슈머·스케줄러 모두 [은행 서킷 브레이커](#은행-서킷-브레이커)를 거칩니다.
 - 한 건의 예외가 같은 배치의 다른 건을 멈추지 않습니다. 배치마다 `group`·`found`·`claimed`·`claimMissed`·`bankSkipped`·`failed`·`unknownStop`·`excludedBanks`·`elapsedMs`를 INFO로 남기고, 결과 모름 연속으로 원장 묶음이나 은행 하나를 멈추면 WARN을 남깁니다.
-- 스케줄러 스레드 풀은 3입니다(`spring.task.scheduling.pool.size`). 복구 배치가 길어도 Outbox 발행이 막히지 않게 하기 위해서입니다.
+- 스케줄러 스레드 풀은 4입니다(`spring.task.scheduling.pool.size`). 복구·Outbox 발행·충전 대사·[이중 지급 자동 정정](#이중-지급-자동-정정)이 각자 스레드를 써서, 복구 배치가 길어도 Outbox 발행이 막히지 않게 하기 위해서입니다.
 - 컨슈머와 스케줄러가 같은 충전을 동시에 실행해도 조건부 UPDATE로 한쪽만 전이합니다.
 
 | 지표 | 의미 |
@@ -490,7 +491,7 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 
 ### 늦게 생긴 취소 분개
 
-취소 분개는 보통 `CREDIT_AND_REFUND_BOTH`를 본 운영자가 나중에 만듭니다(예: 11/20 충전·환불, 11/23 취소 분개).
+취소 분개는 대사가 `CREDIT_AND_REFUND_BOTH`를 남긴 뒤 [이중 지급 자동 정정](#이중-지급-자동-정정)이 나중에 만듭니다(예: 11/20 충전·환불, 11/23 취소 분개).
 
 1. 11/23 기간 실행의 취소 분개 목록에 그 취소 분개가 들어옵니다.
 2. referenceId(chargeId)로 지갑 DB에서 11/20 충전을 찾아 판정 후보에 넣습니다.
@@ -501,6 +502,161 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 
 - `PARTIAL` 실행도 진행 위치를 넘기므로, `SOURCE_UNAVAILABLE`로 보류된 충전은 자동으로 다시 확인하지 않습니다. 기간을 지정한 수동 실행(재대사)으로 다시 봅니다.
 - 취소 분개는 생성된 기간의 실행에서 목록으로 찾습니다. 그 뒤 다른 기간에 같은 충전이 다른 기록(예: 은행 환불 기록)으로 다시 후보가 되면, 이중 지급 사실(원장 적립 `POSTED` + 은행 환불 `SUCCEEDED`)이 있을 때만 `(CHARGE_REVERSAL, chargeId)`를 단건 조회합니다. 찾으면 목록과 같은 규칙으로 판정하고, 404 `LEDGER_TRANSACTION_NOT_FOUND`면 `CREDIT_AND_REFUND_BOTH`, 그 밖의 조회 실패면 `SOURCE_UNAVAILABLE`(실행 `PARTIAL`)입니다. 이중 지급 사실이 없는 충전은 단건 조회하지 않습니다.
+
+## 이중 지급 자동 정정
+
+대사가 남긴 이중 지급(`CREDIT_AND_REFUND_BOTH`: 같은 충전이 원장 적립과 은행 환불을 모두 받음)을 시스템이 원장 [충전 취소 분개](ledger-service.md#충전-취소-분개)로 바로잡습니다. 충전 상태와 대사 결과(`reconciliation_results`)는 바꾸지 않고, 정정 기록은 `charge_reversal_corrections`(충전당 1행, 실행 주체 `SYSTEM`)에 남깁니다.
+
+### 흐름
+
+1. 대사가 `CREDIT_AND_REFUND_BOTH`를 저장하면 같은 트랜잭션에서 그 충전의 정정 대상을 `PENDING`으로 등록합니다.
+2. 정정 스케줄러(`DoublePaymentCorrectionScheduler`)가 `next_attempt_at`이 지난 `PENDING`을 선점합니다.
+3. 처리기(`DoublePaymentCorrectionProcessor`)가 실행 직전에 은행·원장을 단건 재조회하고, 이중 지급이 맞으면 원장에 취소 분개를 요청합니다.
+4. 결과를 `SUCCEEDED`·`NEEDS_REVIEW`·`PENDING`(결과 모름 재시도)으로 기록합니다.
+5. 취소 분개가 생긴 뒤의 대사 실행은 [정상 취소 분개 규칙](#충전-취소-분개-확인)대로 `CREDIT_AND_REFUND_BOTH`를 남기지 않습니다.
+
+### 기존 보정과 분리한 이유
+
+[운영자 보정](#manual_review로-가는-경우)(`charge_resolutions`)과 다른 흐름이고, 서로의 테이블·상태를 건드리지 않습니다.
+
+| | 운영자 보정 | 이중 지급 자동 정정 |
+|---|---|---|
+| 대상 | `MANUAL_REVIEW` 충전 | `COMPLETED`·`REFUNDED` 충전의 이중 지급 |
+| 하는 일 | 충전 상태를 확정하거나 SAGA 단계로 되돌림. 돈을 움직이지 않음 | 원장에 취소 분개를 기록(돈을 되돌림). 충전 상태는 그대로 |
+| 실행 주체 | 운영자(`operator_id` NOT NULL, 멱등 키) | 시스템(`executed_by = SYSTEM`) |
+| 대사 결과 | `resolution_status = RESOLVED`, `resolution_id` 연결 | 바꾸지 않음. 대사 결과는 실행마다 같은 충전에 여러 행이 쌓일 수 있어 충전 단위 기록을 따로 둠 |
+
+- 두 흐름의 대상 충전 상태가 겹치지 않습니다. `COMPLETED`·`REFUNDED`에서 `MANUAL_REVIEW`로 가는 경로가 없습니다.
+
+### 대상 등록
+
+- `ReconciliationTransactionSteps.complete()` 안, 결과 `saveAll`과 같은 트랜잭션에서 `CREDIT_AND_REFUND_BOTH` 결과마다 `INSERT ... ON CONFLICT (charge_id) DO NOTHING`(`PENDING`, `attempt_count` 0, `next_attempt_at` 지금)을 실행합니다.
+- `reconciliation_result_id`는 같은 실행에서 저장한 그 충전의 `CREDIT_AND_REFUND_BOTH` 결과 행입니다. 결과 ID는 persist 때 정해지고(`GenerationType.UUID`), 등록 쿼리가 `@Modifying(flushAutomatically = true)`라 실행 전에 결과 INSERT가 flush되어 FK가 그 행을 찾습니다.
+- 이미 있는 충전은 상태와 관계없이 바꾸지 않습니다. 다음 실행이 같은 충전을 다시 잡아도 1행이고 처음 결과 ID 그대로입니다.
+- 실행이 도중에 정리되어 `complete()`가 롤백되면 결과와 정정 대상이 함께 사라집니다.
+
+### 선점·임대·선점 토큰·원장 멱등
+
+임대는 중복 처리를 줄이고, 토큰은 늦게 끝난 처리기의 기록을 막는다. 그래도 남는 중복 요청은 원장 멱등이 한 번만 반영한다.
+
+| 단계 | 쿼리 | 뜻 |
+|---|---|---|
+| 대상 조회 | `status = 'PENDING' and next_attempt_at <= now()`, `next_attempt_at` 순, 배치 크기만큼. `id`·`updated_at`·`attempt_count`를 읽음 | 부분 인덱스 `ix_charge_reversal_corrections_pending` |
+| 선점 | `set updated_at = now(), next_attempt_at = now() + 30초 where id = ? and status = 'PENDING' and updated_at = 읽은 값 returning updated_at` (건마다 커밋) | 0행이면 건너뜀. 1행이면 돌려받은 `updated_at`이 **선점 토큰** |
+| 결과 기록 | `... where id = ? and status = 'PENDING' and updated_at = 토큰`, `updated_at = now()` 포함 | 0행이면 덮어쓰지 않고 INFO 로그만 |
+
+- 임대: 선점이 `next_attempt_at`을 30초 뒤로 미뤄, 처리 중인 행을 다음 주기 조회가 다시 집지 않습니다. 30초는 복구의 최소 재선택 간격([payment-transfer.md D5](payment-transfer.md#d5-복구는-선점-update-지수-백오프-시도-한도로) 첫 간격)과 같은 값입니다.
+- 선점 토큰: 처리가 30초를 넘겨 임대가 끝나면 다른 처리기가 다시 선점할 수 있습니다. 그러면 `updated_at`이 바뀌어 이전 처리기의 결과 기록은 0행이 됩니다.
+- 원장 멱등: 두 처리기가 모두 원장에 보내도 취소 분개는 `(CHARGE_REVERSAL, chargeId)`로 한 건만 저장되고, 늦은 요청은 200과 같은 거래를 받습니다.
+- 시각은 복구 선점(`claimForRecovery`)처럼 DB `now()`입니다. 벌크 UPDATE라 `@PreUpdate`가 돌지 않아 `updated_at`을 쿼리에서 직접 바꿉니다.
+- 외부 호출(은행·원장)은 트랜잭션 밖이고, 선점·충전 조회·결과 기록은 각각 짧은 트랜잭션(제한 3초)입니다(`DoublePaymentCorrectionSteps`).
+
+### 재조회 조건
+
+처리기는 대사 결과·스냅샷을 믿지 않고 실행 직전 사실로 판단합니다.
+
+1. 충전 행을 읽어 상태가 `COMPLETED`·`REFUNDED`가 아니면 바로 `NEEDS_REVIEW`(`CHARGE_STATUS`). 외부 호출 없음.
+2. 단건 재조회(기존 대사 포트): 은행 환불(충전 `refund_request_id`), 원장 충전 적립 `(CHARGE, chargeId)`, 원장 취소 분개 `(CHARGE_REVERSAL, chargeId)`. 포트의 예상 밖 예외도 조회 불가(Unavailable)로 봅니다.
+3. 판정 기준은 대사와 같은 `DoublePaymentCriteria`입니다. 원장에 보낼 이중 지급은 금액까지 맞아야 합니다(`isDoublePaidWithMatchingAmounts`: 환불 `SUCCEEDED`·금액 = 충전 금액, 적립 `POSTED`·충전 지갑 `CHARGE_IN` 금액·통화 = 충전 금액·통화).
+
+### 처리 규칙
+
+| 재조회 결과 | 원장 요청 | 결과 |
+|---|---|---|
+| 셋 중 하나라도 조회 불가 | 없음 | 기록 없음. 선점이 바꾼 `updated_at`·`next_attempt_at`(30초 뒤)만 남고 status·`attempt_count` 그대로 |
+| 취소 분개 있음 + 정상 구조 | 없음 | `SUCCEEDED`. `ledger_tx_id` = 그 거래, 회수 = `CHARGE_REVERSAL_OUT` 합, 미수 = `CHARGE_REVERSAL_RECEIVABLE` 합(항목이 없으면 0) |
+| 취소 분개 있음 + 구조 이상(또는 회수 + 미수 ≠ 충전 금액) | 없음 | `NEEDS_REVIEW`(`REVERSAL_MALFORMED`) |
+| 취소 분개 없음 + 금액까지 맞는 이중 지급 | 있음 | 아래 원장 결과 |
+| 취소 분개 없음 + 이중 지급 아님 | 없음 | `NEEDS_REVIEW`. 기준 순서로 처음 틀린 것 하나: 환불 → `NO_REFUND`, 적립 → `NO_CREDIT`, 둘 다 맞고 금액이 다름 → `AMOUNT_MISMATCH` |
+
+| 원장 결과 | 결과 |
+|---|---|
+| `Reversed`(201·200, `POSTED`, 회수·미수 0 이상, 합 = 충전 금액) | `SUCCEEDED`(`ledger_tx_id`·회수·미수 저장) |
+| 422 `LEDGER_ORIGINAL_NOT_REVERSIBLE` | `NEEDS_REVIEW`(`NOT_REVERSIBLE`) |
+| 422 `LEDGER_REJECTED_WALLET_SUSPENDED` | `NEEDS_REVIEW`(`WALLET_SUSPENDED`) |
+| 404 `LEDGER_TRANSACTION_NOT_FOUND` | `NEEDS_REVIEW`(`ORIGINAL_NOT_FOUND`) |
+| 그 밖의 4xx, 2xx 내용 이상 | `NEEDS_REVIEW`(`INVALID_RESPONSE`) |
+| 결과 모름(3xx·5xx·시간 초과·연결 실패) | [재시도](#재시도) |
+
+- 회수 + 미수 합 검사는 원장이 보장하는 조건을 지갑이 한 번 더 확인하는 방어입니다. 넘침 없이 빼기로 비교합니다.
+- 이미 있는 취소 분개의 구조는 대사와 같은 `reversalProblems`로 검사합니다(회수 + 미수 = `CHARGE_REVERSAL_IN` = 충전 금액 포함). 저장할 회수·미수는 항목에서 넘침 검사를 하며 따로 더합니다.
+- `NEEDS_REVIEW` 전환은 WARN 로그(`correctionId`·`chargeId`·분류 코드)를 남깁니다.
+
+### 분류 코드
+
+`last_error`는 `코드: 짧은 설명`(500자 이하)이며 응답 원문·계좌 정보는 넣지 않습니다(`CorrectionErrorCode`).
+
+| 코드 | 상태 | 뜻 |
+|---|---|---|
+| `CHARGE_STATUS` | `NEEDS_REVIEW` | 충전이 `COMPLETED`·`REFUNDED`가 아님 |
+| `NO_REFUND` | `NEEDS_REVIEW` | 은행 환불 `SUCCEEDED` 없음 |
+| `NO_CREDIT` | `NEEDS_REVIEW` | 원장 적립 `POSTED` 없음 |
+| `AMOUNT_MISMATCH` | `NEEDS_REVIEW` | 환불·적립은 있으나 금액·통화·지갑이 충전과 다름 |
+| `REVERSAL_MALFORMED` | `NEEDS_REVIEW` | 이미 있는 취소 분개의 구조 이상 |
+| `NOT_REVERSIBLE` | `NEEDS_REVIEW` | 원장 422 `LEDGER_ORIGINAL_NOT_REVERSIBLE` |
+| `WALLET_SUSPENDED` | `NEEDS_REVIEW` | 원장 422 `LEDGER_REJECTED_WALLET_SUSPENDED`(원장은 재요청을 그때 상태로 다시 판단하지만 지갑 정지는 사람이 판단) |
+| `ORIGINAL_NOT_FOUND` | `NEEDS_REVIEW` | 원장 404 `LEDGER_TRANSACTION_NOT_FOUND` |
+| `INVALID_RESPONSE` | `NEEDS_REVIEW` | 원장 그 밖의 4xx·응답 내용 이상 |
+| `LEDGER_UNKNOWN` | `PENDING` | 원장 결과 모름, 재시도 대기 |
+| `RETRY_EXHAUSTED` | `NEEDS_REVIEW` | 결과 모름 5회 |
+
+### 재시도
+
+원장 결과 모름이면 `attempt_count`를 1 올리고 다음 시도를 미룹니다. 같은 chargeId로 다시 보내므로 원장이 이미 기록했으면 200과 같은 거래를 받습니다.
+
+| 새 `attempt_count` | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| 결과 | `PENDING` | `PENDING` | `PENDING` | `PENDING` | `NEEDS_REVIEW`(`RETRY_EXHAUSTED`), 더 시도 안 함 |
+| 다음 시도까지 | 30초 | 60초 | 120초 | 240초 | — |
+
+- 대기는 `30초 × 2^(n − 1)`이고, 한도는 결과 모름 5회입니다. 근거는 [payment-transfer.md D5](payment-transfer.md#d5-복구는-선점-update-지수-백오프-시도-한도로) 팀 복구 정책(5회, 30초부터 두 배)이며 충전·송금 복구와 같은 값입니다.
+- 재조회 조회 불가는 원장에 보내지 않았으므로 횟수를 세지 않습니다(충전 복구의 `NotSent`와 같은 이유).
+- 다른 결과(`NEEDS_REVIEW`·`SUCCEEDED`)는 `attempt_count`를 그대로 둡니다.
+
+### 설정
+
+| 키 | 기본값 | 근거 |
+|---|---|---|
+| `travelpay.wallet.charge.correction.enabled` | `true`(설정이 없어도 켜짐). 끄면 스케줄러가 등록되지 않음(테스트용) | 충전 복구와 같은 방식 |
+| `travelpay.wallet.charge.correction.fixed-delay` | `10s`(이전 주기 종료 후). 1초 미만·형식 오류면 기동 실패 | 충전 복구 기본값 |
+| `travelpay.wallet.charge.correction.batch-size` | `10`. 1 미만이면 기동 실패 | 충전 복구 기본값 |
+| 한 주기 마감 | 8초(코드 상수). 배치가 가득 차면 같은 주기에서 이어서 조회하고, 덜 찬 배치가 나오거나 8초가 지나면 끝. 첫 배치는 항상 처리 | 충전 복구와 같은 값. 실행 시간 상한이 아니라 추가 배치를 시작하지 않는 마감 |
+| 선점 임대 | 30초(코드 상수) | D5 복구 첫 간격 |
+| 결과 모름 한도·간격 | 5회, 30·60·120·240초(코드 상수) | D5 팀 복구 정책 |
+| 스케줄러 스레드 풀 | 4(`spring.task.scheduling.pool.size`, 기본·prod 모두) | 스케줄러 4개(복구·Outbox·대사·정정)가 서로 막지 않게 |
+
+- 한 건 최대 처리 시간(외부 호출만): 은행 환불 조회(연결 1초 + 읽기 5초) + 원장 적립·취소 분개 조회 각 7초(연결 1초 + 읽기 6초) + 원장 취소 분개 요청 7초 = **27초**. Feign 자동 재시도는 은행·원장 모두 끔(`NEVER_RETRY`)이라 더해지지 않습니다. 여기에 DB 트랜잭션(충전 조회·결과 기록, 각 제한 3초)이 더해지면 최악 33초로 임대 30초를 넘을 수 있고, 그때는 선점 토큰과 원장 멱등이 막습니다.
+
+### 지표
+
+| 지표 | 의미 |
+|---|---|
+| `charge.correction.needs_review` | `NEEDS_REVIEW` 정정 수. 0보다 크면 사람이 확인할 건이 있음 |
+| `charge.correction.pending` | `PENDING` 정정 수. 재시도 대기와 재조회 실패로 다시 시도 중인 건도 포함 |
+
+- 정정 주기마다 갱신합니다. 조회에 실패하면 ERROR 로그만 남기고 이전 값을 유지합니다(`charge.recovery.stuck`과 같은 방식).
+- `/actuator/prometheus`에서 `charge_correction_needs_review`·`charge_correction_pending`으로 볼 수 있습니다.
+
+### 관리자 조회
+
+`GET /api/v1/admin/charges/double-payment-corrections` (`MASTER`, [Swagger](#swagger)의 `charge-admin` 그룹)
+
+| 파라미터 | 기본값 | 설명 |
+|---|---|---|
+| `status` | 없음(전체) | `PENDING`·`SUCCEEDED`·`NEEDS_REVIEW` |
+| `page` | 0 | 0부터 |
+| `size` | 20 | 1 이상, 100을 넘으면 100 |
+
+- 정렬은 `created_at`·`id` 내림차순(최근 등록순)입니다. 대사 실행·결과 목록과 같은 방식입니다.
+- 응답 항목: `id`, `chargeId`, `reconciliationResultId`, `status`, `attemptCount`, `nextAttemptAt`, `lastError`, `ledgerTxId`, `recoveredAmount`, `receivableAmount`, `createdAt`, `updatedAt`. 금액·`ledgerTxId`는 `SUCCEEDED`일 때만 있습니다.
+- 권한·오류는 다른 관리자 API와 같습니다(`MASTER`가 아니면 403, 인증 헤더가 없으면 401, 잘못된 `status`·`page`·`size`는 400). 조회만 하며 정정은 스케줄러만 합니다.
+
+### 남은 한계
+
+- 재조회가 계속 조회 불가면 30초(임대)마다 다시 조회하고 횟수 상한이 없습니다. 원장에 보내지 않았으므로 결과 모름 한도에 넣지 않습니다.
+- `charge.correction.pending`은 조회 불가로 재조회 중인 건도 포함해, 숫자만으로는 재시도 대기와 의존성 장애를 구분하지 못합니다. 로그(`이중 지급 정정 재조회 실패`)로 구분합니다.
+- 충전 복구와 달리 결과 모름 연속으로 이번 주기를 멈추는 장치가 없습니다. 원장이 응답 없이 붙잡으면 건마다 최대 27초가 걸려 한 배치(10건)가 길어질 수 있습니다.
+- 미수(`receivable_amount`)를 회원에게서 받아 내는 절차는 아직 없습니다(원장 [고려 중](ledger-service.md#고려-중)).
 
 ## 충전 내역 조회
 
@@ -675,6 +831,7 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 | `V4__add_reconciliation_run_type.sql` | `reconciliation_runs.run_type`(기존 행 `AUTO`, NOT NULL, CHECK `AUTO`·`MANUAL`), `ix_reconciliation_runs_closed_period_to`를 `AUTO` 조건으로 다시 만듦 |
 | `V5__create_charge_resolutions.sql` | `charge_resolutions` 테이블(`idempotency_key` UNIQUE, 충전·대사 결과 FK, action·결과 상태·lookup CHECK), `ix_charge_resolutions_charge`, `charge_status_history.resolution_id`·`reconciliation_results.resolution_id`(FK) 추가, `reconciliation_results` 보정 상태·연결 CHECK |
 | `V6__add_reversal_mismatch_type.sql` | `ck_reconciliation_results_mismatch_type`에 `REVERSAL_MISMATCH` 추가(DROP 후 다시 만듦) |
+| `V7__create_charge_reversal_corrections.sql` | `charge_reversal_corrections` 테이블(`charge_id` UNIQUE·충전 FK, 대사 결과 FK, status·`executed_by`(`SYSTEM`)·`attempt_count` CHECK, 상태별 결과 칸 CHECK, 금액 0 이상), 부분 인덱스 `ix_charge_reversal_corrections_pending (next_attempt_at) WHERE status = 'PENDING'` |
 
 새 파일은 이미 적용된 파일을 고치지 않고 추가합니다.
 
@@ -684,7 +841,7 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 ./gradlew :wallet-service:test
 ```
 
-- DB 없이 실행: `BankAccountTest`, `AesGcmAccountNumberCipherTest`, `BankClientAdapterTest`, `BankFaultInjectionTest`, `BankFeignClientFaultHeaderTest`, `LedgerAccountClientAdapterTest`, `LedgerTransactionClientAdapterTest`, `UserFundingIdentityClientAdapterTest`, `ChargeRecoverySchedulerConfigTest`, `ChargeRecoverySchedulerTest`(한 주기 처리·8초 마감·묶음별 중단·지표 갱신), `OutboxPublishSchedulerTest`(롤백 시에만 보정 호출, 보정 예외를 밖으로 던지지 않음), `WalletServiceInternalBalancesTest`.
+- DB 없이 실행: `BankAccountTest`, `AesGcmAccountNumberCipherTest`, `BankClientAdapterTest`, `BankFaultInjectionTest`, `BankFeignClientFaultHeaderTest`, `LedgerAccountClientAdapterTest`, `LedgerTransactionClientAdapterTest`, `UserFundingIdentityClientAdapterTest`, `ChargeRecoverySchedulerConfigTest`, `DoublePaymentCorrectionSchedulerConfigTest`, `LedgerChargeReversalClientAdapterTest`, `DoublePaymentCriteriaTest`, `ChargeRecoverySchedulerTest`(한 주기 처리·8초 마감·묶음별 중단·지표 갱신), `OutboxPublishSchedulerTest`(롤백 시에만 보정 호출, 보정 예외를 밖으로 던지지 않음), `WalletServiceInternalBalancesTest`.
 - 통합 테스트는 Testcontainers로 PostgreSQL 컨테이너(`postgres:18.6-bookworm`)를 띄우고 Flyway를 적용해 실행합니다. `OutboxPublisherIntegrationTest`는 Kafka 컨테이너(`apache/kafka:4.2.2`)도 띄웁니다. `.env`나 로컬 compose는 필요 없고 Docker만 실행 중이면 됩니다. Docker가 없으면 건너뜁니다(통과가 아님).
 
 | 통합 테스트 | 범위 |
@@ -698,6 +855,9 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 | `ChargeQueryIntegrationTest` | 충전 내역 조회 API(회원·관리자) |
 | `ConnectionIsolationIntegrationTest` | 서버 기본 격리 수준을 serializable로 띄운 PostgreSQL에서도 쓰기·조회 트랜잭션이 READ COMMITTED인지(Hikari 설정 적용 확인) |
 | `ChargeIdempotencyRaceIntegrationTest` | 같은 멱등 키 경쟁에서 진 요청이 JDBC batch를 켠 상태에서도 UNIQUE 위반 후 기존 충전을 돌려주는지 |
+| `ChargeReversalCorrectionSchemaIntegrationTest` | V7 제약(status·`executed_by` CHECK, 충전당 1행, 상태별 결과 칸, 금액 0 이상, FK)과 이미 있는 충전 등록이 아무것도 바꾸지 않는지 |
+| `DoublePaymentCorrectionIntegrationTest` | 정정 처리 규칙·분류 코드·재시도 간격·5회 한도, 동시 선점(한쪽만 성공, 원장 요청 최대 1회), 임대 만료 뒤 재선점과 선점 토큰, 배치·마감, 지표, 대사 → 정정 → 다음 대사까지(은행·원장은 대역, `correct()` 직접 호출) |
+| `AdminDoublePaymentCorrectionIntegrationTest` | 관리자 정정 목록(정렬·status 필터·페이지·권한·인증 헤더 없음) |
 
 ## 고려 중
 
