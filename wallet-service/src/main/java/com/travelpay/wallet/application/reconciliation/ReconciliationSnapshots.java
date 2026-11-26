@@ -10,7 +10,9 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -43,6 +45,7 @@ public class ReconciliationSnapshots {
         root.put("bankDebit", bank(charge.getBankRequestId(), facts.debit()));
         root.put("bankRefund", bank(charge.getRefundRequestId(), facts.refund()));
         root.put("ledger", ledger(charge, facts.ledger()));
+        root.put("chargeReversal", reversal(facts.reversal()));
         return jsonMapper.writeValueAsString(root);
     }
 
@@ -56,6 +59,7 @@ public class ReconciliationSnapshots {
         Map<String, Object> node = new LinkedHashMap<>();
         node.put("transactionId", record.transactionId());
         node.put("status", record.status());
+        node.put("referenceType", record.referenceType());
         node.put("referenceId", record.referenceId());
         return jsonMapper.writeValueAsString(Map.of("ledger", node));
     }
@@ -90,6 +94,36 @@ public class ReconciliationSnapshots {
                 Optional<LedgerEntryRecord> entry = found.record().chargeInEntry(charge.getWalletId());
                 node.put("amount", entry.map(LedgerEntryRecord::amount).orElse(null));
                 node.put("currency", entry.map(LedgerEntryRecord::currency).orElse(null));
+            }
+            case SourceLookup.NotFound<LedgerTransactionRecord> ignored -> {
+            }
+            case SourceLookup.Unavailable<LedgerTransactionRecord> unavailable ->
+                    node.put("reason", unavailable.reason());
+        }
+        return node;
+    }
+
+    /** 취소 분개는 구조 판정 근거가 되도록 항목을 모두 남긴다 */
+    private static Map<String, Object> reversal(SourceLookup<LedgerTransactionRecord> lookup) {
+        Map<String, Object> node = new LinkedHashMap<>();
+        node.put("lookup", lookupName(lookup));
+        switch (lookup) {
+            case SourceLookup.Found<LedgerTransactionRecord> found -> {
+                node.put("transactionId", found.record().transactionId());
+                node.put("status", found.record().status());
+                List<Map<String, Object>> entries = new ArrayList<>();
+                for (LedgerEntryRecord entry : found.record().entries()) {
+                    Map<String, Object> e = new LinkedHashMap<>();
+                    e.put("ownerType", entry.ownerType());
+                    e.put("walletId", entry.walletId());
+                    e.put("accountType", entry.accountType());
+                    e.put("direction", entry.direction());
+                    e.put("currency", entry.currency());
+                    e.put("amount", entry.amount());
+                    e.put("entryType", entry.entryType());
+                    entries.add(e);
+                }
+                node.put("entries", entries);
             }
             case SourceLookup.NotFound<LedgerTransactionRecord> ignored -> {
             }

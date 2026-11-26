@@ -4,8 +4,11 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
-/** 대사에 쓰는 원장 충전 거래 사실 (referenceType = CHARGE). REJECTED 거래는 entries가 비어 있다 */
-public record LedgerTransactionRecord(UUID transactionId, String status, UUID referenceId,
+/**
+ * 대사에 쓰는 원장 거래 사실. referenceType은 CHARGE(충전 적립) 또는 CHARGE_REVERSAL(충전 취소 분개).
+ * REJECTED 거래는 entries가 비어 있다
+ */
+public record LedgerTransactionRecord(UUID transactionId, String status, String referenceType, UUID referenceId,
                                       List<LedgerEntryRecord> entries) {
 
     private static final String POSTED = "POSTED";
@@ -29,7 +32,7 @@ public record LedgerTransactionRecord(UUID transactionId, String status, UUID re
                 .findFirst();
     }
 
-    public record LedgerEntryRecord(String ownerType, UUID walletId, String direction, String currency,
-                                    long amount, String entryType) {
+    public record LedgerEntryRecord(String ownerType, UUID walletId, String accountType, String direction,
+                                    String currency, long amount, String entryType) {
     }
 }

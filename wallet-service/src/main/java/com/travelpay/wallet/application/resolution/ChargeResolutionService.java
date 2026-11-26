@@ -198,7 +198,8 @@ public class ChargeResolutionService {
         Instant checkedAt = Instant.now();
         Instant notFoundConfirmedAt = charge.getUpdatedAt().plus(settings.notFoundConfirmAfter());
         boolean notFoundConfirmed = !checkedAt.isBefore(notFoundConfirmedAt);
-        ChargeFacts facts = new ChargeFacts(debit, refund, ledger);
+        // 보정 판정(ChargeResolutionJudge)은 취소 분개를 보지 않는다. 취소 분개는 조회하지 않고 NotFound로 넘긴다
+        ChargeFacts facts = new ChargeFacts(debit, refund, ledger, SourceLookup.notFound());
         return new Snapshot(checkedAt, notFoundConfirmedAt, debit, SourceFact.ofBank(debit), SourceFact.ofBank(refund),
                 SourceFact.ofLedger(ledger, charge.getWalletId()),
                 ChargeResolutionJudge.assess(charge, facts, notFoundConfirmed));

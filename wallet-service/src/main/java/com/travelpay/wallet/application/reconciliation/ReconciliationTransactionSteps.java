@@ -52,16 +52,19 @@ public class ReconciliationTransactionSteps {
     }
 
     /**
-     * 대사 대상 충전: created_at이 [from, to)인 충전 + 은행 목록 requestId·원장 목록 referenceId가 가리키는 충전.
+     * 대사 대상 충전: created_at이 [from, to)인 충전 + 은행 목록 requestId·원장 목록 referenceId·
+     * 취소 분개 목록 referenceId가 가리키는 충전 (접수 시각과 무관하게 지갑 DB에서 id로 찾는다).
      * id로 중복을 없앤다 (상태 무관, 처리 중 제외는 호출자가 한다)
      */
     @Transactional(readOnly = true, timeout = BULK_TX_TIMEOUT_SECONDS)
     public List<ChargeRequest> loadCharges(Instant from, Instant to, Collection<String> bankRequestIds,
-                                           Collection<UUID> ledgerReferenceIds) {
+                                           Collection<UUID> ledgerReferenceIds,
+                                           Collection<UUID> reversalReferenceIds) {
         Map<UUID, ChargeRequest> charges = new LinkedHashMap<>();
         chargeRequestRepository.findCreatedBetween(from, to).forEach(c -> charges.put(c.getId(), c));
         chargeRequestRepository.findByBankOrRefundRequestIds(bankRequestIds).forEach(c -> charges.put(c.getId(), c));
         chargeRequestRepository.findAllByIds(ledgerReferenceIds).forEach(c -> charges.put(c.getId(), c));
+        chargeRequestRepository.findAllByIds(reversalReferenceIds).forEach(c -> charges.put(c.getId(), c));
         return List.copyOf(charges.values());
     }
 

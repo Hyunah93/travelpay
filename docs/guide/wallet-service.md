@@ -453,6 +453,55 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 4. 약 30초 뒤 복구 스케줄러가 같은 `bank_request_id`로 헤더 없이 다시 보냅니다. Mock Bank가 기존 성공 결과를 돌려주고 충전이 `CREDIT_PROCESSING` → `COMPLETED`가 됩니다.
 5. 확인할 것: Mock Bank 계좌 잔액이 한 번만 줄었는지, 원장 잔액이 한 번만 늘었는지, 상태 이력이 `null→REQUESTED→BANK_PROCESSING→CREDIT_PROCESSING→COMPLETED`인지.
 
+## 충전 대사
+
+충전·은행 거래·원장 기록을 기간 `[from, to)`마다 대조해 어긋남을 `reconciliation_results`에 남깁니다(`ChargeReconciliationService`). 찾고 기록만 하며 충전 상태나 돈은 바꾸지 않습니다. 이 절은 충전 취소 분개(#3) 반영 내용과 그에 필요한 범위만 적습니다.
+
+### 기간과 판정 후보
+
+- 기간: from = 직전 `AUTO` 실행(`COMPLETED`·`PARTIAL`)의 `period_to − overlap(10분)`, to = min(`지금 − grace(5분)`, `from + max-period(1일)`). `FAILED` 실행은 기준이 되지 않으므로 다음 실행이 같은 기간을 다시 봅니다.
+- 기간 목록: 은행 거래, 원장 충전 거래(`referenceType = CHARGE`), 원장 충전 취소 분개(`referenceType = CHARGE_REVERSAL`)를 각자의 생성 시각으로 끝 페이지까지 받습니다. 어느 목록이든 한 페이지라도 받지 못하면 실행은 `FAILED`이고 결과를 저장하지 않습니다.
+- 판정 후보 충전: `created_at`이 기간 안인 충전 + 은행 목록 requestId·원장 목록 referenceId·취소 분개 목록 referenceId가 가리키는 충전(지갑 DB에서 id로 찾음, 접수 시각 무관).
+
+### 충전 취소 분개 확인
+
+원장의 [충전 취소 분개](ledger-service.md#충전-취소-분개)는 `(CHARGE_REVERSAL, chargeId)`로 충전 1건에 최대 1건입니다.
+
+정상 취소 분개 조건(모두 만족):
+
+- `POSTED`, `referenceType = CHARGE_REVERSAL`, `referenceId = chargeId`
+- `CHARGE_SOURCE CREDIT CHARGE_REVERSAL_IN` 정확히 1항목, 금액·통화 = 충전 금액·통화
+- 지갑 `DEBIT CHARGE_REVERSAL_OUT` 합 + `RECEIVABLE DEBIT CHARGE_REVERSAL_RECEIVABLE` 합 = `CHARGE_REVERSAL_IN` 금액
+- `CHARGE_REVERSAL_OUT`이 있으면 충전 지갑, 그 밖의 항목 없음
+- 원거래 연결(`originalTransactionId`)은 원장 조회 응답에 없어 확인하지 않습니다(원장 [정합성 검사](ledger-service.md#정합성-검사) 5번이 확인).
+
+| 상황 | 결과 |
+|---|---|
+| 이중 지급 사실(원장 적립 `POSTED` + 은행 환불 `SUCCEEDED`) + 정상 취소 분개 | `CREDIT_AND_REFUND_BOTH` 남기지 않음 |
+| 이중 지급 사실 + 취소 분개 없음 | `CREDIT_AND_REFUND_BOTH`(기존과 같음) |
+| 이중 지급 사실 + 구조가 틀린 취소 분개 | `REVERSAL_MISMATCH` + `CREDIT_AND_REFUND_BOTH` |
+| 이중 지급 사실이 없는 충전에 취소 분개 | `REVERSAL_MISMATCH` |
+| 처리 중 충전(`REQUESTED`·`BANK_PROCESSING`·`CREDIT_PROCESSING`·`REFUND_PROCESSING`)에 취소 분개 | 건너뛰지 않고 `REVERSAL_MISMATCH`(다른 판정 없음) |
+| 지갑 DB에 그 chargeId 충전이 없는 취소 분개 | `LEDGER_ORPHAN`(`source_type = LEDGER`, `source_key` = 취소 분개 transactionId, detail에 `CHARGE_REVERSAL`). 기간 안 충전 목록에 없다는 이유로는 판정하지 않음 |
+| 판정에 필요한 은행 환불·원장 적립 단건 조회 실패 | 해당 규칙 보류, `SOURCE_UNAVAILABLE`, 실행 `PARTIAL` |
+
+- `MANUAL_REVIEW` 충전은 취소 분개가 있어도 기존대로 `REVIEW_REQUIRED`만 남기고, 취소 분개는 스냅샷에 남깁니다.
+- 결과 스냅샷의 `chargeReversal`에 취소 분개 lookup·상태·항목 전체가 들어갑니다.
+
+### 늦게 생긴 취소 분개
+
+취소 분개는 보통 `CREDIT_AND_REFUND_BOTH`를 본 운영자가 나중에 만듭니다(예: 11/20 충전·환불, 11/23 취소 분개).
+
+1. 11/23 기간 실행의 취소 분개 목록에 그 취소 분개가 들어옵니다.
+2. referenceId(chargeId)로 지갑 DB에서 11/20 충전을 찾아 판정 후보에 넣습니다.
+3. 취소 분개가 있는 충전은 상태와 관계없이 은행 환불과 원장 적립(`CHARGE`)을 단건 재조회합니다. 앞 기간에 찍혀 이번 목록에 없는 이중 지급 사실을 "없음"으로 보지 않기 위해서입니다.
+4. 이중 지급 사실과 취소 분개 구조로 위 표대로 판정합니다. 11/20 실행이 남긴 `CREDIT_AND_REFUND_BOTH` 행은 그 실행의 결과로 그대로 남습니다.
+
+### 한계
+
+- `PARTIAL` 실행도 진행 위치를 넘기므로, `SOURCE_UNAVAILABLE`로 보류된 충전은 자동으로 다시 확인하지 않습니다. 기간을 지정한 수동 실행(재대사)으로 다시 봅니다.
+- 취소 분개는 생성된 기간의 실행에서 목록으로 찾습니다. 그 뒤 다른 기간에 같은 충전이 다른 기록(예: 은행 환불 기록)으로 다시 후보가 되면, 이중 지급 사실(원장 적립 `POSTED` + 은행 환불 `SUCCEEDED`)이 있을 때만 `(CHARGE_REVERSAL, chargeId)`를 단건 조회합니다. 찾으면 목록과 같은 규칙으로 판정하고, 404 `LEDGER_TRANSACTION_NOT_FOUND`면 `CREDIT_AND_REFUND_BOTH`, 그 밖의 조회 실패면 `SOURCE_UNAVAILABLE`(실행 `PARTIAL`)입니다. 이중 지급 사실이 없는 충전은 단건 조회하지 않습니다.
+
 ## 충전 내역 조회
 
 ### 단건
@@ -621,6 +670,11 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 | 파일 | 내용 |
 |---|---|
 | `V1__create_wallet_tables.sql` | 다섯 테이블, 제약, 인덱스 |
+| `V2__create_reconciliation_tables.sql` | `reconciliation_runs`(상태·기간·종료·건수 CHECK, RUNNING 1개 `ux_reconciliation_runs_running`)·`reconciliation_results`(`run_id` FK, `mismatch_type`·`source_type`·대상 CHECK, 유일 인덱스 `ux_reconciliation_results_charge`·`ux_reconciliation_results_orphan`) 테이블, `ix_charge_requests_created(created_at)` |
+| `V3__add_reconciliation_query_indexes.sql` | 인덱스 `ix_reconciliation_runs_started`·`ix_reconciliation_runs_closed_period_to`(`COMPLETED`·`PARTIAL`)·`ix_reconciliation_results_run_detected` |
+| `V4__add_reconciliation_run_type.sql` | `reconciliation_runs.run_type`(기존 행 `AUTO`, NOT NULL, CHECK `AUTO`·`MANUAL`), `ix_reconciliation_runs_closed_period_to`를 `AUTO` 조건으로 다시 만듦 |
+| `V5__create_charge_resolutions.sql` | `charge_resolutions` 테이블(`idempotency_key` UNIQUE, 충전·대사 결과 FK, action·결과 상태·lookup CHECK), `ix_charge_resolutions_charge`, `charge_status_history.resolution_id`·`reconciliation_results.resolution_id`(FK) 추가, `reconciliation_results` 보정 상태·연결 CHECK |
+| `V6__add_reversal_mismatch_type.sql` | `ck_reconciliation_results_mismatch_type`에 `REVERSAL_MISMATCH` 추가(DROP 후 다시 만듦) |
 
 새 파일은 이미 적용된 파일을 고치지 않고 추가합니다.
 
