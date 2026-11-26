@@ -102,6 +102,7 @@ class ReconciliationRunnerIntegrationTest {
         when(ledgerClient.listChargeTransactions(any(), any())).thenReturn(List.of());
         when(bankClient.findTransaction(anyString())).thenReturn(SourceLookup.notFound());
         when(ledgerClient.findChargeTransaction(any())).thenReturn(SourceLookup.notFound());
+        when(ledgerClient.findChargeReversal(any())).thenReturn(SourceLookup.notFound());
         now = Instant.now().truncatedTo(ChronoUnit.MICROS);
     }
 

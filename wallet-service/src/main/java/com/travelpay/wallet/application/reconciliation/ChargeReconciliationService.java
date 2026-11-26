@@ -36,6 +36,8 @@ import java.util.function.Supplier;
  * (COMPLETED: 출금·원장, REFUNDED: 출금·환불, 취소 분개가 있으면 환불·원장 적립도). 없어야 하는 기록은 목록에 없으면 없음으로 본다.
  * 기간 밖에 찍힌 기록은 그 기간의 실행에서 목록 키로 충전을 찾아 판정 후보에 넣으므로 놓치지 않는다.
  * 취소 분개도 생성된 기간의 실행에서 목록 키로 충전을 불러오므로, 충전보다 늦게 생긴 취소 분개를 놓치지 않는다.
+ * 이중 지급 사실(원장 적립 POSTED + 환불 SUCCEEDED)이 있는데 이번 목록에 취소 분개가 없으면 단건 조회한다
+ * (앞 기간에 바로잡힌 충전이 다른 기록으로 다시 후보가 될 때 CREDIT_AND_REFUND_BOTH 오탐 방지).
  */
 @Slf4j
 @Service
@@ -154,14 +156,25 @@ public class ChargeReconciliationService {
         UUID ledgerKey = charge.getId();
         LedgerTransactionRecord reversal = reversalByReference.get(ledgerKey);
         boolean reversed = reversal != null;
-        return new ChargeFacts(
-                lookup(bankByRequestId.get(debitKey), completed || refunded,
-                        () -> bankClient.findTransaction(debitKey)),
-                lookup(bankByRequestId.get(refundKey), refunded || reversed,
-                        () -> bankClient.findTransaction(refundKey)),
-                lookup(ledgerByReference.get(ledgerKey), completed || reversed,
-                        () -> ledgerClient.findChargeTransaction(ledgerKey)),
-                reversed ? SourceLookup.found(reversal) : SourceLookup.notFound());
+        SourceLookup<BankTransactionRecord> debit = lookup(bankByRequestId.get(debitKey), completed || refunded,
+                () -> bankClient.findTransaction(debitKey));
+        SourceLookup<BankTransactionRecord> refund = lookup(bankByRequestId.get(refundKey), refunded || reversed,
+                () -> bankClient.findTransaction(refundKey));
+        SourceLookup<LedgerTransactionRecord> ledger = lookup(ledgerByReference.get(ledgerKey),
+                completed || reversed, () -> ledgerClient.findChargeTransaction(ledgerKey));
+        // 이중 지급 사실이 있는데 이번 목록에 취소 분개가 없으면, 앞 기간에 생긴 취소 분개일 수 있어 단건 조회한다
+        boolean doublePaid = isSucceeded(refund) && isPosted(ledger);
+        SourceLookup<LedgerTransactionRecord> reversalLookup = lookup(reversal, doublePaid,
+                () -> ledgerClient.findChargeReversal(ledgerKey));
+        return new ChargeFacts(debit, refund, ledger, reversalLookup);
+    }
+
+    private static boolean isSucceeded(SourceLookup<BankTransactionRecord> lookup) {
+        return lookup instanceof SourceLookup.Found<BankTransactionRecord> found && found.record().isSucceeded();
+    }
+
+    private static boolean isPosted(SourceLookup<LedgerTransactionRecord> lookup) {
+        return lookup instanceof SourceLookup.Found<LedgerTransactionRecord> found && found.record().isPosted();
     }
 
     private static <T> SourceLookup<T> lookup(T fromList, boolean expected, Supplier<SourceLookup<T>> single) {

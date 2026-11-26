@@ -53,6 +53,11 @@ public class LedgerTransactionQueryAdapter implements LedgerTransactionQueryClie
         return findByReference(CHARGE, chargeId);
     }
 
+    @Override
+    public SourceLookup<LedgerTransactionRecord> findChargeReversal(UUID chargeId) {
+        return findByReference(CHARGE_REVERSAL, chargeId);
+    }
+
     private List<LedgerTransactionRecord> listByPeriod(String referenceType, String label, Instant from,
                                                        Instant to) {
         List<LedgerTransactionRecord> records = new ArrayList<>();

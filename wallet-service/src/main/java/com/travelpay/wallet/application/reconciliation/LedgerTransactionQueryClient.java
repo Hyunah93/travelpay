@@ -24,4 +24,7 @@ public interface LedgerTransactionQueryClient {
      * 한 페이지라도 받지 못하면 ReconciliationSourceException
      */
     List<LedgerTransactionRecord> listChargeReversals(Instant from, Instant to);
+
+    /** (CHARGE_REVERSAL, chargeId) 단건. 404 LEDGER_TRANSACTION_NOT_FOUND만 NotFound, 그 밖의 실패는 Unavailable */
+    SourceLookup<LedgerTransactionRecord> findChargeReversal(UUID chargeId);
 }

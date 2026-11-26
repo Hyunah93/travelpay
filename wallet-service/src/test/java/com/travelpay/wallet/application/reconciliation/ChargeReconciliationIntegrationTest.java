@@ -107,6 +107,7 @@ class ChargeReconciliationIntegrationTest {
         when(ledgerClient.listChargeReversals(any(), any())).thenReturn(reversalList);
         when(bankClient.findTransaction(anyString())).thenReturn(SourceLookup.notFound());
         when(ledgerClient.findChargeTransaction(any())).thenReturn(SourceLookup.notFound());
+        when(ledgerClient.findChargeReversal(any())).thenReturn(SourceLookup.notFound());
     }
 
     @Test
@@ -567,6 +568,49 @@ class ChargeReconciliationIntegrationTest {
         assertEquals(0, resultCount(result.runId()));
     }
 
+    @Test
+    void 앞_기간_정상_취소_분개는_목록에_없어도_단건_조회로_찾아_CREDIT_AND_REFUND_BOTH_없음() {
+        Charge corrected = earlierDoublePaidWithRefundInPeriod();
+        when(ledgerClient.findChargeReversal(corrected.id()))
+                .thenReturn(SourceLookup.found(reversal(corrected, AMOUNT, AMOUNT, 0, walletId)));
+        // 이중 지급 사실이 없는 충전은 취소 분개를 단건 조회하지 않는다
+        Charge normal = completedCharge();
+        bankList.add(debit(normal, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(normal, AMOUNT, "KRW"));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(0, resultCount(result.runId()));
+        assertCounts(result, 2, 2, 0, 0);
+        verify(ledgerClient, times(1)).findChargeReversal(corrected.id());
+        verify(ledgerClient, never()).findChargeReversal(normal.id());
+    }
+
+    @Test
+    void 앞_기간_이중_지급에_취소_분개_단건_조회_결과가_없으면_CREDIT_AND_REFUND_BOTH() {
+        Charge notCorrected = earlierDoublePaidWithRefundInPeriod();
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of("CREDIT_AND_REFUND_BOTH"), types(result.runId(), notCorrected.id()));
+        verify(ledgerClient, times(1)).findChargeReversal(notCorrected.id());
+    }
+
+    @Test
+    void 앞_기간_이중_지급에_취소_분개_단건_조회가_실패하면_SOURCE_UNAVAILABLE이고_PARTIAL() {
+        Charge unknown = earlierDoublePaidWithRefundInPeriod();
+        when(ledgerClient.findChargeReversal(unknown.id()))
+                .thenReturn(SourceLookup.unavailable("feign.FeignException$ServiceUnavailable status=503"));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(ReconciliationRunStatus.PARTIAL, result.status());
+        assertEquals(List.of("SOURCE_UNAVAILABLE"), types(result.runId(), unknown.id()));
+        String detail = detail(result.runId(), unknown.id(), "SOURCE_UNAVAILABLE");
+        assertTrue(detail.startsWith("원장 취소 분개 조회 실패"), detail);
+        assertCounts(result, 1, 0, 0, 1);
+    }
+
     // ---- 준비 ----
 
     private record Charge(UUID id, String bankRequestId, String refundRequestId, UUID bankTxId,
@@ -618,6 +662,21 @@ class ChargeReconciliationIntegrationTest {
         bankList.add(debit(charge, "SUCCEEDED", AMOUNT));
         ledgerList.add(posted(charge, AMOUNT, "KRW"));
         bankList.add(refund(charge, "SUCCEEDED", AMOUNT));
+        return charge;
+    }
+
+    /**
+     * 3일 전 접수·출금·원장 적립된 COMPLETED 충전(저장된 ID 일치). 이번 기간 은행 목록에는 환불 성공만 있어
+     * 이 기록으로 다시 후보가 된다. 출금·원장 적립은 단건 조회로 찾는다
+     */
+    private Charge earlierDoublePaidWithRefundInPeriod() {
+        Charge charge = charge("COMPLETED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                FROM.minus(Duration.ofDays(3)));
+        bankList.add(refund(charge, "SUCCEEDED", AMOUNT));
+        when(bankClient.findTransaction(charge.bankRequestId()))
+                .thenReturn(SourceLookup.found(debit(charge, "SUCCEEDED", AMOUNT)));
+        when(ledgerClient.findChargeTransaction(charge.id()))
+                .thenReturn(SourceLookup.found(posted(charge, AMOUNT, "KRW")));
         return charge;
     }
 

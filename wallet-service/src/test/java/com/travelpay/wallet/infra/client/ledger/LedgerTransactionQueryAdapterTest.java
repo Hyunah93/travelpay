@@ -138,6 +138,45 @@ class LedgerTransactionQueryAdapterTest {
         assertTrue(e.getMessage().startsWith("원장 취소 분개 목록 응답 이상"), e.getMessage());
     }
 
+    @Test
+    void 취소_분개_단건은_CHARGE_REVERSAL로_조회하고_404_LEDGER_TRANSACTION_NOT_FOUND만_NotFound() {
+        UUID chargeId = UUID.randomUUID();
+        when(feignClient.findByReference("CHARGE_REVERSAL", chargeId))
+                .thenThrow(error(404, "LEDGER_TRANSACTION_NOT_FOUND"));
+
+        assertInstanceOf(SourceLookup.NotFound.class, adapter.findChargeReversal(chargeId));
+    }
+
+    @Test
+    void 취소_분개_단건을_찾으면_Found() {
+        UUID chargeId = UUID.randomUUID();
+        when(feignClient.findByReference("CHARGE_REVERSAL", chargeId)).thenReturn(ApiResponse.success(
+                new LedgerTransactionDetailResponse(UUID.randomUUID(), "POSTED", "CHARGE_REVERSAL", chargeId,
+                        List.of())));
+
+        SourceLookup<LedgerTransactionRecord> lookup = adapter.findChargeReversal(chargeId);
+
+        assertEquals("CHARGE_REVERSAL",
+                ((SourceLookup.Found<LedgerTransactionRecord>) lookup).record().referenceType());
+    }
+
+    @ParameterizedTest
+    @MethodSource("unavailableFailures")
+    void 취소_분개_단건_그_밖의_실패는_Unavailable(FeignException failure) {
+        UUID chargeId = UUID.randomUUID();
+        when(feignClient.findByReference("CHARGE_REVERSAL", chargeId)).thenThrow(failure);
+
+        assertInstanceOf(SourceLookup.Unavailable.class, adapter.findChargeReversal(chargeId));
+    }
+
+    @Test
+    void 취소_분개_단건_응답이_다른_referenceType이면_Unavailable() {
+        UUID chargeId = UUID.randomUUID();
+        when(feignClient.findByReference("CHARGE_REVERSAL", chargeId)).thenReturn(ApiResponse.success(posted(chargeId)));
+
+        assertInstanceOf(SourceLookup.Unavailable.class, adapter.findChargeReversal(chargeId));
+    }
+
     private static LedgerTransactionDetailResponse posted(UUID chargeId) {
         return new LedgerTransactionDetailResponse(UUID.randomUUID(), "POSTED", "CHARGE", chargeId, List.of(
                 new LedgerTransactionDetailResponse.Entry("SYSTEM", null, "CHARGE_SOURCE", "KRW", "DEBIT",
