@@ -31,6 +31,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "MOCK_BANK_URL=http://localhost:1",
         "travelpay.wallet.outbox.publisher.enabled=false",
         "travelpay.wallet.charge.recovery.enabled=false",
+        "travelpay.wallet.charge.correction.enabled=false",
         "travelpay.wallet.charge.reconciliation.enabled=false",
         "travelpay.wallet.charge.saga.consumer.enabled=false",
         "spring.kafka.admin.auto-create=false"

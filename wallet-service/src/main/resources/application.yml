@@ -46,8 +46,8 @@ spring:
   task:
     scheduling:
       pool:
-        # 복구·Outbox 발행·충전 대사가 각자 스레드를 쓴다 (외부 호출이 긴 배치가 다른 스케줄러를 막지 않게)
-        size: 3
+        # 복구·Outbox 발행·충전 대사·이중 지급 정정이 각자 스레드를 쓴다 (외부 호출이 긴 배치가 다른 스케줄러를 막지 않게)
+        size: 4
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     producer:
@@ -109,6 +109,13 @@ travelpay:
         running-timeout: 30m
         # 직전 실행(COMPLETED·PARTIAL)이 없을 때 시작점
         initial-from: "2026-11-01T00:00:00Z"
+      correction:
+        # 이중 지급 자동 정정(대사가 등록한 CREDIT_AND_REFUND_BOTH 충전을 원장 충전 취소 분개로 바로잡음).
+        # 끄면 스케줄러가 등록되지 않는다 (테스트용). 주기·배치는 충전 복구와 같은 값
+        enabled: true
+        # 이전 주기가 끝난 뒤부터 다음 주기까지의 간격
+        fixed-delay: 10s
+        batch-size: 10
       resolution:
         # 운영자 보정: MANUAL_REVIEW 전환(updated_at) 후 이 시간이 지난 은행·원장 NotFound만 "없음"으로 인정한다
         not-found-confirm-after: 10m

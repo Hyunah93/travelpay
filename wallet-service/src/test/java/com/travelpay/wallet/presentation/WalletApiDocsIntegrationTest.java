@@ -33,6 +33,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         "eureka.client.enabled=false",
         "travelpay.wallet.outbox.publisher.enabled=false",
         "travelpay.wallet.charge.recovery.enabled=false",
+        "travelpay.wallet.charge.correction.enabled=false",
         "travelpay.wallet.charge.reconciliation.enabled=false",
         "travelpay.wallet.charge.saga.consumer.enabled=false",
         "spring.kafka.admin.auto-create=false"
@@ -89,7 +90,8 @@ class WalletApiDocsIntegrationTest {
                         "/api/v1/admin/charges/{chargeId}/review",
                         "/api/v1/admin/charges/{chargeId}/resolve",
                         "/api/v1/admin/charges/reconciliations",
-                        "/api/v1/admin/charges/reconciliations/{runId}")));
+                        "/api/v1/admin/charges/reconciliations/{runId}",
+                        "/api/v1/admin/charges/double-payment-corrections")));
     }
 
     @Test
