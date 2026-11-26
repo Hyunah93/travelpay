@@ -4,6 +4,8 @@ import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.ledger.application.transaction.dto.CancelTransactionCommand;
 import com.travelpay.ledger.application.transaction.dto.CancelTransactionResult;
+import com.travelpay.ledger.application.transaction.dto.ChargeReversalCommand;
+import com.travelpay.ledger.application.transaction.dto.ChargeReversalResult;
 import com.travelpay.ledger.application.transaction.dto.LedgerEntryResult;
 import com.travelpay.ledger.application.transaction.dto.RegisterTransactionCommand;
 import com.travelpay.ledger.application.transaction.dto.TransactionDetailResult;
@@ -67,7 +69,9 @@ public class LedgerTransactionService {
      */
     public CancelTransactionResult cancel(CancelTransactionCommand command) {
         Objects.requireNonNull(command, "command");
-        if (command.referenceType() == null || command.referenceId() == null) {
+        // CHARGE_REVERSAL은 충전 취소 분개 API만 기록한다. 취소 기록으로 그 reference를 차지하지 못하게 거절한다
+        if (command.referenceType() == null || command.referenceType() == ReferenceType.CHARGE_REVERSAL
+                || command.referenceId() == null) {
             throw new BusinessException(CommonErrorCode.INVALID_REQUEST);
         }
         String requestHash = LedgerRequestHasher.hashCancel(command.referenceType(), command.referenceId());
@@ -75,6 +79,24 @@ public class LedgerTransactionService {
             return recorder.cancel(command, requestHash);
         } catch (DuplicateReferenceException e) {
             return recorder.existingForCancel(command.referenceType(), command.referenceId());
+        }
+    }
+
+    /**
+     * 충전 취소 분개 (CHARGE_REVERSAL, chargeId)를 기록한다. 이미 있으면 그대로 돌려준다.
+     * 등록·취소처럼 트랜잭션을 열지 않는 진입점이라 reference UNIQUE 위반을 밖에서 잡아
+     * 새 트랜잭션에서 먼저 저장된 취소 분개를 읽는다.
+     */
+    public ChargeReversalResult reverseCharge(ChargeReversalCommand command) {
+        Objects.requireNonNull(command, "command");
+        if (command.chargeId() == null) {
+            throw new BusinessException(CommonErrorCode.INVALID_REQUEST);
+        }
+        String requestHash = LedgerRequestHasher.hashChargeReversal(command.chargeId());
+        try {
+            return recorder.reverseCharge(command, requestHash);
+        } catch (DuplicateReferenceException e) {
+            return recorder.existingChargeReversal(command.chargeId());
         }
     }
 

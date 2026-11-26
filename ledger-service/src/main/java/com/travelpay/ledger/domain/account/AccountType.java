@@ -5,5 +5,6 @@ public enum AccountType {
     CHARGE_SOURCE,        // 충전금 출처
     FX_POSITION,          // 환전 계정
     FEE_REVENUE,          // 수수료 수익
-    MERCHANT_SETTLEMENT   // 가맹점 정산금
+    MERCHANT_SETTLEMENT,  // 가맹점 정산금
+    RECEIVABLE            // 미수 (충전 취소 분개에서 회수하지 못한 부족분, SYSTEM)
 }

@@ -3,6 +3,7 @@ package com.travelpay.ledger.presentation.integrity.dto;
 import com.travelpay.ledger.application.integrity.dto.IntegrityCheckResult;
 import com.travelpay.ledger.application.integrity.dto.IntegrityCheckResult.CheckOutcome;
 import com.travelpay.ledger.domain.integrity.AccountBalanceViolation;
+import com.travelpay.ledger.domain.integrity.ChargeReversalViolation;
 import com.travelpay.ledger.domain.integrity.CurrencyTotalViolation;
 import com.travelpay.ledger.domain.integrity.RejectedEntriesViolation;
 import com.travelpay.ledger.domain.integrity.TransactionBalanceViolation;
@@ -15,7 +16,7 @@ import java.util.function.Function;
 
 /**
  * 정합성 검사 응답. 검사마다 SQL 한 문장이라 검사끼리는 읽은 시점이 다를 수 있다.
- * consistent는 네 검사의 위반이 모두 0일 때 true.
+ * consistent는 다섯 검사의 위반이 모두 0일 때 true.
  */
 public record IntegrityCheckResponse(
         Instant checkedAt,
@@ -25,7 +26,8 @@ public record IntegrityCheckResponse(
         Check<AccountBalance> accountBalance,
         Check<TransactionBalance> postedTransactionBalance,
         Check<RejectedEntries> rejectedTransactionEntries,
-        Check<CurrencyTotal> currencyTotal
+        Check<CurrencyTotal> currencyTotal,
+        Check<ChargeReversalStructure> chargeReversalStructure
 ) {
 
     public static IntegrityCheckResponse from(IntegrityCheckResult result) {
@@ -34,7 +36,8 @@ public record IntegrityCheckResponse(
                 Check.from(result.accountBalance(), AccountBalance::from),
                 Check.from(result.postedTransactionBalance(), TransactionBalance::from),
                 Check.from(result.rejectedTransactionEntries(), RejectedEntries::from),
-                Check.from(result.currencyTotal(), CurrencyTotal::from));
+                Check.from(result.currencyTotal(), CurrencyTotal::from),
+                Check.from(result.chargeReversalStructure(), ChargeReversalStructure::from));
     }
 
     public record Check<T>(long checkedCount, long violationCount, int returnedCount, boolean truncated,
@@ -67,6 +70,13 @@ public record IntegrityCheckResponse(
     public record CurrencyTotal(String currency, BigInteger totalBalance) {
         static CurrencyTotal from(CurrencyTotalViolation v) {
             return new CurrencyTotal(v.currency().name(), v.totalBalance());
+        }
+    }
+
+    /** reason: ORIGINAL_MISMATCH, REVERSAL_IN_MISMATCH, SPLIT_MISMATCH, WALLET_MISMATCH, RECEIVABLE_OUTSIDE_REVERSAL */
+    public record ChargeReversalStructure(UUID transactionId, String reason) {
+        static ChargeReversalStructure from(ChargeReversalViolation v) {
+            return new ChargeReversalStructure(v.transactionId(), v.reason().name());
         }
     }
 }

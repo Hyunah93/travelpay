@@ -14,6 +14,8 @@ public enum LedgerErrorCode implements ErrorCode {
     LEDGER_INVALID_PAGE_SIZE("LEDGER_INVALID_PAGE_SIZE", "조회 건수는 1 이상이어야 합니다.", 400),
     LEDGER_INVALID_CURSOR("LEDGER_INVALID_CURSOR", "커서가 올바르지 않습니다.", 400),
     LEDGER_CURSOR_MISMATCH("LEDGER_CURSOR_MISMATCH", "커서의 조회 조건과 요청 조건이 다릅니다.", 400),
+    /** 충전 취소 분개: 원거래가 POSTED가 아니거나 충전 항목 구조(충전 원천 DEBIT + 지갑 CREDIT)가 아님 */
+    LEDGER_ORIGINAL_NOT_REVERSIBLE("LEDGER_ORIGINAL_NOT_REVERSIBLE", "취소 분개할 수 없는 원거래입니다.", 422),
     LEDGER_REFERENCE_CONFLICT("LEDGER_REFERENCE_CONFLICT", "같은 참조로 다른 내용의 거래가 이미 있습니다.", 409),
     /** 다른 정합성 검사가 실행 중. 기다리지 않고 바로 돌려준다 */
     LEDGER_INTEGRITY_CHECK_IN_PROGRESS("LEDGER_INTEGRITY_CHECK_IN_PROGRESS", "다른 정합성 검사가 실행 중입니다.", 409),

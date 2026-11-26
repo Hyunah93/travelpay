@@ -77,6 +77,7 @@ class LedgerIntegrityCheckPerformanceTest {
         CHECK_SQL.put("2 거래 차대", LedgerIntegritySql.POSTED_TRANSACTION_BALANCES);
         CHECK_SQL.put("3 거절 거래 항목", LedgerIntegritySql.REJECTED_WITHOUT_ENTRIES);
         CHECK_SQL.put("4 통화별 합계", LedgerIntegritySql.CURRENCY_TOTALS);
+        CHECK_SQL.put("5 충전 취소 분개 구조", LedgerIntegritySql.CHARGE_REVERSAL_STRUCTURE);
     }
 
     @Container
@@ -165,7 +166,7 @@ class LedgerIntegrityCheckPerformanceTest {
         line("API 결과(오탐 확인): consistent=" + data.get("consistent").asBoolean() + ", 전체 위반 "
                 + data.get("totalViolationCount").asLong() + ", 검사 대상 수 1=" + checked(data, "accountBalance")
                 + " 2=" + checked(data, "postedTransactionBalance") + " 3=" + checked(data, "rejectedTransactionEntries")
-                + " 4=" + checked(data, "currencyTotal"));
+                + " 4=" + checked(data, "currencyTotal") + " 5=" + checked(data, "chargeReversalStructure"));
         assertTrue(data.get("consistent").asBoolean(), "정상 데이터에서 위반이 나옴(오탐): " + first.body());
 
         line("");
@@ -180,7 +181,7 @@ class LedgerIntegrityCheckPerformanceTest {
             }
         }
         Api api = apiMedian(scale);
-        line("- API 응답(네 검사 + 잠금): " + api.median() + " / 5회 " + api.runs() + " (예열 포함 모두 200)");
+        line("- API 응답(다섯 검사 + 잠금): " + api.median() + " / 5회 " + api.runs() + " (예열 포함 모두 200)");
     }
 
     // =====================================================================

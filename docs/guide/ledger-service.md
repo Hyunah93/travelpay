@@ -44,6 +44,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | `GET /internal/v1/ledger/accounts?walletId=` | 지갑의 통화별 계정·잔액 조회 | 200 |
 | `POST /internal/v1/ledger/transactions` | 거래 등록 | 201(새 기록)·200(같은 내용 재요청) |
 | `POST /internal/v1/ledger/transactions/cancel` | 거래 취소(같은 reference를 취소 기록으로 막음) | 201(취소 기록)·200(이미 거래 있음) |
+| `POST /internal/v1/ledger/transactions/charge-reversals` | 충전 취소 분개(이중 지급 바로잡기) | 201(새 기록)·200(이미 있음) |
 | `GET /internal/v1/ledger/transactions?referenceType=&referenceId=` | reference로 거래 단건 조회 | 200 |
 | `GET /internal/v1/ledger/transactions/period?referenceType=&from=&to=` | 기간 거래 목록(커서) | 200 |
 | `GET /internal/v1/ledger/integrity` | 원장 내부 정합성 검사(찾기만 하고 고치지 않음) | 200(위반이 있어도 200) |
@@ -77,7 +78,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 
 | 항목 | 규칙 |
 |---|---|
-| `referenceType` | 필수. `CHARGE`·`PAYMENT`·`PAYMENT_REFUND`·`TRANSFER`·`EXCHANGE`·`SETTLEMENT` |
+| `referenceType` | 필수. `CHARGE`·`PAYMENT`·`PAYMENT_REFUND`·`TRANSFER`·`EXCHANGE`·`SETTLEMENT`. `CHARGE_REVERSAL`은 400([아래](#충전-취소-분개-전용-값은-400)) |
 | `referenceId` | 필수, UUID. 도메인의 원 거래 ID(충전 ID, 송금 ID 등) |
 | `userId` | 선택. 기록용이며 계정 조회에 쓰지 않음 |
 | `description` | 선택, 255자 이하 |
@@ -88,7 +89,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | `entries[].currency` | `KRW`·`JPY`·`CNY` |
 | `entries[].direction` | `DEBIT`(차변, 잔액 감소) 또는 `CREDIT`(대변, 잔액 증가) |
 | `entries[].amount` | 0보다 큰 정수 |
-| `entries[].entryType` | [entry_type 허용 값](#entry_type-허용-값) 13개 중 하나 |
+| `entries[].entryType` | [entry_type 허용 값](#entry_type-허용-값) 16개 중 충전 취소 분개 전용 3개를 뺀 13개 중 하나 |
 
 ### 계정 지정
 
@@ -106,6 +107,19 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 - 금액은 0보다 큼. 금액 0 항목은 보내지 않습니다(예: 환전 수수료 0이면 수수료 쌍을 뺌)
 - `entryType`은 허용 값 13개 중 하나
 - 요청 enum(`referenceType`·`ownerType`·`accountType`·`currency`·`direction`·`entryType`)은 **정확한 이름 문자열만** 받습니다. 숫자(`0`), 숫자 문자열(`"0"`), 소문자(`"charge_in"`)는 400 `COMMON_INVALID_REQUEST`입니다.
+
+#### 충전 취소 분개 전용 값은 400
+
+거래 등록 API와 [거래 취소](#거래-취소) API는 아래 값을 400 `COMMON_INVALID_REQUEST`로 거절합니다(`TransactionCommandValidator`, `LedgerTransactionService.cancel`). DB CHECK에는 있지만 [충전 취소 분개](#충전-취소-분개) API만 기록합니다.
+
+| 값 | 거절하는 API |
+|---|---|
+| `referenceType: CHARGE_REVERSAL` | 등록·취소 |
+| `entryType`: `CHARGE_REVERSAL_OUT`·`CHARGE_REVERSAL_IN`·`CHARGE_REVERSAL_RECEIVABLE` | 등록 |
+| `SYSTEM` 항목의 `accountType: RECEIVABLE` | 등록 |
+
+- 막지 않으면 거래 등록 API로 미수(`RECEIVABLE`) 계정에 원거래와 상관없는 금액을 기록할 수 있습니다. 미수 금액은 충전 취소 분개가 원거래와 잠근 잔액으로 계산한 값만 남아야 합니다.
+- 취소 API로 `(CHARGE_REVERSAL, chargeId)`를 취소 기록으로 차지하면 그 충전의 취소 분개를 영영 기록할 수 없게 되므로 취소도 막습니다.
 
 ### 반영과 거절 판단
 
@@ -132,7 +146,9 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 
 ### entry_type 허용 값
 
-`CHARGE_OUT`, `CHARGE_IN`, `PAYMENT_OUT`, `PAYMENT_IN`, `PAYMENT_REFUND_OUT`, `PAYMENT_REFUND_IN`, `EXCHANGE_OUT`, `EXCHANGE_IN`, `EXCHANGE_FEE`, `TRANSFER_OUT`, `TRANSFER_IN`, `SETTLEMENT_OUT`, `SETTLEMENT_IN`  (13개, `EntryType` enum과 V7 CHECK가 같음).
+`CHARGE_OUT`, `CHARGE_IN`, `PAYMENT_OUT`, `PAYMENT_IN`, `PAYMENT_REFUND_OUT`, `PAYMENT_REFUND_IN`, `EXCHANGE_OUT`, `EXCHANGE_IN`, `EXCHANGE_FEE`, `TRANSFER_OUT`, `TRANSFER_IN`, `SETTLEMENT_OUT`, `SETTLEMENT_IN`, `CHARGE_REVERSAL_OUT`, `CHARGE_REVERSAL_IN`, `CHARGE_REVERSAL_RECEIVABLE`  (16개, `EntryType` enum과 V8 CHECK가 같음).
+
+마지막 3개(`CHARGE_REVERSAL_*`)는 [충전 취소 분개](#충전-취소-분개) API만 기록하고, 거래 등록 API는 [400으로 거절](#충전-취소-분개-전용-값은-400)합니다. 거래 등록 API가 받는 값은 앞의 13개입니다.
 
 도메인별 분개(각 서비스의 현재 요청 코드 기준):
 
@@ -146,6 +162,7 @@ Swagger UI는 없습니다(ledger-service에 springdoc 의존성이 없음). API
 | 환전(수수료) | `EXCHANGE` | `USER` 지갑(보내는 통화), `EXCHANGE_FEE` | `SYSTEM FEE_REVENUE`(보내는 통화), `EXCHANGE_FEE` |
 | 환전(받는 금액) | `EXCHANGE` | `SYSTEM FX_POSITION`(받는 통화), `EXCHANGE_IN` | `USER` 지갑(받는 통화), `EXCHANGE_IN` |
 | 정산 | `SETTLEMENT` | `USER` 가맹점 지갑, `SETTLEMENT_OUT` | `USER` 가맹점 주인 개인 지갑, `SETTLEMENT_IN` |
+| 충전 취소 분개(원장이 기록) | `CHARGE_REVERSAL` | `USER` 회원 지갑 KRW, `CHARGE_REVERSAL_OUT`(회수액) + `SYSTEM RECEIVABLE` KRW, `CHARGE_REVERSAL_RECEIVABLE`(부족분) | `SYSTEM CHARGE_SOURCE` KRW, `CHARGE_REVERSAL_IN`(원금액) |
 
 - 환전은 한 거래에 6항목(수수료 0이면 4항목)입니다. 통화별로 차변·대변이 맞습니다.
 - 환불은 `originalTransactionId`에 결제의 원장 거래 ID를 넣습니다.
@@ -261,7 +278,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 거래 없음 | `REJECTED` + `rejectReason: CANCELLED_BY_REQUESTER` 저장. 항목·계정 잠금·잔액 변화 없음 | 201, 빈 `entries` |
 | 이미 `POSTED` | 바꾸지 않음 | 200, 기존 거래(항목 포함) |
 | 이미 `REJECTED`(원장 거절 또는 앞선 취소) | 바꾸지 않음 | 200, 기존 거래와 원래 사유 |
-| 형식 오류(`referenceType`·`referenceId` 없음 등) | 기록 없음 | 400 `COMMON_INVALID_REQUEST` |
+| 형식 오류(`referenceType`·`referenceId` 없음 등), `referenceType: CHARGE_REVERSAL`([이유](#충전-취소-분개-전용-값은-400)) | 기록 없음 | 400 `COMMON_INVALID_REQUEST` |
 | DB 연결 불가·커넥션 획득 실패·트랜잭션 시간 초과 | 롤백 | 503 `COMMON_SERVICE_UNAVAILABLE` (같은 요청으로 재전송) |
 
 등록 API와 다른 점:
@@ -294,6 +311,99 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | `referenceId` 없음 | 400, 거래 행 변화 없음 |
 
 커밋 전 행은 앱 풀 밖 연결이 같은 reference 행을 INSERT만 하고 쥔 채로 재현했습니다. 취소가 잠금을 기다리는 것을 `pg_stat_activity`(`wait_event_type = 'Lock'`)로 확인한 뒤 커밋·롤백했고, 이 대기도 취소의 트랜잭션 제한 3초 안입니다.
+
+## 충전 취소 분개
+
+`POST /internal/v1/ledger/transactions/charge-reversals`
+
+이중 지급(같은 충전이 지갑 적립과 출금 환불을 모두 받은 경우, `CREDIT_AND_REFUND_BOTH`)을 원장에서 바로잡습니다. 지갑에 적립된 충전금을 잠근 뒤의 잔액만큼 회수하고, 이미 써서 모자란 만큼은 미수(`RECEIVABLE`)로 남기며, 충전 원천(`CHARGE_SOURCE`)에는 원금액을 되돌립니다. 미수를 회원에게서 실제로 받아 내는 절차(미수 회수)는 아직 없습니다([고려 중](#고려-중)).
+
+### 요청
+
+```json
+{
+  "chargeId": "6dda1ae2-…",
+  "description": "이중 지급 바로잡기"
+}
+```
+
+| 필드 | 필수 | 설명 |
+|---|---|---|
+| `chargeId` | 필수 | 되돌릴 충전 ID. 원거래 `(CHARGE, chargeId)`를 찾고, 취소 분개는 `(CHARGE_REVERSAL, chargeId)`로 기록 |
+| `description` | 선택 | 255자 이하 |
+
+금액·항목·`userId`는 받지 않습니다. `userId`는 원거래에서 가져옵니다.
+
+### 응답
+
+거래 응답 형식([단건 조회](#단건-조회)와 같은 필드)에 두 금액을 더합니다.
+
+```json
+{
+  "success": true,
+  "data": {
+    "transactionId": "a41f…",
+    "status": "POSTED",
+    "rejectReason": null,
+    "referenceType": "CHARGE_REVERSAL",
+    "referenceId": "6dda1ae2-…",
+    "createdAt": "2026-11-26T05:06:07.123456Z",
+    "entries": [
+      {"ownerType": "USER", "walletId": "…", "accountType": "WALLET", "currency": "KRW", "direction": "DEBIT", "amount": 20000, "entryType": "CHARGE_REVERSAL_OUT"},
+      {"ownerType": "SYSTEM", "walletId": null, "accountType": "RECEIVABLE", "currency": "KRW", "direction": "DEBIT", "amount": 80000, "entryType": "CHARGE_REVERSAL_RECEIVABLE"},
+      {"ownerType": "SYSTEM", "walletId": null, "accountType": "CHARGE_SOURCE", "currency": "KRW", "direction": "CREDIT", "amount": 100000, "entryType": "CHARGE_REVERSAL_IN"}
+    ],
+    "recoveredAmount": 20000,
+    "receivableAmount": 80000
+  },
+  "error": null
+}
+```
+
+- `recoveredAmount`: 지갑에서 회수한 금액(`CHARGE_REVERSAL_OUT` 합), `receivableAmount`: 미수 금액(`CHARGE_REVERSAL_RECEIVABLE` 합). 저장된 항목에서 계산하므로 201과 200이 같은 규칙입니다.
+- 금액이 0인 항목은 만들지 않습니다. 잔액이 충분하면 미수 항목이 없고, 잔액이 0이면 지갑 항목이 없습니다.
+- 취소 분개는 `POSTED`로만 기록되므로 `rejectReason`은 항상 `null`입니다.
+
+### 처리 규칙
+
+서비스 진입점은 거래 등록·취소처럼 트랜잭션을 열지 않습니다. 기록은 한 트랜잭션(제한 3초)입니다.
+
+1. `(CHARGE_REVERSAL, chargeId)`가 이미 있으면 바꾸지 않고 200으로 돌려줍니다.
+2. 원거래 `(CHARGE, chargeId)`가 없으면 404 `LEDGER_TRANSACTION_NOT_FOUND`.
+3. 원거래가 `POSTED`가 아니거나 항목 구조가 충전과 다르면 422 `LEDGER_ORIGINAL_NOT_REVERSIBLE`. 기대 구조는 항목 정확히 2개 = `SYSTEM CHARGE_SOURCE DEBIT CHARGE_OUT` + `USER WALLET CREDIT CHARGE_IN`, 금액·통화 같음(wallet-service 충전 요청 형태).
+4. 회원 지갑(원거래의 `walletId`·통화), `CHARGE_SOURCE`, `RECEIVABLE` 세 계정을 [거래 등록과 같은 규칙](#계정-잠금-순서)(계정 ID 순 `FOR NO KEY UPDATE`, `lockAllInIdOrder`)으로 한 번에 잠급니다. 회수액이 0이어도 잔액을 읽으려고 지갑을 잠급니다.
+5. 셋 중 하나라도 `ACTIVE`가 아니면 422 `LEDGER_REJECTED_WALLET_SUSPENDED`.
+6. 잠근 뒤의 지갑 잔액으로 `회수액 = min(잔액, 원금액)`, `미수 = 원금액 − 회수액`을 정합니다.
+7. 한 거래로 `POSTED` 기록: `referenceType: CHARGE_REVERSAL`, `referenceId: chargeId`, `originalTransactionId`: 원거래 ID, `userId`: 원거래 `userId`. 반영 순서·`balance_after`·반영 후 잔액 확인은 거래 등록과 같은 코드입니다.
+
+- **거절은 행을 저장하지 않습니다.** 404·422는 예외로 롤백하므로 거래 등록과 달리 `REJECTED` 거래도 남지 않습니다. 같은 `chargeId`로 다시 요청하면 그때 상태로 다시 판단합니다.
+- 같은 `chargeId` 동시 요청은 reference UNIQUE로 하나만 저장되고, 진 요청은 새 트랜잭션에서 먼저 저장된 취소 분개를 읽어 200으로 돌려줍니다.
+
+### 멱등성
+
+- 요청 해시는 항목이 아니라 `charge-reversal-v1` + `CHARGE_REVERSAL` + `chargeId`로 만듭니다(`LedgerRequestHasher.hashChargeReversal`). 금액이 요청이 아니라 잠근 뒤의 잔액으로 정해져, 항목으로 해시를 만들면 같은 요청을 다시 보내도 잔액이 바뀐 만큼 다른 해시가 되기 때문입니다.
+- 접두어가 달라 거래 등록 해시(`v1`)·취소 해시(`cancel-v1`)와 겹치지 않습니다.
+- 그래서 같은 `chargeId` 재요청은 항상 200, 같은 `transactionId`입니다(409가 없음). `description`이 달라도 바꾸지 않습니다.
+
+### 테스트로 확인
+
+`LedgerChargeReversalIntegrationTest`(실제 Postgres·실제 HTTP, 테스트마다 정합성 검사 `consistent=true`와 [5번 검사](#정합성-검사) 위반 0 확인):
+
+| 상황 | 결과 |
+|---|---|
+| 잔액 충분(10만 충전, 잔액 10만) | 201, 회수 10만·미수 0, 미수 항목 없음. 지갑·`CHARGE_SOURCE`가 원거래 전 상태로 |
+| 잔액 부족(10만 충전 후 8만 송금, 잔액 2만) | 회수 2만·미수 8만, `CHARGE_SOURCE` 10만 복구, `RECEIVABLE` 잔액 −8만 |
+| 잔액 0 | 지갑 항목 없음, 전액 미수 |
+| 원거래 없음 / 원거래 `REJECTED` / 구조 다름 | 404 / 422 / 422, 셋 다 거래·항목 행 수와 시스템 계정 잔액 변화 없음 |
+| 같은 요청 재전송 | 200, 같은 `transactionId`·금액·항목, 거래 1건 |
+| 같은 `chargeId` 동시 2건 × 50회 | 매회 201·200, 같은 `transactionId`, 거래 1건 |
+| 같은 지갑 출금(송금 8만)과 동시 × 50회 | 매회 지갑 잔액 음수 없음, 회수액 + 출금액 ≤ 시작 잔액, 회수액 + 미수 = 원금액, 차변 = 대변. 어느 쪽이 먼저 잠그는지는 정하지 않음(한 번 실행에서 취소 분개 먼저 1회·출금 먼저 49회) |
+| 지갑 계정 잠금을 외부 연결이 쥔 동안(`LedgerLockProbe`) | 취소 분개가 `FOR NO KEY UPDATE` 대기에 들어가고, 대기 중 기록 없음. 풀면 201 |
+| 순서 강제: 취소 분개 먼저 대기 → 출금(송금 5만) 대기 → 해제 | 실제로도 취소 분개 먼저(회수 전 잔액 10만). 회수 10만·미수 0, 출금은 422 `LEDGER_REJECTED_INSUFFICIENT_BALANCE`(`REJECTED`만 남고 항목 없음) |
+| 순서 강제: 출금 먼저 대기 → 취소 분개 대기 → 해제 | 실제로도 출금 먼저(회수 전 잔액 5만). 출금 `POSTED`, 회수 5만·미수 5만 |
+
+- 순서 강제 테스트는 대기 순서를 `pg_stat_activity`로 맞추지만, 실제 반영 순서는 가정하지 않고 취소 분개 지갑 항목의 `balance_after` + 회수액(회수 전 잔액)으로 판별해 그 순서의 기대값을 확인합니다.
+- `TransactionCommandValidatorTest`(DB 없음)와 `LedgerEntryTypeIntegrationTest`가 [전용 값 400](#충전-취소-분개-전용-값은-400)과 V8 미수 계정 시드(SYSTEM·RECEIVABLE·KRW 1개, 잔액 0, `ACTIVE`)를 확인합니다.
 
 ## 조회
 
@@ -368,10 +478,23 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 2 | `postedTransactionBalance` | POSTED 거래마다 통화별 DEBIT 합 = CREDIT 합 | POSTED 거래 | (거래, 통화), `transactionId`·`currency` 순 |
 | 3 | `rejectedTransactionEntries` | REJECTED 거래에 항목이 없음 | REJECTED 거래 | 거래, `transactionId` 순 |
 | 4 | `currencyTotal` | 통화별 전체 계정 잔액 합 = 0(요약) | 모든 계정 | 통화, `currency` 순 |
+| 5 | `chargeReversalStructure` | 충전 취소 분개 구조(아래), 미수 계정 항목은 취소 분개에만 | POSTED `CHARGE_REVERSAL` 거래 | (거래, 이유), `transactionId`·`reason` 순 |
 
-- 모든 계정의 시작 잔액은 0입니다(시드 V3·V4, 계정 개설). 그래서 1과 4는 시작 잔액을 보정하지 않습니다. `balance_after`는 검사하지 않습니다.
+5번 위반 한 건은 `{transactionId, reason}`이고, 한 거래가 여러 이유로 걸리면 이유마다 한 건입니다.
+
+| `reason` | 위반 |
+|---|---|
+| `ORIGINAL_MISMATCH` | `original_transaction_id`가 POSTED `CHARGE` 거래가 아니거나, 그 거래의 `reference_id`가 취소 분개의 `reference_id`(chargeId)와 다름 |
+| `REVERSAL_IN_MISMATCH` | `CHARGE_SOURCE CREDIT CHARGE_REVERSAL_IN` 금액·통화가 원거래 지갑 적립(`USER CREDIT CHARGE_IN`)과 다름. 어느 쪽이든 정확히 1항목이 아니어도 위반 |
+| `SPLIT_MISMATCH` | 지갑 `DEBIT CHARGE_REVERSAL_OUT` + `RECEIVABLE DEBIT CHARGE_REVERSAL_RECEIVABLE` ≠ `CHARGE_REVERSAL_IN` 금액 |
+| `WALLET_MISMATCH` | `CHARGE_REVERSAL_OUT` 항목이 원거래 `CHARGE_IN`과 다른 지갑 계정 |
+| `RECEIVABLE_OUTSIDE_REVERSAL` | `RECEIVABLE` 계정 항목이 `CHARGE_REVERSAL`이 아닌 거래에 있음(거래 상태 무관). 이때 `transactionId`는 그 거래 |
+
+- 2번(차대)·1번(잔액)만으로는 "원거래 10만인데 취소 분개를 OUT 5만 + RECEIVABLE 3만 = IN 8만으로 맞춘" 경우처럼 차대와 잔액이 모두 맞는 잘못된 분개를 찾지 못해 5번을 따로 둡니다.
+- 취소 분개는 `reference_type = 'CHARGE_REVERSAL'` 조건으로 V6 인덱스에서 찾고, 항목은 `ix_ledger_entries_transaction`, 미수 계정 항목은 `ix_ledger_entries_account_created`로 읽을 수 있게 조건을 걸었습니다. 1·2와 달리 집계 대상이 취소 분개와 미수 계정 항목으로 한정됩니다. 실제 실행 계획(EXPLAIN)은 아직 측정하지 않았습니다.
+- 모든 계정의 시작 잔액은 0입니다(시드 V3·V4·V8, 계정 개설). 그래서 1과 4는 시작 잔액을 보정하지 않습니다. `balance_after`는 검사하지 않습니다.
 - 응답 `data`: `checkedAt`(첫 검사 직전 시각), `consistent`(전체 위반 0), `totalViolationCount`, `violationLimit`, 그리고 검사별로 `{checkedCount, violationCount, returnedCount, truncated, violations}`가 있습니다. `violations`는 정렬한 뒤 앞쪽부터 `violationLimit`건까지 담고, 더 있으면 `truncated: true`입니다. 합계 값(`postedNet`·`debitSum`·`creditSum`·`totalBalance`)은 bigint 범위를 넘을 수 있어 정수 그대로 돌려줍니다.
-- **읽은 시점**: 검사마다 SQL 한 문장입니다. 한 문장 안에서는 모든 테이블을 같은 시점으로 읽으므로, 잔액과 항목 합계를 다른 시점에 읽어 생기는 오탐이 없습니다. 네 검사는 차례로 실행되므로 **검사끼리는 읽은 시점이 다를 수 있습니다**(응답 전체가 한 시점의 스냅샷은 아님). 격리 수준은 따로 지정하지 않습니다(Hikari의 READ COMMITTED).
+- **읽은 시점**: 검사마다 SQL 한 문장입니다. 한 문장 안에서는 모든 테이블을 같은 시점으로 읽으므로, 잔액과 항목 합계를 다른 시점에 읽어 생기는 오탐이 없습니다. 다섯 검사는 차례로 실행되므로 **검사끼리는 읽은 시점이 다를 수 있습니다**(응답 전체가 한 시점의 스냅샷은 아님). 격리 수준은 따로 지정하지 않습니다(Hikari의 READ COMMITTED).
 - 읽기 전용 트랜잭션으로 실행합니다. timeout은 거래 처리(3초)와 별도로 `travelpay.ledger.integrity.timeout-seconds`(기본 30)이고, 넘으면 503 `COMMON_SERVICE_UNAVAILABLE`입니다. 위반 최대 건수는 `travelpay.ledger.integrity.violation-limit`(기본 100)입니다.
 - **동시 실행**: 검사 트랜잭션 안에서 `pg_try_advisory_xact_lock(1279608903, 1)`(정수 두 개 형태, `0x4C454447`="LEDG", 1=정합성 검사)을 기다리지 않고 시도합니다. 다른 검사가 쥐고 있으면 409 `LEDGER_INTEGRITY_CHECK_IN_PROGRESS`입니다. 트랜잭션이 끝나면(timeout 롤백 포함) 자동으로 풀립니다. Flyway는 bigint 하나 형태의 advisory lock을 쓰고, PostgreSQL에서 bigint 하나 키와 정수 두 개 키는 키 공간이 겹치지 않습니다(PostgreSQL 문서 Advisory Lock Functions).
 - 읽기만 하므로 거래 등록의 계정 잠금을 막지 않습니다. 다만 1·2는 `ledger_entries` 전체를 집계합니다(인덱스로 줄일 수 없음).
@@ -389,6 +512,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 - 시간 대부분은 검사 2(거래별 차대)입니다. 120만 거래에서 (거래, 통화) 묶음이 약 130만 개라 해시 집계가 work_mem(4MB)을 넘어 디스크를 씁니다.
 - 검사 2 개선을 실험했지만 적용하지 않았습니다(`LedgerIntegrityQueryExperimentTest`). 디스크를 없애면(work_mem 192MB) 두 번 측정에서 약 6~9% 빨라졌지만 검사 한 번에 메모리 약 312MB를 써서 운영 RDS 메모리(4GiB)의 약 8%를 차지합니다. 인덱스 순서로 집계하면 약 55% 느려졌습니다. 병렬 비용 힌트는 약 34% 빨랐지만 SQL이 아닌 플래너 설정이고 워커 2개와 임시 파일 약 470MB를 씁니다. 운영 RDS는 vCPU 2개라 다른 서비스 쿼리와 CPU를 나눠 쓰게 되므로 쓰지 않습니다.
 - 실제 흐름 데이터에는 REJECTED 거래가 없어 검사 3은 조작 테스트와 성능 데이터(REJECTED 2%)로만 확인했습니다.
+- 위 숫자는 5번 검사를 추가하기 전(검사 네 개) 측정입니다. 성능 테스트 리포트에 5번 SQL 시간도 나오게 했지만 아직 다시 측정하지 않았습니다.
 - timeout 30초는 120만 거래 2.1초 대비 약 14배 여유입니다. 검사는 `ledger_entries` 전체를 집계해 커넥션을 수 초 쓸 수 있어(운영 풀 5), 한 번에 하나만 실행합니다.
 - 운영 RDS는 db.t4g.medium(vCPU 2, 버스트형)이고 work_mem·병렬 설정은 기본값입니다(`infra/aws/rds.tf`). 측정 환경(CPU 32)보다 CPU가 작아 시간이 다를 수 있으니, 운영에서 처음 실행할 때 시간을 확인합니다.
 
@@ -401,6 +525,11 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | `CHARGE_SOURCE` | KRW | V3 | 충전의 차변(충전금 출처) |
 | `FX_POSITION` | KRW·JPY·CNY | V4 | 환전 회사 통화 보유분 |
 | `FEE_REVENUE` | KRW·JPY·CNY | V4 | 환전 수수료 수익 |
+| `RECEIVABLE` | KRW | V8 | 미수. [충전 취소 분개](#충전-취소-분개)에서 지갑 잔액으로 회수하지 못한 부족분의 차변 |
+
+- **`RECEIVABLE` 잔액이 음수로 보이는 이유**: 원장 계정은 종류와 관계없이 CREDIT이 잔액 증가, DEBIT이 감소입니다. 미수는 부족분을 DEBIT으로 기록하므로 받을 돈이 쌓일수록 잔액이 음수로 커집니다(미수 8만 = 잔액 −8만). `USER` 계정은 음수가 금지(`ck_ledger_accounts_user_balance`)라 회원별 계정이 아니라 `SYSTEM` 계정 하나에 둡니다. 회원별 미수는 취소 분개 거래(`userId`, 지갑 항목)로 찾습니다.
+- 충전은 KRW뿐이라 `RECEIVABLE`도 KRW만 시드합니다.
+- 거래 등록 API로는 `RECEIVABLE`을 지정할 수 없습니다([400](#충전-취소-분개-전용-값은-400)).
 
 `MERCHANT_SETTLEMENT`는 허용 값에만 있고 시드된 계정은 없습니다.
 
@@ -417,11 +546,12 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 400 | `LEDGER_INVALID_CURSOR` | 풀 수 없거나 위치가 기간 밖인 커서 |
 | 400 | `LEDGER_CURSOR_MISMATCH` | 커서의 조건과 요청 조건이 다름 |
 | 404 | `LEDGER_ACCOUNT_NOT_FOUND` | 지갑 계정 조회에서 계정 없음 |
-| 404 | `LEDGER_TRANSACTION_NOT_FOUND` | reference의 거래 없음 |
+| 404 | `LEDGER_TRANSACTION_NOT_FOUND` | reference의 거래 없음. 충전 취소 분개에서는 원거래 `(CHARGE, chargeId)` 없음 |
 | 409 | `LEDGER_REFERENCE_CONFLICT` | 같은 reference로 다른 내용의 거래가 이미 있음 |
 | 409 | `LEDGER_INTEGRITY_CHECK_IN_PROGRESS` | 다른 정합성 검사가 실행 중(기다리지 않음) |
 | 422 | `LEDGER_REJECTED_INSUFFICIENT_BALANCE` | `USER` 계정 잔액 부족 거절 |
-| 422 | `LEDGER_REJECTED_WALLET_SUSPENDED` | 항목 계정 중 `ACTIVE`가 아닌 계정이 있어 거절 |
+| 422 | `LEDGER_REJECTED_WALLET_SUSPENDED` | 항목 계정 중 `ACTIVE`가 아닌 계정이 있어 거절. 충전 취소 분개에서는 지갑·`CHARGE_SOURCE`·`RECEIVABLE` 중 하나(행 저장 없음) |
+| 422 | `LEDGER_ORIGINAL_NOT_REVERSIBLE` | 충전 취소 분개의 원거래가 `POSTED`가 아니거나 충전 항목 구조가 아님(행 저장 없음) |
 | 422 | `LEDGER_REJECTED_ACCOUNT_NOT_FOUND` | 항목 계정이 없어 거절 |
 | 422 | `LEDGER_REJECTED_CANCELLED_BY_REQUESTER` | 취소 기록이 있는 reference에 같은 요청 해시로 등록. 취소 해시는 등록 해시와 달라 실제로는 409가 됨 |
 | 500 | `COMMON_INTERNAL_SERVER_ERROR` | 예상하지 못한 오류 |
@@ -440,7 +570,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 |---|---|---|
 | `ledger_accounts` | 계정과 현재 잔액 | `ck_ledger_accounts_user_balance`(USER 잔액 ≥ 0), USER는 `wallet_id` 필수·SYSTEM은 NULL, 통화·유형·상태 CHECK, `uk_ledger_accounts_id_currency(id, currency)`(항목 FK 대상) |
 | `ledger_transactions` | 거래(사건) | `uk_ledger_transactions_reference(reference_type, reference_id)` 멱등 키, `REJECTED`일 때만 `reject_reason`, `original_transaction_id` 자기 참조 FK, `request_hash` 64자 |
-| `ledger_entries` | 거래 항목(계정별 증감) | `amount > 0`, `direction` CHECK, `fk_ledger_entries_account(account_id, currency)`로 항목 통화 = 계정 통화 강제, `ck_ledger_entries_entry_type`(V5) |
+| `ledger_entries` | 거래 항목(계정별 증감) | `amount > 0`, `direction` CHECK, `fk_ledger_entries_account(account_id, currency)`로 항목 통화 = 계정 통화 강제, `ck_ledger_entries_entry_type`(V5, V7·V8에서 값 추가) |
 
 | 인덱스 | 내용 |
 |---|---|
@@ -461,6 +591,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | `V5__add_entry_type_check.sql` | entry_type 11개 CHECK(`NOT VALID`) |
 | `V6__add_ledger_transactions_reference_created_index.sql` (+ `.sql.conf`) | 기간 목록 인덱스(`CONCURRENTLY`) |
 | `V7__add_settlement_types.sql` | `referenceType`에 `SETTLEMENT`, entry_type에 `SETTLEMENT_OUT`·`SETTLEMENT_IN` 추가(entry_type은 `NOT VALID` 유지) |
+| `V8__add_charge_reversal_types.sql` | `referenceType`에 `CHARGE_REVERSAL`, entry_type에 `CHARGE_REVERSAL_OUT`·`CHARGE_REVERSAL_IN`·`CHARGE_REVERSAL_RECEIVABLE`(`NOT VALID` 유지), account_type에 `RECEIVABLE` 추가, `RECEIVABLE` KRW 시스템 계정 시드 |
 
 ### 기록은 INSERT만
 
@@ -471,7 +602,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 ### V5 `NOT VALID`
 
 - 팀원 로컬 DB에 이름 변경 전 entry_type 값이 남아 있을 수 있어 `NOT VALID`로 추가했습니다. 새로 들어오는 행만 검사하고 기존 행은 검사하지 않습니다. 같은 이유로 앱은 `entryType`을 enum이 아니라 문자열로 저장·조회합니다(옛 값이 남은 행도 읽을 수 있게).
-- V7에서 정산 값을 추가할 때도 같은 이유로 `NOT VALID`를 유지했습니다. `referenceType` CHECK는 기존 제약이 이미 검증된 상태이고 새 목록이 기존 값을 모두 포함하므로 검증된 제약으로 다시 만들었습니다.
+- V7에서 정산 값, V8에서 충전 취소 분개 값을 추가할 때도 같은 이유로 `NOT VALID`를 유지했습니다(V8의 `referenceType`·`account_type` CHECK는 V7의 `referenceType`과 같은 이유로 검증된 제약). `referenceType` CHECK는 기존 제약이 이미 검증된 상태이고 새 목록이 기존 값을 모두 포함하므로 검증된 제약으로 다시 만들었습니다.
 
 ### V6 `CONCURRENTLY`
 
@@ -491,8 +622,8 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 ./gradlew :ledger-service:test
 ```
 
-- `LedgerRequestHasherTest`는 DB 없이 실행됩니다.
-- DB 통합 테스트(`LedgerEntryTypeIntegrationTest`, `LedgerTransactionQueryIntegrationTest`, `LedgerTransactionPeriodIntegrationTest`, `LedgerSameReferenceIntegrationTest`, `LedgerOppositeTransferIntegrationTest`, `LedgerDatabaseFailureIntegrationTest`, `LedgerCancelIntegrationTest`, `LedgerIntegrityCheckIntegrationTest`, `LedgerIntegrityTamperIntegrationTest`, `ConnectionIsolationIntegrationTest`)는 Testcontainers로 PostgreSQL 컨테이너(`postgres:18.6-bookworm`)를 띄우고 Flyway를 적용해 실행합니다. `.env`나 로컬 compose DB는 필요 없고 Docker만 실행 중이면 됩니다. Docker가 없으면 건너뜁니다(통과가 아님).
+- `LedgerRequestHasherTest`, `TransactionCommandValidatorTest`는 DB 없이 실행됩니다.
+- DB 통합 테스트(`LedgerEntryTypeIntegrationTest`, `LedgerTransactionQueryIntegrationTest`, `LedgerTransactionPeriodIntegrationTest`, `LedgerSameReferenceIntegrationTest`, `LedgerOppositeTransferIntegrationTest`, `LedgerDatabaseFailureIntegrationTest`, `LedgerCancelIntegrationTest`, `LedgerChargeReversalIntegrationTest`, `LedgerIntegrityCheckIntegrationTest`, `LedgerIntegrityTamperIntegrationTest`, `ConnectionIsolationIntegrationTest`)는 Testcontainers로 PostgreSQL 컨테이너(`postgres:18.6-bookworm`)를 띄우고 Flyway를 적용해 실행합니다. `.env`나 로컬 compose DB는 필요 없고 Docker만 실행 중이면 됩니다. Docker가 없으면 건너뜁니다(통과가 아님).
 
 ### 성능 측정
 
@@ -501,7 +632,7 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 ```
 
 - `@Tag("performance")` 테스트(`LedgerTransactionPeriodPerformanceTest`, `LedgerIntegrityCheckPerformanceTest`, `LedgerIntegrityQueryExperimentTest`)는 기본 `test`에서 빠지고 이 태스크로만 실행됩니다. 하나만 돌리려면 `--tests`로 클래스를 지정합니다(태그가 붙은 테스트를 모두 실행하므로).
-- `LedgerIntegrityCheckPerformanceTest`는 규모(1만·10만·120만 거래)마다 위와 같은 방식으로 데이터를 만듭니다. 여기에 REJECTED 거래 2%(PAYMENT 자리)를 넣고 계정 잔액을 POSTED 항목 합으로 맞춘 뒤, API 위반 0(오탐 없음)을 확인합니다. 그다음 검사 SQL 네 개의 실행 시간(5회 중앙값)과 디스크 사용 여부, API 응답 시간을 측정합니다. 1만 규모에서 회원 0의 KRW 순합계가 음수가 되지 않도록 송금 상대를 활동 회원 안에서 고릅니다(10만·120만은 원래와 같음).
+- `LedgerIntegrityCheckPerformanceTest`는 규모(1만·10만·120만 거래)마다 위와 같은 방식으로 데이터를 만듭니다. 여기에 REJECTED 거래 2%(PAYMENT 자리)를 넣고 계정 잔액을 POSTED 항목 합으로 맞춘 뒤, API 위반 0(오탐 없음)을 확인합니다. 그다음 검사 SQL 다섯 개의 실행 시간(5회 중앙값)과 디스크 사용 여부, API 응답 시간을 측정합니다. 1만 규모에서 회원 0의 KRW 순합계가 음수가 되지 않도록 송금 상대를 활동 회원 안에서 고릅니다(10만·120만은 원래와 같음).
 - `LedgerIntegrityQueryExperimentTest`는 검사 2 SQL의 대안(집계 먼저, 정렬 입력, work_mem, 병렬 비용 힌트)을 120만 거래에서 교차 실행해 비교한 기록입니다. 데이터 생성은 `LedgerIntegrityCheckPerformanceTest`에서 복사했습니다. 결론은 위 [측정 결과](#측정-결과-2026-11-15)에 있습니다.
 - `LedgerTransactionPeriodPerformanceTest`는 기간 목록의 V6 인덱스 전후를 측정합니다. Flyway를 V5까지만 적용한 뒤 규모(1만·10만·120만 거래)마다 데이터를 만들고 인덱스 없이 측정 → V6 실행 → 다시 측정합니다. 결과는 표준 출력의 `===== PERF REPORT =====` 구간에 나옵니다.
 - 대량 데이터를 만들어 기본 테스트보다 오래 걸립니다. 매번 다시 실행됩니다(`upToDateWhen false`).
@@ -513,7 +644,8 @@ reference(`referenceType` + `referenceId`)가 원장의 멱등 키입니다. 헤
 | 항목 | 현재 동작 | 정할 것 |
 |---|---|---|
 | V5 CHECK 검증 | `NOT VALID`라 기존 행은 검사하지 않음 | 모든 환경의 옛 값 정리 후 `ALTER TABLE … VALIDATE CONSTRAINT ck_ledger_entries_entry_type` 마이그레이션 추가 시점 |
-| 취소·되돌림 분개 | `originalTransactionId`와 원거래 존재 검사만 있음. 되돌림용 entry_type 없음 | 완료된 송금 등의 취소 분개(referenceType·entryType, 원거래 연결) |
+| 취소·되돌림 분개 | 충전은 구현([충전 취소 분개](#충전-취소-분개), 정합성 검사 5번). 다른 거래 유형은 `originalTransactionId`와 원거래 존재 검사만 있고 되돌림용 entry_type 없음 | 완료된 송금 등 다른 거래 유형의 취소 분개(referenceType·entryType, 원거래 연결) |
+| 미수 회수 | 충전 취소 분개가 `RECEIVABLE`에 부족분을 남기기만 하고, 받아 내는 절차·API 없음 | 회수 분개(회원 지갑 → `RECEIVABLE`), 미수 통제계정 검사(`RECEIVABLE` 잔액 = 취소 분개 미수 합 − 회수 합), 회수 초과 검사(거래별 회수 합 ≤ 미수) |
 | referenceType별 추가 검증 | 없음(코드 TODO) | 환불의 원거래 상태·중복·금액 등 유형별 정책. 해당 도메인 담당이 추가 |
 | `MERCHANT` 계정 지정 | 요청에 쓰면 400. 가맹점은 `USER` + 가맹점 ID 지갑 계정 사용 | 가맹점 계정 지정 방식 |
 | `CHARGE_SOURCE` 잠금 | 모든 충전이 같은 계정을 잠금(핫 계정). 충전 동시성 3(초당 약 200건)에서 원장 잠금 대기 평균 0.03으로 측정 범위에서는 병목이 아니었음(지갑 부하 측정 README 2026-11-10) | 목표 처리량이 정해지면 배포 구성에서 다시 측정 |

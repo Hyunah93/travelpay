@@ -54,8 +54,10 @@ class LedgerIntegrityTamperIntegrationTest {
     private static final String POSTED_BALANCE = "postedTransactionBalance";
     private static final String REJECTED_ENTRIES = "rejectedTransactionEntries";
     private static final String CURRENCY_TOTAL = "currencyTotal";
+    private static final String CHARGE_REVERSAL = "chargeReversalStructure";
     private static final List<String> CHECKS = List.of(ACCOUNT_BALANCE, POSTED_BALANCE, REJECTED_ENTRIES,
-            CURRENCY_TOTAL);
+            CURRENCY_TOTAL, CHARGE_REVERSAL);
+    private static final String CHARGE_REVERSALS = LedgerTestClient.TRANSACTIONS + "/charge-reversals";
 
     @Container
     static final PostgreSQLContainer POSTGRES = new PostgreSQLContainer("postgres:18.6-bookworm")
@@ -200,9 +202,120 @@ class LedgerIntegrityTamperIntegrationTest {
         assertEquals(3 + 1, data.get("totalViolationCount").asLong());
     }
 
+    // ---- 5. 충전 취소 분개 구조 (1~4번은 통과하도록 잔액까지 맞춰 조작) ----
+
+    @Test
+    void 원거래_10만에_취소_분개를_8만으로_맞추면_5번에만_걸린다() throws Exception {
+        UUID walletC = client.openWallet();
+        UUID chargeId = UUID.randomUUID();
+        realCharge(chargeId, walletC, 100_000);
+        assertEquals(201, client.register(transferBody(UUID.randomUUID(), walletC, walletB, 50_000)).statusCode());
+        UUID reversal = reverse(chargeId);
+        // 정상: OUT 5만 + RECEIVABLE 5만 = IN 10만 → 조작: RECEIVABLE 3만, IN 8만 (차대 일치, 잔액도 맞춤)
+        jdbcTemplate.update("UPDATE ledger_entries SET amount = 30000 WHERE transaction_id = ?"
+                + " AND entry_type = 'CHARGE_REVERSAL_RECEIVABLE'", reversal);
+        jdbcTemplate.update("UPDATE ledger_entries SET amount = 80000 WHERE transaction_id = ?"
+                + " AND entry_type = 'CHARGE_REVERSAL_IN'", reversal);
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance + 20000 WHERE id = ?",
+                systemAccount("RECEIVABLE", "KRW"));
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance - 20000 WHERE id = ?",
+                systemAccount("CHARGE_SOURCE", "KRW"));
+
+        JsonNode data = check();
+
+        assertEquals(Set.of(CHARGE_REVERSAL), violatedChecks(data), data.toString());
+        assertEquals(List.of(reversal + "/REVERSAL_IN_MISMATCH"), reversalViolations(data));
+        assertEquals(1, data.get(CHARGE_REVERSAL).get("checkedCount").asLong());
+    }
+
+    @Test
+    void 원거래_연결이_다른_충전을_가리키면_5번에만_걸린다() throws Exception {
+        UUID walletC = client.openWallet();
+        UUID walletD = client.openWallet();
+        UUID chargeId = UUID.randomUUID();
+        realCharge(chargeId, walletC, 20_000);
+        UUID otherCharge = realCharge(UUID.randomUUID(), walletD, 20_000);
+        UUID reversal = reverse(chargeId);
+        jdbcTemplate.update("UPDATE ledger_transactions SET original_transaction_id = ? WHERE id = ?",
+                otherCharge, reversal);
+
+        JsonNode data = check();
+
+        assertEquals(Set.of(CHARGE_REVERSAL), violatedChecks(data), data.toString());
+        // 가리킨 충전의 지갑이 회수 지갑과 달라 WALLET_MISMATCH도 함께 나온다 (금액은 같아 REVERSAL_IN은 통과)
+        assertEquals(List.of(reversal + "/ORIGINAL_MISMATCH", reversal + "/WALLET_MISMATCH"),
+                reversalViolations(data));
+    }
+
+    @Test
+    void 지갑_회수_항목이_다른_지갑이면_5번에만_걸린다() throws Exception {
+        UUID walletC = client.openWallet();
+        UUID chargeId = UUID.randomUUID();
+        realCharge(chargeId, walletC, 20_000);
+        UUID reversal = reverse(chargeId);
+        // 회수 항목을 walletA(잔액 33,000)로 옮기고 두 지갑 잔액을 맞춘다
+        UUID walletAAccount = walletAccount(walletA, "KRW");
+        jdbcTemplate.update("UPDATE ledger_entries SET account_id = ? WHERE transaction_id = ?"
+                + " AND entry_type = 'CHARGE_REVERSAL_OUT'", walletAAccount, reversal);
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance + 20000 WHERE id = ?",
+                walletAccount(walletC, "KRW"));
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance - 20000 WHERE id = ?", walletAAccount);
+
+        JsonNode data = check();
+
+        assertEquals(Set.of(CHARGE_REVERSAL), violatedChecks(data), data.toString());
+        assertEquals(List.of(reversal + "/WALLET_MISMATCH"), reversalViolations(data));
+    }
+
+    @Test
+    void 미수_계정에_취소_분개가_아닌_항목이_있으면_5번에만_걸린다() {
+        UUID receivable = systemAccount("RECEIVABLE", "KRW");
+        UUID chargeSource = systemAccount("CHARGE_SOURCE", "KRW");
+        // POSTED 송금에 RECEIVABLE DEBIT + CHARGE_SOURCE CREDIT 한 쌍을 넣고 잔액도 맞춘다 (차대·잔액 검사 통과)
+        jdbcTemplate.update("""
+                INSERT INTO ledger_entries
+                    (id, transaction_id, account_id, currency, entry_type, direction, amount, balance_after)
+                VALUES (gen_random_uuid(), ?, ?, 'KRW', 'TRANSFER_OUT', 'DEBIT', 100, 0),
+                       (gen_random_uuid(), ?, ?, 'KRW', 'TRANSFER_IN', 'CREDIT', 100, 0)
+                """, transferTx, receivable, transferTx, chargeSource);
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance - 100 WHERE id = ?", receivable);
+        jdbcTemplate.update("UPDATE ledger_accounts SET balance = balance + 100 WHERE id = ?", chargeSource);
+
+        JsonNode data = check();
+
+        assertEquals(Set.of(CHARGE_REVERSAL), violatedChecks(data), data.toString());
+        assertEquals(List.of(transferTx + "/RECEIVABLE_OUTSIDE_REVERSAL"), reversalViolations(data));
+        assertEquals(0, data.get(CHARGE_REVERSAL).get("checkedCount").asLong());
+    }
+
     // ---- 도구 ----
 
     private record Entry(UUID id, UUID accountId) {
+    }
+
+    /** 실제 충전 요청과 같은 구조(충전 원천 DEBIT CHARGE_OUT + 지갑 CREDIT CHARGE_IN). 거래 ID를 돌려준다 */
+    private UUID realCharge(UUID chargeId, UUID walletId, long amount) throws Exception {
+        return registered(LedgerTestClient.body("CHARGE", chargeId, List.of(
+                LedgerTestClient.system("CHARGE_SOURCE", "KRW", "DEBIT", amount, "CHARGE_OUT"),
+                LedgerTestClient.user(walletId, "KRW", "CREDIT", amount, "CHARGE_IN"))));
+    }
+
+    /** 충전 취소 분개 API로 기록하고 거래 ID를 돌려준다. 조작 전 검사가 위반 0인지도 확인한다 */
+    private UUID reverse(UUID chargeId) throws Exception {
+        HttpResponse<String> response = client.post(CHARGE_REVERSALS,
+                jsonMapper.writeValueAsString(Map.of("chargeId", chargeId.toString())));
+        assertEquals(201, response.statusCode(), response.body());
+        JsonNode before = check();
+        assertEquals(Set.of(), violatedChecks(before), "조작 전에는 위반이 없어야 함: " + before);
+        return UUID.fromString(client.data(response).get("transactionId").asString());
+    }
+
+    /** 5번 위반을 "거래ID/이유"로 (응답 순서 = transaction_id, reason 순) */
+    private static List<String> reversalViolations(JsonNode data) {
+        List<String> violations = new ArrayList<>();
+        data.get(CHARGE_REVERSAL).get("violations").forEach(v ->
+                violations.add(v.get("transactionId").asString() + "/" + v.get("reason").asString()));
+        return violations;
     }
 
     private JsonNode check() {

@@ -21,6 +21,7 @@ final class LedgerRequestHasher {
 
     private static final String VERSION = "v1";
     private static final String CANCEL_VERSION = "cancel-v1";
+    private static final String CHARGE_REVERSAL_VERSION = "charge-reversal-v1";
 
     private LedgerRequestHasher() {
     }
@@ -31,6 +32,14 @@ final class LedgerRequestHasher {
      */
     static String hashCancel(ReferenceType referenceType, UUID referenceId) {
         return sha256(CANCEL_VERSION + token(referenceType) + token(referenceId));
+    }
+
+    /**
+     * 충전 취소 분개의 요청 해시. 항목이 아니라 (CHARGE_REVERSAL, chargeId)로 만든다.
+     * 금액이 잠근 뒤의 지갑 잔액으로 정해져 재요청마다 달라질 수 있기 때문. 접두어가 달라 등록·취소 해시와 겹치지 않는다
+     */
+    static String hashChargeReversal(UUID chargeId) {
+        return sha256(CHARGE_REVERSAL_VERSION + token(ReferenceType.CHARGE_REVERSAL) + token(chargeId));
     }
 
     static String hash(RegisterTransactionCommand command) {
