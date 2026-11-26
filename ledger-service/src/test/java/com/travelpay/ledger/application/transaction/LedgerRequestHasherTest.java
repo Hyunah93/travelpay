@@ -156,7 +156,7 @@ class LedgerRequestHasherTest {
         assertEquals(LedgerRequestHasher.hash(stringCommand), LedgerRequestHasher.hash(request.toCommand()));
     }
 
-    /** enum의 name()에 기대지 않고 V5 CHECK에 적힌 문자열 그대로 */
+    /** enum의 name()에 기대지 않고 V5·V7·V8 CHECK에 적힌 문자열 그대로 */
     private static String literal(EntryType entryType) {
         return switch (entryType) {
             case CHARGE_OUT -> "CHARGE_OUT";
@@ -172,6 +172,9 @@ class LedgerRequestHasherTest {
             case TRANSFER_IN -> "TRANSFER_IN";
             case SETTLEMENT_OUT -> "SETTLEMENT_OUT";
             case SETTLEMENT_IN -> "SETTLEMENT_IN";
+            case CHARGE_REVERSAL_OUT -> "CHARGE_REVERSAL_OUT";
+            case CHARGE_REVERSAL_IN -> "CHARGE_REVERSAL_IN";
+            case CHARGE_REVERSAL_RECEIVABLE -> "CHARGE_REVERSAL_RECEIVABLE";
         };
     }
 }

@@ -4,8 +4,10 @@ import com.travelpay.common.error.BusinessException;
 import com.travelpay.common.error.CommonErrorCode;
 import com.travelpay.ledger.application.transaction.dto.RegisterTransactionCommand;
 import com.travelpay.ledger.domain.Currency;
+import com.travelpay.ledger.domain.account.AccountType;
 import com.travelpay.ledger.domain.transaction.Direction;
 import com.travelpay.ledger.domain.transaction.EntryType;
+import com.travelpay.ledger.domain.transaction.ReferenceType;
 
 import java.util.Arrays;
 import java.util.EnumMap;
@@ -21,8 +23,17 @@ final class TransactionCommandValidator {
 
     private static final int MIN_ENTRIES = 2;
     private static final int MAX_ENTRIES = 20;
-    /** V5 CHECK와 같은 값. 허용 밖 값이 DB CHECK(500)까지 내려가지 않게 미리 거절한다 */
+    /**
+     * 충전 취소 분개 API만 기록하는 항목 유형. 거래 등록 API로 미수 계정에 임의 금액을 기록하지 못하게 거절한다
+     */
+    private static final Set<EntryType> CHARGE_REVERSAL_ENTRY_TYPES = Set.of(
+            EntryType.CHARGE_REVERSAL_OUT, EntryType.CHARGE_REVERSAL_IN, EntryType.CHARGE_REVERSAL_RECEIVABLE);
+    /**
+     * 거래 등록 API가 받는 항목 유형. CHECK 값 중 충전 취소 분개 전용 값을 뺀 것.
+     * 허용 밖 값이 DB CHECK(500)까지 내려가지 않게 미리 거절한다
+     */
     private static final Set<String> ENTRY_TYPES = Arrays.stream(EntryType.values())
+            .filter(entryType -> !CHARGE_REVERSAL_ENTRY_TYPES.contains(entryType))
             .map(Enum::name)
             .collect(Collectors.toUnmodifiableSet());
 
@@ -30,7 +41,9 @@ final class TransactionCommandValidator {
     }
 
     static void validate(RegisterTransactionCommand command) {
-        if (command.referenceType() == null || command.referenceId() == null
+        // CHARGE_REVERSAL은 충전 취소 분개 API만 기록한다
+        if (command.referenceType() == null || command.referenceType() == ReferenceType.CHARGE_REVERSAL
+                || command.referenceId() == null
                 || command.entries().size() < MIN_ENTRIES || command.entries().size() > MAX_ENTRIES) {
             throw invalid();
         }
@@ -54,7 +67,9 @@ final class TransactionCommandValidator {
         }
         boolean validAccount = switch (entry.ownerType()) {
             case USER -> entry.walletId() != null && entry.accountType() == null;
-            case SYSTEM -> entry.walletId() == null && entry.accountType() != null;
+            // 미수(RECEIVABLE)는 충전 취소 분개 API만 기록한다
+            case SYSTEM -> entry.walletId() == null && entry.accountType() != null
+                    && entry.accountType() != AccountType.RECEIVABLE;
             // 가맹점 계정 지정 방식은 MVP 이후 결정
             case MERCHANT -> false;
         };

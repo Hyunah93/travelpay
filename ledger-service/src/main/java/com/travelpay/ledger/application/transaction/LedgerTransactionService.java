@@ -67,7 +67,9 @@ public class LedgerTransactionService {
      */
     public CancelTransactionResult cancel(CancelTransactionCommand command) {
         Objects.requireNonNull(command, "command");
-        if (command.referenceType() == null || command.referenceId() == null) {
+        // CHARGE_REVERSAL은 충전 취소 분개 API만 기록한다. 취소 기록으로 그 reference를 차지하지 못하게 거절한다
+        if (command.referenceType() == null || command.referenceType() == ReferenceType.CHARGE_REVERSAL
+                || command.referenceId() == null) {
             throw new BusinessException(CommonErrorCode.INVALID_REQUEST);
         }
         String requestHash = LedgerRequestHasher.hashCancel(command.referenceType(), command.referenceId());

@@ -40,7 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 실제 Postgres(Flyway V1~V5)와 실제 HTTP로 거래 항목 유형(entryType) 검증을 확인한다.
+ * 실제 Postgres(Flyway V1~V8)와 실제 HTTP로 거래 항목 유형(entryType) 검증을 확인한다.
  * 테스트마다 새 지갑·새 referenceId를 쓰고 해당 거래·지갑 값만 확인하므로 실행 순서와 무관하다.
  * Docker가 없으면 건너뛴다.
  */
@@ -83,8 +83,11 @@ class LedgerEntryTypeIntegrationTest {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
+    /** 충전 취소 분개 전용 항목 유형은 거래 등록 API에서 거절하므로 제외한다 (아래 400 테스트에서 확인) */
     @ParameterizedTest
-    @EnumSource(EntryType.class)
+    @EnumSource(value = EntryType.class,
+            names = {"CHARGE_REVERSAL_OUT", "CHARGE_REVERSAL_IN", "CHARGE_REVERSAL_RECEIVABLE"},
+            mode = EnumSource.Mode.EXCLUDE)
     void 합의한_항목_유형은_모두_등록된다(EntryType entryType) throws Exception {
         UUID walletId = openWallet();
         UUID referenceId = UUID.randomUUID();
@@ -195,6 +198,81 @@ class LedgerEntryTypeIntegrationTest {
         assertEquals(balanceBefore, walletBalance(walletId));
     }
 
+    // ---- 충전 취소 분개 전용 값 (충전 취소 분개 API만 기록) ----
+
+    @ParameterizedTest
+    @EnumSource(value = EntryType.class,
+            names = {"CHARGE_REVERSAL_OUT", "CHARGE_REVERSAL_IN", "CHARGE_REVERSAL_RECEIVABLE"})
+    void 충전_취소_분개_항목_유형은_거래_등록_API에서_400이고_아무것도_기록하지_않는다(EntryType entryType)
+            throws Exception {
+        UUID walletId = openWallet();
+        UUID referenceId = UUID.randomUUID();
+        long balanceBefore = walletBalance(walletId);
+
+        HttpResponse<String> response = register(referenceId, walletId, entryType.name());
+
+        assertInvalidAndNothingRecorded(response, referenceId);
+        assertEquals(0, allTransactionCountOf(referenceId));
+        assertEquals(balanceBefore, walletBalance(walletId));
+    }
+
+    @Test
+    void CHARGE_REVERSAL_참조_유형은_거래_등록_API에서_400이고_아무것도_기록하지_않는다() throws Exception {
+        UUID walletId = openWallet();
+        UUID referenceId = UUID.randomUUID();
+        long balanceBefore = walletBalance(walletId);
+
+        HttpResponse<String> response = registerRaw(referenceId, walletId,
+                Map.of("referenceType", quoted("CHARGE_REVERSAL")));
+
+        assertInvalidAndNothingRecorded(response, referenceId);
+        assertEquals(0, allTransactionCountOf(referenceId));
+        assertEquals(balanceBefore, walletBalance(walletId));
+    }
+
+    @Test
+    void RECEIVABLE_계정_지정은_거래_등록_API에서_400이고_미수_잔액이_그대로다() throws Exception {
+        UUID walletId = openWallet();
+        UUID referenceId = UUID.randomUUID();
+        long balanceBefore = walletBalance(walletId);
+        long receivableBefore = receivableBalance();
+
+        HttpResponse<String> response = registerRaw(referenceId, walletId,
+                Map.of("accountType", quoted("RECEIVABLE")));
+
+        assertInvalidAndNothingRecorded(response, referenceId);
+        assertEquals(0, allTransactionCountOf(referenceId));
+        assertEquals(balanceBefore, walletBalance(walletId));
+        assertEquals(receivableBefore, receivableBalance());
+    }
+
+    @Test
+    void CHARGE_REVERSAL_참조_유형은_취소_API에서_400이고_아무것도_기록하지_않는다() throws Exception {
+        UUID referenceId = UUID.randomUUID();
+
+        HttpResponse<String> response = post("/internal/v1/ledger/transactions/cancel",
+                jsonMapper.writeValueAsString(Map.of("referenceType", "CHARGE_REVERSAL",
+                        "referenceId", referenceId.toString())));
+
+        assertEquals(400, response.statusCode(), response.body());
+        JsonNode body = jsonMapper.readTree(response.body());
+        assertEquals("COMMON_INVALID_REQUEST", body.get("error").get("code").asString());
+        assertEquals(0, allTransactionCountOf(referenceId));
+    }
+
+    @Test
+    void V8_미수_시스템_계정은_KRW_하나이고_잔액_0_ACTIVE다() {
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
+                SELECT balance, status FROM ledger_accounts
+                WHERE owner_type = 'SYSTEM' AND account_type = 'RECEIVABLE' AND currency = 'KRW'
+                  AND wallet_id IS NULL
+                """);
+
+        assertEquals(1, rows.size());
+        assertEquals(0L, ((Number) rows.getFirst().get("balance")).longValue());
+        assertEquals("ACTIVE", rows.getFirst().get("status"));
+    }
+
     private UUID openWallet() throws Exception {
         UUID walletId = UUID.randomUUID();
         HttpResponse<String> response = post("/internal/v1/ledger/accounts",
@@ -261,6 +339,18 @@ class LedgerEntryTypeIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM ledger_transactions WHERE reference_type = 'CHARGE' AND reference_id = ?",
                 Integer.class, referenceId);
+    }
+
+    /** 참조 유형과 상관없이 referenceId로 기록된 거래 수 */
+    private int allTransactionCountOf(UUID referenceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM ledger_transactions WHERE reference_id = ?", Integer.class, referenceId);
+    }
+
+    private long receivableBalance() {
+        return jdbcTemplate.queryForObject(
+                "SELECT balance FROM ledger_accounts WHERE owner_type = 'SYSTEM' AND account_type = 'RECEIVABLE' AND currency = 'KRW'",
+                Long.class);
     }
 
     private List<String> entryTypesOf(UUID referenceId) {

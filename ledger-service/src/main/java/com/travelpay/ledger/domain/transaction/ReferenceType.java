@@ -6,5 +6,6 @@ public enum ReferenceType {
     PAYMENT_REFUND,
     TRANSFER,
     EXCHANGE,
-    SETTLEMENT
+    SETTLEMENT,
+    CHARGE_REVERSAL
 }
