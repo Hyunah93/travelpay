@@ -500,7 +500,7 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 ### 한계
 
 - `PARTIAL` 실행도 진행 위치를 넘기므로, `SOURCE_UNAVAILABLE`로 보류된 충전은 자동으로 다시 확인하지 않습니다. 기간을 지정한 수동 실행(재대사)으로 다시 봅니다.
-- 취소 분개는 생성된 기간의 실행에서만 목록으로 찾습니다. 그 뒤 다른 기간에 같은 충전이 다른 기록으로 다시 후보가 되면 취소 분개는 "없음"으로 보고 `CREDIT_AND_REFUND_BOTH`가 다시 남을 수 있습니다.
+- 취소 분개는 생성된 기간의 실행에서 목록으로 찾습니다. 그 뒤 다른 기간에 같은 충전이 다른 기록(예: 은행 환불 기록)으로 다시 후보가 되면, 이중 지급 사실(원장 적립 `POSTED` + 은행 환불 `SUCCEEDED`)이 있을 때만 `(CHARGE_REVERSAL, chargeId)`를 단건 조회합니다. 찾으면 목록과 같은 규칙으로 판정하고, 404 `LEDGER_TRANSACTION_NOT_FOUND`면 `CREDIT_AND_REFUND_BOTH`, 그 밖의 조회 실패면 `SOURCE_UNAVAILABLE`(실행 `PARTIAL`)입니다. 이중 지급 사실이 없는 충전은 단건 조회하지 않습니다.
 
 ## 충전 내역 조회
 
@@ -670,6 +670,11 @@ Mock Bank 동작(POST에 `Mock-Fault` 헤더가 있을 때, 처리·커밋이 �
 | 파일 | 내용 |
 |---|---|
 | `V1__create_wallet_tables.sql` | 다섯 테이블, 제약, 인덱스 |
+| `V2__create_reconciliation_tables.sql` | `reconciliation_runs`(상태·기간·종료·건수 CHECK, RUNNING 1개 `ux_reconciliation_runs_running`)·`reconciliation_results`(`run_id` FK, `mismatch_type`·`source_type`·대상 CHECK, 유일 인덱스 `ux_reconciliation_results_charge`·`ux_reconciliation_results_orphan`) 테이블, `ix_charge_requests_created(created_at)` |
+| `V3__add_reconciliation_query_indexes.sql` | 인덱스 `ix_reconciliation_runs_started`·`ix_reconciliation_runs_closed_period_to`(`COMPLETED`·`PARTIAL`)·`ix_reconciliation_results_run_detected` |
+| `V4__add_reconciliation_run_type.sql` | `reconciliation_runs.run_type`(기존 행 `AUTO`, NOT NULL, CHECK `AUTO`·`MANUAL`), `ix_reconciliation_runs_closed_period_to`를 `AUTO` 조건으로 다시 만듦 |
+| `V5__create_charge_resolutions.sql` | `charge_resolutions` 테이블(`idempotency_key` UNIQUE, 충전·대사 결과 FK, action·결과 상태·lookup CHECK), `ix_charge_resolutions_charge`, `charge_status_history.resolution_id`·`reconciliation_results.resolution_id`(FK) 추가, `reconciliation_results` 보정 상태·연결 CHECK |
+| `V6__add_reversal_mismatch_type.sql` | `ck_reconciliation_results_mismatch_type`에 `REVERSAL_MISMATCH` 추가(DROP 후 다시 만듦) |
 
 새 파일은 이미 적용된 파일을 고치지 않고 추가합니다.
 
