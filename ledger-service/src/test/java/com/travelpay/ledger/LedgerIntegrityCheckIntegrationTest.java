@@ -124,7 +124,7 @@ class LedgerIntegrityCheckIntegrationTest {
         assertEquals(0, data.get("totalViolationCount").asLong(), response.body());
         assertTrue(data.hasNonNull("checkedAt"), response.body());
         for (String check : List.of("accountBalance", "postedTransactionBalance", "rejectedTransactionEntries",
-                "currencyTotal")) {
+                "currencyTotal", "chargeReversalStructure")) {
             JsonNode node = data.get(check);
             assertEquals(0, node.get("violationCount").asLong(), check + " " + response.body());
             assertEquals(0, node.get("returnedCount").asInt(), check);
@@ -139,6 +139,9 @@ class LedgerIntegrityCheckIntegrationTest {
         long rejected = count("SELECT count(*) FROM ledger_transactions WHERE status = 'REJECTED'");
         assertTrue(rejected >= 2, "취소·잔액 부족 거절이 REJECTED로 남아야 함: " + rejected);
         assertEquals(rejected, data.get("rejectedTransactionEntries").get("checkedCount").asLong());
+        assertEquals(count("SELECT count(*) FROM ledger_transactions"
+                        + " WHERE reference_type = 'CHARGE_REVERSAL' AND status = 'POSTED'"),
+                data.get("chargeReversalStructure").get("checkedCount").asLong());
     }
 
     // ---- 읽기 전용 트랜잭션의 advisory lock ----

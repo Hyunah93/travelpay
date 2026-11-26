@@ -21,4 +21,10 @@ public interface LedgerIntegrityRepository {
 
     /** 4. 통화별 전체 계정 잔액 합 = 0. 검사 대상은 모든 계정, 위반 단위는 통화 */
     IntegrityCheck<CurrencyTotalViolation> checkCurrencyTotals(int violationLimit);
+
+    /**
+     * 5. 충전 취소 분개 구조(원거래 연결·금액·지갑)와 미수 계정 항목이 취소 분개에만 있음.
+     * 검사 대상은 POSTED CHARGE_REVERSAL 거래, 위반 단위는 (거래, 이유)
+     */
+    IntegrityCheck<ChargeReversalViolation> checkChargeReversalStructure(int violationLimit);
 }

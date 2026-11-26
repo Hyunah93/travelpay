@@ -86,6 +86,95 @@ public final class LedgerIntegritySql {
             LEFT JOIN LATERAL (SELECT * FROM violations ORDER BY currency LIMIT ?) AS v ON true
             """;
 
+    /**
+     * 5. 충전 취소 분개 구조. POSTED CHARGE_REVERSAL 거래마다 원거래 연결·금액·지갑을 확인하고,
+     * 미수(RECEIVABLE) 계정에 취소 분개가 아닌 거래의 항목이 있는지도 함께 찾는다.
+     * 위반 한 건은 (거래, 이유). 한 거래가 여러 이유로 걸리면 이유마다 한 건
+     * <ul>
+     *     <li>ORIGINAL_MISMATCH: original_transaction_id가 POSTED CHARGE 거래가 아니거나 그 reference_id가 chargeId와 다름</li>
+     *     <li>REVERSAL_IN_MISMATCH: CHARGE_SOURCE CREDIT CHARGE_REVERSAL_IN 금액·통화가 원거래 지갑 적립(USER CREDIT CHARGE_IN)과 다름
+     *         (어느 쪽이든 정확히 1항목이 아니어도 위반)</li>
+     *     <li>SPLIT_MISMATCH: 지갑 DEBIT CHARGE_REVERSAL_OUT + RECEIVABLE DEBIT CHARGE_REVERSAL_RECEIVABLE ≠ CHARGE_REVERSAL_IN 금액</li>
+     *     <li>WALLET_MISMATCH: CHARGE_REVERSAL_OUT 항목이 원거래 CHARGE_IN과 다른 계정</li>
+     *     <li>RECEIVABLE_OUTSIDE_REVERSAL: RECEIVABLE 계정 항목이 CHARGE_REVERSAL이 아닌 거래에 있음 (거래 상태 무관)</li>
+     * </ul>
+     * 취소 분개는 reference_type 조건으로 V6 인덱스(reference_type, created_at, id)에서 찾고, 항목은 transaction_id 인덱스,
+     * 미수 계정 항목은 (account_id, created_at) 인덱스로 읽는다. checked_count는 검사한 POSTED CHARGE_REVERSAL 거래 수
+     */
+    public static final String CHARGE_REVERSAL_STRUCTURE = """
+            WITH reversals AS (
+                SELECT r.id, o.id AS original_id,
+                       (o.status = 'POSTED' AND o.reference_type = 'CHARGE'
+                        AND o.reference_id = r.reference_id) IS TRUE AS original_linked
+                FROM ledger_transactions r
+                LEFT JOIN ledger_transactions o ON o.id = r.original_transaction_id
+                WHERE r.reference_type = 'CHARGE_REVERSAL' AND r.status = 'POSTED'
+            ), measured AS (
+                SELECT r.id, r.original_linked,
+                       ci.line_count AS charge_in_lines, ci.amount AS charge_amount,
+                       rv.in_lines, rv.in_amount, rv.in_currency_ok, rv.out_amount, rv.receivable_amount,
+                       rv.out_other_account
+                FROM reversals r
+                JOIN LATERAL (
+                    SELECT count(*) AS line_count, MIN(e.amount) AS amount, MIN(e.currency) AS currency,
+                           (array_agg(e.account_id))[1] AS account_id
+                    FROM ledger_entries e
+                    JOIN ledger_accounts a ON a.id = e.account_id
+                    WHERE e.transaction_id = r.original_id
+                      AND e.entry_type = 'CHARGE_IN' AND e.direction = 'CREDIT' AND a.owner_type = 'USER'
+                ) AS ci ON true
+                JOIN LATERAL (
+                    SELECT count(*) FILTER (WHERE e.entry_type = 'CHARGE_REVERSAL_IN') AS in_lines,
+                           COALESCE(SUM(e.amount) FILTER (
+                               WHERE e.entry_type = 'CHARGE_REVERSAL_IN' AND e.direction = 'CREDIT'
+                                 AND a.owner_type = 'SYSTEM' AND a.account_type = 'CHARGE_SOURCE'), 0) AS in_amount,
+                           bool_and(e.currency = ci.currency)
+                               FILTER (WHERE e.entry_type = 'CHARGE_REVERSAL_IN') AS in_currency_ok,
+                           COALESCE(SUM(e.amount) FILTER (
+                               WHERE e.entry_type = 'CHARGE_REVERSAL_OUT' AND e.direction = 'DEBIT'
+                                 AND a.owner_type = 'USER' AND a.account_type = 'WALLET'), 0) AS out_amount,
+                           COALESCE(SUM(e.amount) FILTER (
+                               WHERE e.entry_type = 'CHARGE_REVERSAL_RECEIVABLE' AND e.direction = 'DEBIT'
+                                 AND a.owner_type = 'SYSTEM' AND a.account_type = 'RECEIVABLE'), 0)
+                               AS receivable_amount,
+                           count(*) FILTER (WHERE e.entry_type = 'CHARGE_REVERSAL_OUT'
+                                              AND e.account_id IS DISTINCT FROM ci.account_id) AS out_other_account
+                    FROM ledger_entries e
+                    JOIN ledger_accounts a ON a.id = e.account_id
+                    WHERE e.transaction_id = r.id
+                ) AS rv ON true
+            ), violations AS (
+                SELECT id AS transaction_id, 'ORIGINAL_MISMATCH' AS reason
+                FROM measured WHERE NOT original_linked
+                UNION ALL
+                SELECT id, 'REVERSAL_IN_MISMATCH'
+                FROM measured
+                WHERE NOT (charge_in_lines = 1 AND in_lines = 1 AND in_amount = charge_amount
+                           AND in_currency_ok IS TRUE)
+                UNION ALL
+                SELECT id, 'SPLIT_MISMATCH'
+                FROM measured WHERE out_amount + receivable_amount <> in_amount
+                UNION ALL
+                SELECT id, 'WALLET_MISMATCH'
+                FROM measured WHERE out_other_account > 0
+                UNION ALL
+                SELECT DISTINCT e.transaction_id, 'RECEIVABLE_OUTSIDE_REVERSAL'
+                FROM ledger_accounts a
+                JOIN ledger_entries e ON e.account_id = a.id
+                JOIN ledger_transactions t ON t.id = e.transaction_id
+                WHERE a.owner_type = 'SYSTEM' AND a.account_type = 'RECEIVABLE'
+                  AND t.reference_type <> 'CHARGE_REVERSAL'
+            )
+            SELECT (SELECT count(*) FROM ledger_transactions
+                    WHERE reference_type = 'CHARGE_REVERSAL' AND status = 'POSTED') AS checked_count,
+                   (SELECT count(*) FROM violations) AS violation_count,
+                   v.transaction_id, v.reason
+            FROM (SELECT 1) AS one
+            LEFT JOIN LATERAL (
+                SELECT * FROM violations ORDER BY transaction_id, reason LIMIT ?
+            ) AS v ON true
+            """;
+
     private LedgerIntegritySql() {
     }
 }

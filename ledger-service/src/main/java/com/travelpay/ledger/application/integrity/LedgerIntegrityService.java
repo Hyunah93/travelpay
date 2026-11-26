@@ -44,6 +44,7 @@ public class LedgerIntegrityService {
                 CheckOutcome.from(integrityRepository.checkAccountBalances(violationLimit)),
                 CheckOutcome.from(integrityRepository.checkPostedTransactionBalances(violationLimit)),
                 CheckOutcome.from(integrityRepository.checkRejectedTransactionsHaveNoEntries(violationLimit)),
-                CheckOutcome.from(integrityRepository.checkCurrencyTotals(violationLimit)));
+                CheckOutcome.from(integrityRepository.checkCurrencyTotals(violationLimit)),
+                CheckOutcome.from(integrityRepository.checkChargeReversalStructure(violationLimit)));
     }
 }

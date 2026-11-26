@@ -1,6 +1,7 @@
 package com.travelpay.ledger.application.integrity.dto;
 
 import com.travelpay.ledger.domain.integrity.AccountBalanceViolation;
+import com.travelpay.ledger.domain.integrity.ChargeReversalViolation;
 import com.travelpay.ledger.domain.integrity.CurrencyTotalViolation;
 import com.travelpay.ledger.domain.integrity.IntegrityCheck;
 import com.travelpay.ledger.domain.integrity.RejectedEntriesViolation;
@@ -21,12 +22,14 @@ public record IntegrityCheckResult(
         CheckOutcome<AccountBalanceViolation> accountBalance,
         CheckOutcome<TransactionBalanceViolation> postedTransactionBalance,
         CheckOutcome<RejectedEntriesViolation> rejectedTransactionEntries,
-        CheckOutcome<CurrencyTotalViolation> currencyTotal
+        CheckOutcome<CurrencyTotalViolation> currencyTotal,
+        CheckOutcome<ChargeReversalViolation> chargeReversalStructure
 ) {
 
     public long totalViolationCount() {
         return accountBalance.violationCount() + postedTransactionBalance.violationCount()
-                + rejectedTransactionEntries.violationCount() + currencyTotal.violationCount();
+                + rejectedTransactionEntries.violationCount() + currencyTotal.violationCount()
+                + chargeReversalStructure.violationCount();
     }
 
     /**

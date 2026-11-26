@@ -110,6 +110,16 @@ class LedgerChargeReversalIntegrationTest {
         HttpResponse<String> response = client.get(INTEGRITY);
         assertEquals(200, response.statusCode(), response.body());
         assertTrue(client.data(response).get("consistent").asBoolean(), testName + "\n" + response.body());
+        // 5번 충전 취소 분개 구조 검사: 시나리오(잔액 충분·부족·0, 동시성) 뒤에도 위반 0
+        JsonNode reversalCheck = client.data(response).get("chargeReversalStructure");
+        assertEquals(0, reversalCheck.get("violationCount").asLong(), testName + "\n" + response.body());
+        assertEquals(count("SELECT count(*) FROM ledger_transactions"
+                        + " WHERE reference_type = 'CHARGE_REVERSAL' AND status = 'POSTED'"),
+                reversalCheck.get("checkedCount").asLong(), response.body());
+    }
+
+    private long count(String sql) {
+        return jdbcTemplate.queryForObject(sql, Long.class);
     }
 
     // ---- 금액 ----

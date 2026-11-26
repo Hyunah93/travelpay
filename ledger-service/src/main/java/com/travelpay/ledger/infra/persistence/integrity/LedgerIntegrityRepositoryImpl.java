@@ -2,6 +2,7 @@ package com.travelpay.ledger.infra.persistence.integrity;
 
 import com.travelpay.ledger.domain.Currency;
 import com.travelpay.ledger.domain.integrity.AccountBalanceViolation;
+import com.travelpay.ledger.domain.integrity.ChargeReversalViolation;
 import com.travelpay.ledger.domain.integrity.CurrencyTotalViolation;
 import com.travelpay.ledger.domain.integrity.IntegrityCheck;
 import com.travelpay.ledger.domain.integrity.LedgerIntegrityRepository;
@@ -66,6 +67,13 @@ public class LedgerIntegrityRepositoryImpl implements LedgerIntegrityRepository 
     public IntegrityCheck<CurrencyTotalViolation> checkCurrencyTotals(int violationLimit) {
         return run(LedgerIntegritySql.CURRENCY_TOTALS, violationLimit, rs -> new CurrencyTotalViolation(
                 currency(rs, "currency"), integer(rs, "total")));
+    }
+
+    @Override
+    public IntegrityCheck<ChargeReversalViolation> checkChargeReversalStructure(int violationLimit) {
+        return run(LedgerIntegritySql.CHARGE_REVERSAL_STRUCTURE, violationLimit, rs -> new ChargeReversalViolation(
+                rs.getObject("transaction_id", UUID.class),
+                ChargeReversalViolation.Reason.valueOf(rs.getString("reason"))));
     }
 
     /** 첫 행에서 검사 대상 수·전체 위반 수를 읽고, 위반 열(3번째)이 NULL이 아닌 행만 위반으로 모은다 */
