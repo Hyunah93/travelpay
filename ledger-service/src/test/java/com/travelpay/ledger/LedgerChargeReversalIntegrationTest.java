@@ -376,6 +376,147 @@ class LedgerChargeReversalIntegrationTest {
         assertEquals(0, walletBalance(walletId));
     }
 
+    // ---- 잠금 순서 강제 (지갑 잠금을 쥔 채 대기 순서를 pg_stat_activity로 맞춘 뒤 해제) ----
+
+    @Test
+    void 취소_분개가_먼저_대기하면_원금액을_회수하고_뒤_출금은_잔액_부족으로_거절된다(CapturedOutput output)
+            throws Exception {
+        runInLockOrder(true, output);
+    }
+
+    @Test
+    void 출금이_먼저_대기하면_출금_뒤_잔액만_회수하고_나머지는_미수다(CapturedOutput output) throws Exception {
+        runInLockOrder(false, output);
+    }
+
+    /**
+     * 지갑 계정 잠금을 쥔 채 첫 요청이 잠금 대기에 들어간 것을 확인한 뒤 둘째 요청을 보내고, 둘 다 대기면 푼다.
+     * 대기 순서를 의도대로 맞추지만 실제 반영 순서는 가정하지 않고 취소 분개 지갑 항목의 balance_after로 판별한다
+     * (회수 전 잔액 = balance_after + 회수액이 시작 잔액이면 취소 분개 먼저, 시작 잔액 − 출금액이면 출금 먼저).
+     * 시작 잔액 = 원금액 10만, 출금 5만: 취소 분개가 먼저면 잔액 0이라 출금은 잔액 부족
+     */
+    private void runInLockOrder(boolean reversalFirst, CapturedOutput output) throws Exception {
+        long transferAmount = 50_000;
+        UUID walletId = client.openWallet();
+        UUID otherWallet = client.openWallet();
+        UUID chargeId = UUID.randomUUID();
+        charge(chargeId, walletId, CHARGE_AMOUNT);
+        long startBalance = walletBalance(walletId);
+        UUID transferId = UUID.randomUUID();
+        Map<String, Object> transfer = transferBody(transferId, walletId, otherWallet, transferAmount);
+
+        Call reversalCall;
+        Call transferCall;
+        String probeLog;
+        try (LedgerLockProbe probe = new LedgerLockProbe(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(),
+                POSTGRES.getPassword())) {
+            Connection holder = probe.holdAccount(walletAccountId(walletId));
+            probe.startSampling();
+            LedgerTestClient.Pending first = null;
+            LedgerTestClient.Pending second = null;
+            List<Call> firstCalls;
+            List<Call> secondCalls;
+            try {
+                first = reversalFirst
+                        ? client.sendConcurrently(CHARGE_REVERSALS, List.of(reversalBody(chargeId)))
+                        : client.sendConcurrently(LedgerTestClient.TRANSACTIONS, List.of(transfer));
+                probe.awaitWaiting(1, WAIT_TIMEOUT);
+                second = reversalFirst
+                        ? client.sendConcurrently(LedgerTestClient.TRANSACTIONS, List.of(transfer))
+                        : client.sendConcurrently(CHARGE_REVERSALS, List.of(reversalBody(chargeId)));
+                List<LedgerLockProbe.Sample> waiting = probe.awaitWaiting(2, WAIT_TIMEOUT);
+                System.out.println(probe.releaseInTime(holder, waiting).describe(testName));
+            } finally {
+                probe.release(holder);
+                firstCalls = first == null ? List.of() : first.await(RESPONSE_TIMEOUT);
+                secondCalls = second == null ? List.of() : second.await(RESPONSE_TIMEOUT);
+            }
+            reversalCall = (reversalFirst ? firstCalls : secondCalls).getFirst();
+            transferCall = (reversalFirst ? secondCalls : firstCalls).getFirst();
+            probeLog = probe.describeSamples();
+        }
+        String context = describe(List.of(reversalCall, transferCall)) + "\n" + probeLog + "\n"
+                + LedgerSameReferenceIntegrationTest.appLog(output);
+
+        assertEquals(201, reversalCall.status(), context);
+        JsonNode data = client.data(reversalCall.body());
+        long recovered = data.get("recoveredAmount").asLong();
+        long receivable = data.get("receivableAmount").asLong();
+
+        // 실제 반영 순서: 취소 분개가 잠근 시점의 지갑 잔액(회수 전 잔액)으로 판별한다
+        long balanceAtReversal = recovered == 0 ? 0 : reversalWalletBalanceAfter(chargeId) + recovered;
+        boolean actualReversalFirst;
+        if (balanceAtReversal == startBalance) {
+            actualReversalFirst = true;
+        } else if (balanceAtReversal == startBalance - transferAmount) {
+            actualReversalFirst = false;
+        } else {
+            throw new AssertionError("회수 전 잔액이 두 순서 어느 쪽과도 맞지 않음: " + balanceAtReversal + "\n" + context);
+        }
+        System.out.println("[charge-reversal-order] " + testName + " intended="
+                + (reversalFirst ? "REVERSAL_FIRST" : "TRANSFER_FIRST") + " actual="
+                + (actualReversalFirst ? "REVERSAL_FIRST" : "TRANSFER_FIRST")
+                + " balanceAtReversal=" + balanceAtReversal + " recovered=" + recovered + " receivable=" + receivable
+                + " transferStatus=" + transferCall.status());
+
+        if (actualReversalFirst) {
+            assertEquals(startBalance, recovered, context);
+            assertEquals(0, receivable, context);
+            assertEquals(422, transferCall.status(), context);
+            assertEquals("LEDGER_REJECTED_INSUFFICIENT_BALANCE", client.errorCode(transferCall.body()), context);
+            assertEquals("REJECTED", transferStatus(transferId), context);
+            assertEquals(0, transferEntryRows(transferId), context);
+            assertEquals(0, walletBalance(otherWallet), context);
+        } else {
+            assertEquals(201, transferCall.status(), context);
+            assertEquals("POSTED", transferStatus(transferId), context);
+            assertEquals(startBalance - transferAmount, recovered, context);
+            assertEquals(CHARGE_AMOUNT - recovered, receivable, context);
+            assertEquals(transferAmount, walletBalance(otherWallet), context);
+        }
+        long walletAfter = walletBalance(walletId);
+        assertTrue(walletAfter >= 0, "지갑 잔액 음수 없음\n" + context);
+        assertEquals(0, walletAfter, context);
+        assertEquals(CHARGE_AMOUNT, recovered + receivable, context);
+        assertTrue(debitEqualsCredit(chargeId), "취소 분개 차변 = 대변\n" + context);
+        assertTrue(transferDebitEqualsCredit(transferId), "출금 차변 = 대변\n" + context);
+        // 정합성 검사 consistent=true는 @AfterEach에서 확인
+    }
+
+    /** 취소 분개 지갑 항목(CHARGE_REVERSAL_OUT)의 반영 후 잔액 */
+    private long reversalWalletBalanceAfter(UUID chargeId) {
+        return jdbcTemplate.queryForObject("""
+                SELECT e.balance_after FROM ledger_entries e
+                  JOIN ledger_transactions t ON t.id = e.transaction_id
+                 WHERE t.reference_type = 'CHARGE_REVERSAL' AND t.reference_id = ?
+                   AND e.entry_type = 'CHARGE_REVERSAL_OUT'
+                """, Long.class, chargeId);
+    }
+
+    private String transferStatus(UUID transferId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT status FROM ledger_transactions WHERE reference_type = 'TRANSFER' AND reference_id = ?",
+                String.class, transferId);
+    }
+
+    private int transferEntryRows(UUID transferId) {
+        return jdbcTemplate.queryForObject("""
+                SELECT count(*) FROM ledger_entries e
+                  JOIN ledger_transactions t ON t.id = e.transaction_id
+                 WHERE t.reference_type = 'TRANSFER' AND t.reference_id = ?
+                """, Integer.class, transferId);
+    }
+
+    private boolean transferDebitEqualsCredit(UUID transferId) {
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject("""
+                SELECT coalesce(sum(CASE WHEN e.direction = 'DEBIT' THEN e.amount ELSE 0 END), 0)
+                     = coalesce(sum(CASE WHEN e.direction = 'CREDIT' THEN e.amount ELSE 0 END), 0)
+                  FROM ledger_entries e
+                  JOIN ledger_transactions t ON t.id = e.transaction_id
+                 WHERE t.reference_type = 'TRANSFER' AND t.reference_id = ?
+                """, Boolean.class, transferId));
+    }
+
     // ---- 도구 ----
 
     /** 실제 충전 요청과 같은 구조: 충전 원천 DEBIT CHARGE_OUT + 지갑 CREDIT CHARGE_IN. 원거래 ID를 돌려준다 */
