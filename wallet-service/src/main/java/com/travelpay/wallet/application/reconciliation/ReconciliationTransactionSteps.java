@@ -3,6 +3,8 @@ package com.travelpay.wallet.application.reconciliation;
 import com.travelpay.wallet.application.reconciliation.dto.ReconciliationRunResult;
 import com.travelpay.wallet.domain.charge.ChargeRequest;
 import com.travelpay.wallet.domain.charge.ChargeRequestRepository;
+import com.travelpay.wallet.domain.correction.ChargeReversalCorrectionRepository;
+import com.travelpay.wallet.domain.reconciliation.MismatchType;
 import com.travelpay.wallet.domain.reconciliation.ReconciliationResult;
 import com.travelpay.wallet.domain.reconciliation.ReconciliationResultRepository;
 import com.travelpay.wallet.domain.reconciliation.ReconciliationRun;
@@ -37,6 +39,7 @@ public class ReconciliationTransactionSteps {
     private final ReconciliationRunRepository runRepository;
     private final ReconciliationResultRepository resultRepository;
     private final ChargeRequestRepository chargeRequestRepository;
+    private final ChargeReversalCorrectionRepository correctionRepository;
 
     /** RUNNING 실행을 만든다. 이미 RUNNING이 있으면 ReconciliationAlreadyRunningException */
     @Transactional(timeout = TX_TIMEOUT_SECONDS)
@@ -69,13 +72,22 @@ public class ReconciliationTransactionSteps {
     }
 
     /**
-     * 결과 저장과 실행 종료(COMPLETED·PARTIAL)를 한 트랜잭션으로.
-     * 실행이 이미 RUNNING이 아니면 ReconciliationRunNotRunningException으로 트랜잭션 전체를 되돌린다 (결과도 저장 안 됨)
+     * 결과 저장, 이중 지급 정정 대상 등록, 실행 종료(COMPLETED·PARTIAL)를 한 트랜잭션으로.
+     * CREDIT_AND_REFUND_BOTH 결과마다 그 충전의 정정 대상을 없을 때만 PENDING으로 등록한다 (이미 있으면 상태와 관계없이 그대로).
+     * 등록은 대사 결과 행을 FK로 가리키므로, 등록 쿼리 실행 전에 결과 INSERT가 flush된다 (registerIfAbsent 참고).
+     * 실행이 이미 RUNNING이 아니면 ReconciliationRunNotRunningException으로 트랜잭션 전체를 되돌린다 (결과·정정 대상 모두 저장 안 됨)
      */
     @Transactional(timeout = BULK_TX_TIMEOUT_SECONDS)
     public ReconciliationRunResult complete(UUID runId, List<ReconciliationResult> results, int targetCount,
                                             int matchedCount, int mismatchCount, int unverifiableCount) {
         resultRepository.saveAll(results);
+        Instant now = Instant.now();
+        for (ReconciliationResult result : results) {
+            // id는 persist 시점에 정해진다 (GenerationType.UUID). 충전·실행·유형당 결과는 1행 (ux_reconciliation_results_charge)
+            if (result.getMismatchType() == MismatchType.CREDIT_AND_REFUND_BOTH) {
+                correctionRepository.registerIfAbsent(result.getChargeId(), result.getId(), now);
+            }
+        }
         int updated = runRepository.finishIfRunning(runId, ReconciliationRun.finishedStatus(unverifiableCount),
                 targetCount, matchedCount, mismatchCount, unverifiableCount, Instant.now());
         if (updated == 0) {

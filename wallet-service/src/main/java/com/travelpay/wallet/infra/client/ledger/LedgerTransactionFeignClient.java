@@ -22,6 +22,10 @@ public interface LedgerTransactionFeignClient {
     @PostMapping
     ApiResponse<LedgerTransactionResponse> register(@RequestBody RegisterLedgerTransactionRequest request);
 
+    /** 충전 취소 분개. 201 새로 기록·200 이미 있음 (chargeId 기준 멱등) */
+    @PostMapping("/charge-reversals")
+    ApiResponse<ChargeReversalResponse> reverseCharge(@RequestBody ChargeReversalRequest request);
+
     /** reference 단건. 없으면 404 LEDGER_TRANSACTION_NOT_FOUND */
     @GetMapping
     ApiResponse<LedgerTransactionDetailResponse> findByReference(@RequestParam("referenceType") String referenceType,
