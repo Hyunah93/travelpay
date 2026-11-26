@@ -125,6 +125,9 @@ class ChargeReconciliationMeasurementTest {
                 sources.ledgerPage(inv.getArgument(1), inv.getArgument(2), inv.getArgument(3), inv.getArgument(4)));
         when(ledgerFeign.findByReference(eq("CHARGE"), any())).thenAnswer(inv ->
                 sources.ledgerSingle(inv.getArgument(1)));
+        // 충전 취소 분개 없음: 빈 목록 한 페이지
+        when(ledgerFeign.listByPeriod(eq("CHARGE_REVERSAL"), any(), any(), any(), anyInt())).thenAnswer(inv ->
+                ApiResponse.success(new LedgerTransactionPeriodResponse(List.of(), null)));
     }
 
     // ================= 1. 탐지율·오탐 =================

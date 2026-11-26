@@ -110,6 +110,34 @@ class LedgerTransactionQueryAdapterTest {
         assertInstanceOf(SourceLookup.Unavailable.class, adapter.findChargeTransaction(chargeId));
     }
 
+    @Test
+    void 취소_분개_목록은_CHARGE_REVERSAL로_받고_계정_종류를_남긴다() {
+        UUID chargeId = UUID.randomUUID();
+        LedgerTransactionDetailResponse reversal = new LedgerTransactionDetailResponse(UUID.randomUUID(), "POSTED",
+                "CHARGE_REVERSAL", chargeId, List.of(
+                new LedgerTransactionDetailResponse.Entry("SYSTEM", null, "CHARGE_SOURCE", "KRW", "CREDIT",
+                        10_000L, "CHARGE_REVERSAL_IN")));
+        when(feignClient.listByPeriod("CHARGE_REVERSAL", FROM, TO, null, 100))
+                .thenReturn(page(List.of(reversal), null));
+
+        List<LedgerTransactionRecord> records = adapter.listChargeReversals(FROM, TO);
+
+        assertEquals(1, records.size());
+        assertEquals("CHARGE_REVERSAL", records.getFirst().referenceType());
+        assertEquals(chargeId, records.getFirst().referenceId());
+        assertEquals("CHARGE_SOURCE", records.getFirst().entries().getFirst().accountType());
+    }
+
+    @Test
+    void 취소_분개_목록에_다른_referenceType이_섞이면_예외() {
+        when(feignClient.listByPeriod("CHARGE_REVERSAL", FROM, TO, null, 100))
+                .thenReturn(page(List.of(posted(UUID.randomUUID())), null));
+
+        ReconciliationSourceException e = assertThrows(ReconciliationSourceException.class,
+                () -> adapter.listChargeReversals(FROM, TO));
+        assertTrue(e.getMessage().startsWith("원장 취소 분개 목록 응답 이상"), e.getMessage());
+    }
+
     private static LedgerTransactionDetailResponse posted(UUID chargeId) {
         return new LedgerTransactionDetailResponse(UUID.randomUUID(), "POSTED", "CHARGE", chargeId, List.of(
                 new LedgerTransactionDetailResponse.Entry("SYSTEM", null, "CHARGE_SOURCE", "KRW", "DEBIT",

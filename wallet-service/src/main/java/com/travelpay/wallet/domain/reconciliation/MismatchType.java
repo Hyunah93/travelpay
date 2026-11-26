@@ -13,8 +13,10 @@ public enum MismatchType {
     STATUS_MISMATCH,
     /** 은행 거래에 대응하는 충전이 없음 */
     BANK_ORPHAN,
-    /** 원장 거래에 대응하는 충전이 없음 */
+    /** 원장 거래(충전 적립·충전 취소 분개)에 대응하는 충전이 없음 */
     LEDGER_ORPHAN,
+    /** 충전 취소 분개의 구조가 틀리거나, 이중 지급 사실이 없는 충전·처리 중 충전에 취소 분개가 있음 */
+    REVERSAL_MISMATCH,
     /** MANUAL_REVIEW 충전. 판정하지 않고 사실만 남김 */
     REVIEW_REQUIRED,
     /** 조회 실패로 일부 판정을 보류함 */

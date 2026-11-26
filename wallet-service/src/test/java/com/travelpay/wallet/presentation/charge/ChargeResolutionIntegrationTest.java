@@ -956,14 +956,15 @@ class ChargeResolutionIntegrationTest {
     }
 
     private SourceLookup<LedgerTransactionRecord> posted(UUID chargeId, UUID txId, long amount) {
-        return SourceLookup.found(new LedgerTransactionRecord(txId, "POSTED", chargeId, List.of(
-                new LedgerTransactionRecord.LedgerEntryRecord("SYSTEM", null, "DEBIT", "KRW", amount, "CHARGE_SOURCE"),
-                new LedgerTransactionRecord.LedgerEntryRecord("USER", walletId, "CREDIT", "KRW", amount,
+        return SourceLookup.found(new LedgerTransactionRecord(txId, "POSTED", "CHARGE", chargeId, List.of(
+                new LedgerTransactionRecord.LedgerEntryRecord("SYSTEM", null, "CHARGE_SOURCE", "DEBIT", "KRW", amount,
+                        "CHARGE_SOURCE"),
+                new LedgerTransactionRecord.LedgerEntryRecord("USER", walletId, "WALLET", "CREDIT", "KRW", amount,
                         "CHARGE_IN"))));
     }
 
     private static SourceLookup<LedgerTransactionRecord> rejected(UUID chargeId) {
-        return SourceLookup.found(new LedgerTransactionRecord(UUID.randomUUID(), "REJECTED", chargeId, List.of()));
+        return SourceLookup.found(new LedgerTransactionRecord(UUID.randomUUID(), "REJECTED", "CHARGE", chargeId, List.of()));
     }
 
     private static <T> SourceLookup<T> notFound() {

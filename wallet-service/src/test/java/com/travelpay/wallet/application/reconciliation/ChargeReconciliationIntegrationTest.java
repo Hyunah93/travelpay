@@ -89,6 +89,7 @@ class ChargeReconciliationIntegrationTest {
     private UUID walletId;
     private final List<BankTransactionRecord> bankList = new ArrayList<>();
     private final List<LedgerTransactionRecord> ledgerList = new ArrayList<>();
+    private final List<LedgerTransactionRecord> reversalList = new ArrayList<>();
 
     @BeforeEach
     void setUp() {
@@ -100,8 +101,10 @@ class ChargeReconciliationIntegrationTest {
         jdbcTemplate.update("INSERT INTO wallets (id, user_id, status) VALUES (?, ?, 'ACTIVE')", walletId, userId);
         bankList.clear();
         ledgerList.clear();
+        reversalList.clear();
         when(bankClient.listTransactions(any(), any())).thenReturn(bankList);
         when(ledgerClient.listChargeTransactions(any(), any())).thenReturn(ledgerList);
+        when(ledgerClient.listChargeReversals(any(), any())).thenReturn(reversalList);
         when(bankClient.findTransaction(anyString())).thenReturn(SourceLookup.notFound());
         when(ledgerClient.findChargeTransaction(any())).thenReturn(SourceLookup.notFound());
     }
@@ -226,7 +229,7 @@ class ChargeReconciliationIntegrationTest {
         BankTransactionRecord orphanBank = new BankTransactionRecord(UUID.randomUUID().toString(), UUID.randomUUID(),
                 "DEBIT", "SUCCEEDED", AMOUNT);
         bankList.add(orphanBank);
-        LedgerTransactionRecord orphanLedger = new LedgerTransactionRecord(UUID.randomUUID(), "POSTED",
+        LedgerTransactionRecord orphanLedger = new LedgerTransactionRecord(UUID.randomUUID(), "POSTED", "CHARGE",
                 UUID.randomUUID(), List.of());
         ledgerList.add(orphanLedger);
 
@@ -391,6 +394,179 @@ class ChargeReconciliationIntegrationTest {
         assertEquals(firstRows.size(), resultRows(second.runId()).size());
     }
 
+    // ---- 충전 취소 분개 ----
+
+    @Test
+    void COMPLETED_이중_지급에_정상_취소_분개가_있으면_CREDIT_AND_REFUND_BOTH_없음() {
+        Charge recoveredAll = doublePaidCompleted();
+        reversalList.add(reversal(recoveredAll, AMOUNT, AMOUNT, 0, walletId));
+        Charge withReceivable = doublePaidCompleted();
+        reversalList.add(reversal(withReceivable, AMOUNT, 2_000, 8_000, walletId));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(ReconciliationRunStatus.COMPLETED, result.status());
+        assertEquals(0, resultCount(result.runId()));
+        assertCounts(result, 2, 2, 0, 0);
+    }
+
+    @Test
+    void REFUNDED_원장_적립_POSTED에_정상_취소_분개가_있으면_CREDIT_AND_REFUND_BOTH_없음() {
+        Charge refunded = charge("REFUNDED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+        bankList.add(debit(refunded, "SUCCEEDED", AMOUNT));
+        bankList.add(refund(refunded, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(refunded, AMOUNT, "KRW"));
+        reversalList.add(reversal(refunded, AMOUNT, 3_000, 7_000, walletId));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(0, resultCount(result.runId()));
+        assertCounts(result, 1, 1, 0, 0);
+    }
+
+    @Test
+    void 이중_지급인데_취소_분개가_없으면_CREDIT_AND_REFUND_BOTH() {
+        Charge completed = doublePaidCompleted();
+        Charge refunded = charge("REFUNDED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+        bankList.add(debit(refunded, "SUCCEEDED", AMOUNT));
+        bankList.add(refund(refunded, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(refunded, AMOUNT, "KRW"));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of("CREDIT_AND_REFUND_BOTH"), types(result.runId(), completed.id()));
+        assertEquals(List.of("CREDIT_AND_REFUND_BOTH"), types(result.runId(), refunded.id()));
+    }
+
+    @Test
+    void 늦게_생긴_취소_분개는_그_기간_실행에서_단건_재조회로_이중_지급을_확인해_정상_판정() {
+        // 충전·출금·환불·원장 적립은 앞 기간, 이번 기간에는 취소 분개만 있음
+        Charge earlier = charge("COMPLETED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID(),
+                FROM.minus(Duration.ofDays(3)));
+        reversalList.add(reversal(earlier, AMOUNT, AMOUNT, 0, walletId));
+        when(bankClient.findTransaction(earlier.bankRequestId()))
+                .thenReturn(SourceLookup.found(debit(earlier, "SUCCEEDED", AMOUNT)));
+        when(bankClient.findTransaction(earlier.refundRequestId()))
+                .thenReturn(SourceLookup.found(refund(earlier, "SUCCEEDED", AMOUNT)));
+        when(ledgerClient.findChargeTransaction(earlier.id()))
+                .thenReturn(SourceLookup.found(posted(earlier, AMOUNT, "KRW")));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(0, resultCount(result.runId()));
+        assertCounts(result, 1, 1, 0, 0);
+        verify(bankClient, times(1)).findTransaction(earlier.refundRequestId());
+        verify(ledgerClient, times(1)).findChargeTransaction(earlier.id());
+    }
+
+    @Test
+    void 취소_분개_금액이나_지갑이_틀리면_REVERSAL_MISMATCH와_CREDIT_AND_REFUND_BOTH() {
+        Charge wrongAmount = doublePaidCompleted();
+        reversalList.add(reversal(wrongAmount, AMOUNT - 1, AMOUNT - 1, 0, walletId));
+        Charge wrongWallet = doublePaidCompleted();
+        UUID otherWallet = UUID.randomUUID();
+        reversalList.add(reversal(wrongWallet, AMOUNT, AMOUNT, 0, otherWallet));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of("CREDIT_AND_REFUND_BOTH", "REVERSAL_MISMATCH"), types(result.runId(), wrongAmount.id()));
+        String amountDetail = detail(result.runId(), wrongAmount.id(), "REVERSAL_MISMATCH");
+        assertTrue(amountDetail.contains("CHARGE_REVERSAL_IN 금액(9999) ≠ 충전 금액(10000)"), amountDetail);
+        assertEquals(List.of("CREDIT_AND_REFUND_BOTH", "REVERSAL_MISMATCH"), types(result.runId(), wrongWallet.id()));
+        String walletDetail = detail(result.runId(), wrongWallet.id(), "REVERSAL_MISMATCH");
+        assertTrue(walletDetail.contains("CHARGE_REVERSAL_OUT 지갑(" + otherWallet + ")"), walletDetail);
+        String snapshot = snapshot(result.runId(), wrongWallet.id(), "REVERSAL_MISMATCH");
+        assertTrue(snapshot.contains("\"chargeReversal\""), snapshot);
+        assertTrue(snapshot.contains(otherWallet.toString()), snapshot);
+        assertCounts(result, 2, 0, 2, 0);
+    }
+
+    @Test
+    void 환불이_없는_COMPLETED_충전에_취소_분개가_있으면_REVERSAL_MISMATCH() {
+        Charge completed = completedCharge();
+        bankList.add(debit(completed, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(completed, AMOUNT, "KRW"));
+        reversalList.add(reversal(completed, AMOUNT, AMOUNT, 0, walletId));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of("REVERSAL_MISMATCH"), types(result.runId(), completed.id()));
+        String detail = detail(result.runId(), completed.id(), "REVERSAL_MISMATCH");
+        assertTrue(detail.startsWith("이중 지급 사실 없는 충전에 취소 분개 있음"), detail);
+        // 취소 분개가 있으면 목록에 없는 환불도 단건 재조회한다
+        verify(bankClient, times(1)).findTransaction(completed.refundRequestId());
+    }
+
+    @Test
+    void 처리_중_충전에_취소_분개가_있으면_건너뛰지_않고_REVERSAL_MISMATCH() {
+        Charge inProgress = charge("CREDIT_PROCESSING", UUID.randomUUID(), null, null);
+        bankList.add(debit(inProgress, "SUCCEEDED", AMOUNT));
+        reversalList.add(reversal(inProgress, AMOUNT, AMOUNT, 0, walletId));
+        Charge skipped = charge("REFUND_PROCESSING", UUID.randomUUID(), null, null);
+        bankList.add(debit(skipped, "SUCCEEDED", AMOUNT));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of("REVERSAL_MISMATCH"), types(result.runId(), inProgress.id()));
+        assertTrue(detail(result.runId(), inProgress.id(), "REVERSAL_MISMATCH").contains("CREDIT_PROCESSING"));
+        assertEquals(List.of(), types(result.runId(), skipped.id()));
+        assertCounts(result, 1, 0, 1, 0);
+    }
+
+    @Test
+    void 충전이_없는_취소_분개는_LEDGER_ORPHAN() {
+        Charge missing = new Charge(UUID.randomUUID(), UUID.randomUUID().toString(), UUID.randomUUID().toString(),
+                null, null, null);
+        LedgerTransactionRecord orphan = reversal(missing, AMOUNT, AMOUNT, 0, walletId);
+        reversalList.add(orphan);
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList("""
+                SELECT source_type, source_key, mismatch_type, charge_id, detail FROM reconciliation_results
+                 WHERE run_id = ?
+                """, result.runId());
+        assertEquals(1, rows.size());
+        assertEquals(Map.of("source_type", "LEDGER", "source_key", orphan.transactionId().toString(),
+                "mismatch_type", "LEDGER_ORPHAN"), withoutCharge(rows.getFirst()));
+        String detail = (String) rows.getFirst().get("detail");
+        assertTrue(detail.contains("CHARGE_REVERSAL"), detail);
+        assertCounts(result, 0, 0, 1, 0);
+    }
+
+    @Test
+    void 취소_분개_판정에_필요한_환불_단건_조회가_실패하면_SOURCE_UNAVAILABLE이고_PARTIAL() {
+        Charge completed = charge("COMPLETED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+        bankList.add(debit(completed, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(completed, AMOUNT, "KRW"));
+        reversalList.add(reversal(completed, AMOUNT, AMOUNT, 0, walletId));
+        when(bankClient.findTransaction(completed.refundRequestId()))
+                .thenReturn(SourceLookup.unavailable("feign.FeignException$ServiceUnavailable status=503"));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(ReconciliationRunStatus.PARTIAL, result.status());
+        assertEquals(List.of("SOURCE_UNAVAILABLE"), types(result.runId(), completed.id()));
+        String detail = detail(result.runId(), completed.id(), "SOURCE_UNAVAILABLE");
+        assertTrue(detail.startsWith("은행 환불 조회 실패"), detail);
+        assertTrue(detail.contains("취소 분개 이중 지급 확인"), detail);
+        assertCounts(result, 1, 0, 0, 1);
+    }
+
+    @Test
+    void 취소_분개_목록_수집_실패면_FAILED이고_결과는_저장하지_않음() {
+        Charge failed = charge("FAILED", null, null, null);
+        bankList.add(debit(failed, "SUCCEEDED", AMOUNT));
+        when(ledgerClient.listChargeReversals(any(), any()))
+                .thenThrow(new ReconciliationSourceException("원장 취소 분개 목록 조회 실패 page=0: x"));
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(ReconciliationRunStatus.FAILED, result.status());
+        assertEquals("원장 취소 분개 목록 조회 실패 page=0: x", runRow(result.runId()).get("failure_reason"));
+        assertEquals(0, resultCount(result.runId()));
+    }
+
     // ---- 준비 ----
 
     private record Charge(UUID id, String bankRequestId, String refundRequestId, UUID bankTxId,
@@ -431,13 +607,39 @@ class ChargeReconciliationIntegrationTest {
 
     private LedgerTransactionRecord posted(Charge charge, long amount, String currency) {
         UUID transactionId = charge.ledgerRef() != null ? charge.ledgerRef() : UUID.randomUUID();
-        return new LedgerTransactionRecord(transactionId, "POSTED", charge.id(), List.of(
-                new LedgerEntryRecord("SYSTEM", null, "DEBIT", currency, amount, "CHARGE_OUT"),
-                new LedgerEntryRecord("USER", walletId, "CREDIT", currency, amount, "CHARGE_IN")));
+        return new LedgerTransactionRecord(transactionId, "POSTED", "CHARGE", charge.id(), List.of(
+                new LedgerEntryRecord("SYSTEM", null, "CHARGE_SOURCE", "DEBIT", currency, amount, "CHARGE_OUT"),
+                new LedgerEntryRecord("USER", walletId, "WALLET", "CREDIT", currency, amount, "CHARGE_IN")));
+    }
+
+    /** 출금·원장 적립·환불이 모두 성공하고 저장된 ID도 일치하는 이중 지급 COMPLETED 충전 */
+    private Charge doublePaidCompleted() {
+        Charge charge = charge("COMPLETED", UUID.randomUUID(), UUID.randomUUID(), UUID.randomUUID());
+        bankList.add(debit(charge, "SUCCEEDED", AMOUNT));
+        ledgerList.add(posted(charge, AMOUNT, "KRW"));
+        bankList.add(refund(charge, "SUCCEEDED", AMOUNT));
+        return charge;
+    }
+
+    /** 충전 취소 분개. 회수(recovered)·미수(receivable)가 0이면 그 항목을 넣지 않는다 */
+    private static LedgerTransactionRecord reversal(Charge charge, long inAmount, long recovered, long receivable,
+                                                    UUID outWallet) {
+        List<LedgerEntryRecord> entries = new ArrayList<>();
+        if (recovered > 0) {
+            entries.add(new LedgerEntryRecord("USER", outWallet, "WALLET", "DEBIT", "KRW", recovered,
+                    "CHARGE_REVERSAL_OUT"));
+        }
+        if (receivable > 0) {
+            entries.add(new LedgerEntryRecord("SYSTEM", null, "RECEIVABLE", "DEBIT", "KRW", receivable,
+                    "CHARGE_REVERSAL_RECEIVABLE"));
+        }
+        entries.add(new LedgerEntryRecord("SYSTEM", null, "CHARGE_SOURCE", "CREDIT", "KRW", inAmount,
+                "CHARGE_REVERSAL_IN"));
+        return new LedgerTransactionRecord(UUID.randomUUID(), "POSTED", "CHARGE_REVERSAL", charge.id(), entries);
     }
 
     private static LedgerTransactionRecord rejected(Charge charge) {
-        return new LedgerTransactionRecord(UUID.randomUUID(), "REJECTED", charge.id(), List.of());
+        return new LedgerTransactionRecord(UUID.randomUUID(), "REJECTED", "CHARGE", charge.id(), List.of());
     }
 
     // ---- 확인 ----

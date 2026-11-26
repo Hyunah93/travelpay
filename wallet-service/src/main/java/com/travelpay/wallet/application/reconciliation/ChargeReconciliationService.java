@@ -31,10 +31,11 @@ import java.util.function.Supplier;
  * 충전 대사 실행 1회: 기간 [from, to)의 은행 거래·충전·원장 거래를 식별자로 대조해 어긋남을 저장한다.
  * 찾고 기록만 하며 충전 상태나 돈은 바꾸지 않는다. 외부 호출이 트랜잭션 안에 들어가지 않도록 트랜잭션 없이 동작한다.
  * <p>
- * 매칭: 충전 bank_request_id·refund_request_id = 은행 requestId, 충전 id = 원장 referenceId.
+ * 매칭: 충전 bank_request_id·refund_request_id = 은행 requestId, 충전 id = 원장 referenceId(충전 거래·취소 분개 각각).
  * 은행·원장 기간 목록은 끝까지 한 번에 받아 키로 맵을 만들고, 상태상 있어야 하는 기록이 목록에 없을 때만 단건 재조회한다
- * (COMPLETED: 출금·원장, REFUNDED: 출금·환불). 없어야 하는 기록은 목록에 없으면 없음으로 본다.
+ * (COMPLETED: 출금·원장, REFUNDED: 출금·환불, 취소 분개가 있으면 환불·원장 적립도). 없어야 하는 기록은 목록에 없으면 없음으로 본다.
  * 기간 밖에 찍힌 기록은 그 기간의 실행에서 목록 키로 충전을 찾아 판정 후보에 넣으므로 놓치지 않는다.
+ * 취소 분개도 생성된 기간의 실행에서 목록 키로 충전을 불러오므로, 충전보다 늦게 생긴 취소 분개를 놓치지 않는다.
  */
 @Slf4j
 @Service
@@ -70,9 +71,11 @@ public class ChargeReconciliationService {
     private ReconciliationRunResult reconcile(UUID runId, Instant from, Instant to) {
         List<BankTransactionRecord> bankList;
         List<LedgerTransactionRecord> ledgerList;
+        List<LedgerTransactionRecord> reversalList;
         try {
             bankList = bankClient.listTransactions(from, to);
             ledgerList = ledgerClient.listChargeTransactions(from, to);
+            reversalList = ledgerClient.listChargeReversals(from, to);
         } catch (ReconciliationSourceException e) {
             log.warn("충전 대사 기간 목록 수집 실패 runId={} from={} to={} reason={}", runId, from, to, e.getMessage());
             return steps.fail(runId, e.getMessage());
@@ -82,9 +85,12 @@ public class ChargeReconciliationService {
         bankList.forEach(r -> bankByRequestId.put(r.requestId(), r));
         Map<UUID, LedgerTransactionRecord> ledgerByReference = new LinkedHashMap<>();
         ledgerList.forEach(r -> ledgerByReference.put(r.referenceId(), r));
+        // 충전 거래와 referenceId(= chargeId)가 같으므로 별도 맵
+        Map<UUID, LedgerTransactionRecord> reversalByReference = new LinkedHashMap<>();
+        reversalList.forEach(r -> reversalByReference.put(r.referenceId(), r));
 
         List<ChargeRequest> charges = steps.loadCharges(from, to, bankByRequestId.keySet(),
-                ledgerByReference.keySet());
+                ledgerByReference.keySet(), reversalByReference.keySet());
 
         Instant detectedAt = Instant.now();
         List<ReconciliationResult> results = new ArrayList<>();
@@ -93,11 +99,12 @@ public class ChargeReconciliationService {
         int mismatched = 0;
         int unverifiable = 0;
         for (ChargeRequest charge : charges) {
-            if (IN_PROGRESS.contains(charge.getStatus())) {
+            // 처리 중 충전은 건너뛰되, 취소 분개가 있으면 REVERSAL_MISMATCH로 판정한다
+            if (IN_PROGRESS.contains(charge.getStatus()) && !reversalByReference.containsKey(charge.getId())) {
                 continue;
             }
             target++;
-            ChargeFacts facts = facts(charge, bankByRequestId, ledgerByReference);
+            ChargeFacts facts = facts(charge, bankByRequestId, ledgerByReference, reversalByReference);
             List<Finding> findings = ChargeReconciliationJudge.judge(charge, facts);
             if (findings.isEmpty()) {
                 matched++;
@@ -114,7 +121,8 @@ public class ChargeReconciliationService {
             }
         }
 
-        List<ReconciliationResult> orphans = orphans(runId, charges, bankByRequestId, ledgerByReference, detectedAt);
+        List<ReconciliationResult> orphans = orphans(runId, charges, bankByRequestId, ledgerByReference,
+                reversalByReference, detectedAt);
         results.addAll(orphans);
         mismatched += orphans.size();
 
@@ -131,21 +139,29 @@ public class ChargeReconciliationService {
         return result;
     }
 
-    /** 상태별로 필요한 소스만 단건 재조회한다. MANUAL_REVIEW·FAILED는 목록 사실만 쓴다 */
+    /**
+     * 상태별로 필요한 소스만 단건 재조회한다. MANUAL_REVIEW·FAILED는 목록 사실만 쓴다.
+     * 취소 분개가 있는 충전은 상태와 관계없이 환불·원장 적립을 단건 재조회한다
+     * (앞 기간에 찍힌 이중 지급 사실을 목록에 없다는 이유로 없음으로 보지 않도록)
+     */
     private ChargeFacts facts(ChargeRequest charge, Map<String, BankTransactionRecord> bankByRequestId,
-                              Map<UUID, LedgerTransactionRecord> ledgerByReference) {
+                              Map<UUID, LedgerTransactionRecord> ledgerByReference,
+                              Map<UUID, LedgerTransactionRecord> reversalByReference) {
         boolean completed = charge.getStatus() == ChargeStatus.COMPLETED;
         boolean refunded = charge.getStatus() == ChargeStatus.REFUNDED;
         String debitKey = charge.getBankRequestId();
         String refundKey = charge.getRefundRequestId();
         UUID ledgerKey = charge.getId();
+        LedgerTransactionRecord reversal = reversalByReference.get(ledgerKey);
+        boolean reversed = reversal != null;
         return new ChargeFacts(
                 lookup(bankByRequestId.get(debitKey), completed || refunded,
                         () -> bankClient.findTransaction(debitKey)),
-                lookup(bankByRequestId.get(refundKey), refunded,
+                lookup(bankByRequestId.get(refundKey), refunded || reversed,
                         () -> bankClient.findTransaction(refundKey)),
-                lookup(ledgerByReference.get(ledgerKey), completed,
-                        () -> ledgerClient.findChargeTransaction(ledgerKey)));
+                lookup(ledgerByReference.get(ledgerKey), completed || reversed,
+                        () -> ledgerClient.findChargeTransaction(ledgerKey)),
+                reversed ? SourceLookup.found(reversal) : SourceLookup.notFound());
     }
 
     private static <T> SourceLookup<T> lookup(T fromList, boolean expected, Supplier<SourceLookup<T>> single) {
@@ -155,10 +171,14 @@ public class ChargeReconciliationService {
         return expected ? single.get() : SourceLookup.notFound();
     }
 
-    /** 은행 목록에서 어떤 충전의 출금·환불 요청에도 없는 거래, 원장 목록에서 충전이 없는 거래 */
+    /**
+     * 은행 목록에서 어떤 충전의 출금·환불 요청에도 없는 거래, 원장 목록(충전 거래·취소 분개)에서 충전이 없는 거래.
+     * 충전 없음은 loadCharges가 목록 키로 지갑 DB를 찾아도 그 충전이 없었다는 뜻이다 (기간 안 충전 목록 기준이 아님)
+     */
     private List<ReconciliationResult> orphans(UUID runId, List<ChargeRequest> charges,
                                                Map<String, BankTransactionRecord> bankByRequestId,
                                                Map<UUID, LedgerTransactionRecord> ledgerByReference,
+                                               Map<UUID, LedgerTransactionRecord> reversalByReference,
                                                Instant detectedAt) {
         Set<String> ownedRequestIds = new HashSet<>();
         Set<UUID> chargeIds = new HashSet<>();
@@ -180,6 +200,15 @@ public class ChargeReconciliationService {
                 orphans.add(ReconciliationResult.ofOrphan(runId, SourceType.LEDGER,
                         record.transactionId().toString(), MismatchType.LEDGER_ORPHAN,
                         "원장 거래(" + record.status() + ")의 referenceId " + referenceId + "인 충전 없음",
+                        snapshots.ofLedgerOrphan(record), detectedAt));
+            }
+        });
+        reversalByReference.forEach((referenceId, record) -> {
+            if (!chargeIds.contains(referenceId)) {
+                orphans.add(ReconciliationResult.ofOrphan(runId, SourceType.LEDGER,
+                        record.transactionId().toString(), MismatchType.LEDGER_ORPHAN,
+                        "원장 취소 분개(CHARGE_REVERSAL " + record.status() + ")의 referenceId " + referenceId
+                                + "인 충전 없음",
                         snapshots.ofLedgerOrphan(record), detectedAt));
             }
         });
