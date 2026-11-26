@@ -30,22 +30,12 @@ import java.util.UUID;
  * 충전 취소 분개: 이중 지급 사실(원장 적립 POSTED + 은행 환불 SUCCEEDED)이 있고 정상 취소 분개가 있으면
  * CREDIT_AND_REFUND_BOTH를 남기지 않는다. 취소 분개 구조가 틀리거나 이중 지급 사실이 없는 충전에 있으면 REVERSAL_MISMATCH.
  * 원거래 연결(originalTransactionId)은 원장 응답에 없어 확인하지 않는다 (원장 정합성 검사가 확인).
+ * 이중 지급 사실·정상 취소 분개 기준은 DoublePaymentCriteria에 있다.
  */
 public final class ChargeReconciliationJudge {
 
     static final String STATUS_DIFFERS = "상태가 사실과 다름";
     static final String ID_DIFFERS = "저장된 ID와 다름";
-
-    private static final String CHARGE_REVERSAL = "CHARGE_REVERSAL";
-    private static final String POSTED = "POSTED";
-    private static final String DEBIT = "DEBIT";
-    private static final String CREDIT = "CREDIT";
-    private static final String WALLET = "WALLET";
-    private static final String RECEIVABLE = "RECEIVABLE";
-    private static final String CHARGE_SOURCE = "CHARGE_SOURCE";
-    private static final String REVERSAL_OUT = "CHARGE_REVERSAL_OUT";
-    private static final String REVERSAL_IN = "CHARGE_REVERSAL_IN";
-    private static final String REVERSAL_RECEIVABLE = "CHARGE_REVERSAL_RECEIVABLE";
 
     private ChargeReconciliationJudge() {
     }
@@ -154,7 +144,7 @@ public final class ChargeReconciliationJudge {
                 return;
             }
             out.withRefund("이중 지급 취소 분개 확인", refund -> out.withLedger("이중 지급 취소 분개 확인", ledger -> {
-                if (!isSucceeded(refund) || !isPosted(ledger) || !reversalProblems(charge, found.record()).isEmpty()) {
+                if (!DoublePaymentCriteria.isDoublePaid(refund, ledger) || !DoublePaymentCriteria.reversalProblems(charge, found.record()).isEmpty()) {
                     out.add(MismatchType.CREDIT_AND_REFUND_BOTH, reason + " (취소 분개가 이중 지급을 바로잡지 못함)");
                 }
             }));
@@ -167,73 +157,14 @@ public final class ChargeReconciliationJudge {
             if (!(reversal instanceof SourceLookup.Found<LedgerTransactionRecord> found)) {
                 return;
             }
-            reversalProblems(charge, found.record()).forEach(p -> out.add(MismatchType.REVERSAL_MISMATCH, p));
+            DoublePaymentCriteria.reversalProblems(charge, found.record()).forEach(p -> out.add(MismatchType.REVERSAL_MISMATCH, p));
             out.withRefund("취소 분개 이중 지급 확인", refund -> out.withLedger("취소 분개 이중 지급 확인", ledger -> {
-                if (!isSucceeded(refund) || !isPosted(ledger)) {
+                if (!DoublePaymentCriteria.isDoublePaid(refund, ledger)) {
                     out.add(MismatchType.REVERSAL_MISMATCH, "이중 지급 사실 없는 충전에 취소 분개 있음 (원장 적립 "
                             + ledgerStatus(ledger) + ", 은행 환불 " + bankStatus(refund) + ")");
                 }
             }));
         });
-    }
-
-    /**
-     * 정상 취소 분개: POSTED, referenceType CHARGE_REVERSAL, referenceId = chargeId,
-     * CHARGE_SOURCE CREDIT CHARGE_REVERSAL_IN 1항목의 금액·통화 = 충전 금액·통화,
-     * 지갑 DEBIT CHARGE_REVERSAL_OUT 합 + RECEIVABLE DEBIT CHARGE_REVERSAL_RECEIVABLE 합 = CHARGE_REVERSAL_IN 금액,
-     * CHARGE_REVERSAL_OUT은 충전 지갑, 그 밖의 항목 없음. 어긋난 이유 목록 (정상이면 빈 목록)
-     */
-    private static List<String> reversalProblems(ChargeRequest charge, LedgerTransactionRecord reversal) {
-        List<String> problems = new ArrayList<>();
-        if (!POSTED.equals(reversal.status())) {
-            problems.add("취소 분개 상태 " + reversal.status() + " (POSTED여야 함)");
-        }
-        if (!CHARGE_REVERSAL.equals(reversal.referenceType())) {
-            problems.add("취소 분개 referenceType " + reversal.referenceType());
-        }
-        if (!charge.getId().equals(reversal.referenceId())) {
-            problems.add("취소 분개 referenceId " + reversal.referenceId() + " ≠ 충전 id");
-        }
-        String currency = charge.getCurrency().name();
-        List<LedgerEntryRecord> in = new ArrayList<>();
-        long split = 0;
-        for (LedgerEntryRecord e : reversal.entries()) {
-            boolean isIn = REVERSAL_IN.equals(e.entryType()) && CHARGE_SOURCE.equals(e.accountType())
-                    && CREDIT.equals(e.direction());
-            boolean isOut = REVERSAL_OUT.equals(e.entryType()) && WALLET.equals(e.accountType())
-                    && DEBIT.equals(e.direction());
-            boolean isReceivable = REVERSAL_RECEIVABLE.equals(e.entryType()) && RECEIVABLE.equals(e.accountType())
-                    && DEBIT.equals(e.direction());
-            if (!isIn && !isOut && !isReceivable) {
-                problems.add("취소 분개에 허용되지 않은 항목 (" + e.accountType() + " " + e.direction() + " "
-                        + e.entryType() + ")");
-                continue;
-            }
-            if (!currency.equals(e.currency())) {
-                problems.add("취소 분개 " + e.entryType() + " 통화(" + e.currency() + ") ≠ 충전 통화(" + currency + ")");
-            }
-            if (isIn) {
-                in.add(e);
-            } else {
-                split += e.amount();
-            }
-            if (isOut && !charge.getWalletId().equals(e.walletId())) {
-                problems.add("취소 분개 CHARGE_REVERSAL_OUT 지갑(" + e.walletId() + ") ≠ 충전 지갑("
-                        + charge.getWalletId() + ")");
-            }
-        }
-        if (in.size() != 1) {
-            problems.add("취소 분개 CHARGE_REVERSAL_IN 항목 " + in.size() + "개 (1개여야 함)");
-            return problems;
-        }
-        long inAmount = in.getFirst().amount();
-        if (inAmount != charge.getAmount()) {
-            problems.add("취소 분개 CHARGE_REVERSAL_IN 금액(" + inAmount + ") ≠ 충전 금액(" + charge.getAmount() + ")");
-        }
-        if (split != inAmount) {
-            problems.add("취소 분개 회수+미수(" + split + ") ≠ CHARGE_REVERSAL_IN 금액(" + inAmount + ")");
-        }
-        return problems;
     }
 
     private static void debitAmount(ChargeRequest charge, SourceLookup<BankTransactionRecord> debit, Collector out) {
@@ -295,11 +226,11 @@ public final class ChargeReconciliationJudge {
     }
 
     private static boolean isSucceeded(SourceLookup<BankTransactionRecord> lookup) {
-        return lookup instanceof SourceLookup.Found<BankTransactionRecord> found && found.record().isSucceeded();
+        return DoublePaymentCriteria.isSucceeded(lookup);
     }
 
     private static boolean isPosted(SourceLookup<LedgerTransactionRecord> lookup) {
-        return lookup instanceof SourceLookup.Found<LedgerTransactionRecord> found && found.record().isPosted();
+        return DoublePaymentCriteria.isPosted(lookup);
     }
 
     private static String bankStatus(SourceLookup<BankTransactionRecord> lookup) {

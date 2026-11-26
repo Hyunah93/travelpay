@@ -59,6 +59,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "eureka.client.enabled=false",
         "travelpay.wallet.outbox.publisher.enabled=false",
         "travelpay.wallet.charge.recovery.enabled=false",
+        "travelpay.wallet.charge.correction.enabled=false",
         "travelpay.wallet.charge.reconciliation.enabled=false",
         "travelpay.wallet.charge.saga.consumer.enabled=false",
         "spring.jpa.properties.hibernate.generate_statistics=true",

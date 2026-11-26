@@ -46,8 +46,8 @@ spring:
   task:
     scheduling:
       pool:
-        # 복구·Outbox 발행·충전 대사가 각자 스레드를 쓴다 (외부 호출이 긴 배치가 다른 스케줄러를 막지 않게)
-        size: 3
+        # 복구·Outbox 발행·충전 대사·이중 지급 정정이 각자 스레드를 쓴다 (외부 호출이 긴 배치가 다른 스케줄러를 막지 않게)
+        size: 4
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
     producer:

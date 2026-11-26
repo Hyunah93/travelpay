@@ -49,6 +49,7 @@ import static org.mockito.Mockito.when;
         "eureka.client.enabled=false",
         "travelpay.wallet.outbox.publisher.enabled=false",
         "travelpay.wallet.charge.recovery.enabled=false",
+        "travelpay.wallet.charge.correction.enabled=false",
         "travelpay.wallet.charge.reconciliation.enabled=false",
         "travelpay.wallet.charge.saga.consumer.enabled=false",
         "spring.kafka.admin.auto-create=false"
@@ -611,6 +612,111 @@ class ChargeReconciliationIntegrationTest {
         assertCounts(result, 1, 0, 0, 1);
     }
 
+    // ---- 이중 지급 정정 대상 등록 ----
+
+    @Test
+    void CREDIT_AND_REFUND_BOTH를_저장하면_같은_실행의_결과를_가리키는_PENDING_정정_대상_1건() {
+        Charge doublePaid = doublePaidCompleted();
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        List<Map<String, Object>> corrections = corrections(doublePaid.id());
+        assertEquals(1, corrections.size());
+        Map<String, Object> row = corrections.getFirst();
+        assertEquals(resultId(result.runId(), doublePaid.id(), "CREDIT_AND_REFUND_BOTH"),
+                row.get("reconciliation_result_id"));
+        assertEquals("PENDING", row.get("status"));
+        assertEquals(0, row.get("attempt_count"));
+        assertEquals("SYSTEM", row.get("executed_by"));
+        assertNotNull(row.get("next_attempt_at"));
+        assertNull(row.get("last_error"));
+        assertNull(row.get("ledger_tx_id"));
+        assertNull(row.get("recovered_amount"));
+        assertNull(row.get("receivable_amount"));
+        assertEquals(1, correctionCount());
+    }
+
+    @Test
+    void CREDIT_AND_REFUND_BOTH가_아닌_어긋남은_정정_대상을_만들지_않음() {
+        Charge failed = charge("FAILED", null, null, null);
+        bankList.add(new BankTransactionRecord(failed.bankRequestId(), UUID.randomUUID(), "DEBIT", "SUCCEEDED",
+                AMOUNT));
+
+        service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(0, correctionCount());
+    }
+
+    @Test
+    void 같은_충전이_다음_실행에서_또_잡혀도_정정_대상은_1건이고_처음_결과_ID_그대로() {
+        Charge doublePaid = doublePaidCompleted();
+        ReconciliationRunResult first = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+        Map<String, Object> before = corrections(doublePaid.id()).getFirst();
+
+        ReconciliationRunResult second = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertTrue(types(second.runId(), doublePaid.id()).contains("CREDIT_AND_REFUND_BOTH"));
+        List<Map<String, Object>> after = corrections(doublePaid.id());
+        assertEquals(List.of(before), after);
+        assertEquals(resultId(first.runId(), doublePaid.id(), "CREDIT_AND_REFUND_BOTH"),
+                after.getFirst().get("reconciliation_result_id"));
+    }
+
+    @Test
+    void 이미_SUCCEEDED인_정정_대상은_다음_실행에서_바뀌지_않음() {
+        Charge doublePaid = doublePaidCompleted();
+        service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+        jdbcTemplate.update("""
+                UPDATE charge_reversal_corrections
+                   SET status = 'SUCCEEDED', attempt_count = 1, ledger_tx_id = ?, recovered_amount = 4000,
+                       receivable_amount = 6000, updated_at = now()
+                 WHERE charge_id = ?
+                """, UUID.randomUUID(), doublePaid.id());
+        Map<String, Object> before = corrections(doublePaid.id()).getFirst();
+
+        service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of(before), corrections(doublePaid.id()));
+    }
+
+    @Test
+    void 이미_NEEDS_REVIEW인_정정_대상은_다음_실행에서_바뀌지_않음() {
+        Charge doublePaid = doublePaidCompleted();
+        service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+        jdbcTemplate.update("""
+                UPDATE charge_reversal_corrections
+                   SET status = 'NEEDS_REVIEW', attempt_count = 5, last_error = 'RETRY_EXHAUSTED',
+                       updated_at = now()
+                 WHERE charge_id = ?
+                """, doublePaid.id());
+        Map<String, Object> before = corrections(doublePaid.id()).getFirst();
+
+        service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(List.of(before), corrections(doublePaid.id()));
+    }
+
+    @Test
+    void 실행이_도중에_정리되어_완료가_롤백되면_결과와_정정_대상_모두_없음() {
+        Charge doublePaid = doublePaidCompleted();
+        // 기간 목록을 받는 사이 다른 경로가 이 실행을 오래된 RUNNING으로 정리한 상황
+        when(bankClient.listTransactions(any(), any())).thenAnswer(inv -> {
+            jdbcTemplate.update("""
+                    UPDATE reconciliation_runs
+                       SET status = 'FAILED', finished_at = now(), failure_reason = '정리됨'
+                     WHERE status = 'RUNNING'
+                    """);
+            return bankList;
+        });
+
+        ReconciliationRunResult result = service.run(FROM, TO, null, ReconciliationRunType.MANUAL);
+
+        assertEquals(ReconciliationRunStatus.FAILED, result.status());
+        assertEquals(0, resultCount(result.runId()));
+        assertEquals(List.of(), corrections(doublePaid.id()));
+        assertEquals(0, correctionCount());
+    }
+
     // ---- 준비 ----
 
     private record Charge(UUID id, String bankRequestId, String refundRequestId, UUID bankTxId,
@@ -750,6 +856,20 @@ class ChargeReconciliationIntegrationTest {
                 SELECT id, charge_id, mismatch_type, detail, snapshot::text AS snapshot, detected_at, resolution_status
                   FROM reconciliation_results WHERE run_id = ? ORDER BY mismatch_type
                 """, runId);
+    }
+
+    private UUID resultId(UUID runId, UUID chargeId, String type) {
+        return jdbcTemplate.queryForObject("""
+                SELECT id FROM reconciliation_results WHERE run_id = ? AND charge_id = ? AND mismatch_type = ?
+                """, UUID.class, runId, chargeId, type);
+    }
+
+    private List<Map<String, Object>> corrections(UUID chargeId) {
+        return jdbcTemplate.queryForList("SELECT * FROM charge_reversal_corrections WHERE charge_id = ?", chargeId);
+    }
+
+    private int correctionCount() {
+        return jdbcTemplate.queryForObject("SELECT count(*) FROM charge_reversal_corrections", Integer.class);
     }
 
     private static Map<String, Object> withoutCharge(Map<String, Object> row) {

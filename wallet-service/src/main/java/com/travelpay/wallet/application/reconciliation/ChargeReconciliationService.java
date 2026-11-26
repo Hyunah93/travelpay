@@ -163,18 +163,10 @@ public class ChargeReconciliationService {
         SourceLookup<LedgerTransactionRecord> ledger = lookup(ledgerByReference.get(ledgerKey),
                 completed || reversed, () -> ledgerClient.findChargeTransaction(ledgerKey));
         // 이중 지급 사실이 있는데 이번 목록에 취소 분개가 없으면, 앞 기간에 생긴 취소 분개일 수 있어 단건 조회한다
-        boolean doublePaid = isSucceeded(refund) && isPosted(ledger);
+        boolean doublePaid = DoublePaymentCriteria.isDoublePaid(refund, ledger);
         SourceLookup<LedgerTransactionRecord> reversalLookup = lookup(reversal, doublePaid,
                 () -> ledgerClient.findChargeReversal(ledgerKey));
         return new ChargeFacts(debit, refund, ledger, reversalLookup);
-    }
-
-    private static boolean isSucceeded(SourceLookup<BankTransactionRecord> lookup) {
-        return lookup instanceof SourceLookup.Found<BankTransactionRecord> found && found.record().isSucceeded();
-    }
-
-    private static boolean isPosted(SourceLookup<LedgerTransactionRecord> lookup) {
-        return lookup instanceof SourceLookup.Found<LedgerTransactionRecord> found && found.record().isPosted();
     }
 
     private static <T> SourceLookup<T> lookup(T fromList, boolean expected, Supplier<SourceLookup<T>> single) {
